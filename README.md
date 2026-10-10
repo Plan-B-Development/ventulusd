@@ -2,7 +2,7 @@
 
 *Formerly Control-OFC (`control-ofc-daemon`, `control-ofc-tray`).*
 
-**Latest release:** v4.3.0 (as Control-OFC) — 2026-10-09. Pairs with `ventulus` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover); version numbers carry on from Control-OFC.
+**Latest release:** v5.0.0 — 2026-10-10. Pairs with `ventulus` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover); version numbers carry on from Control-OFC.
 
 Rust workspace for the Ventulus fan control daemon.
 
