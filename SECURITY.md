@@ -5,7 +5,7 @@
 If you discover a security vulnerability in Ventulus daemon, please
 report it privately:
 
-1. **Email:** chomeop@gmail.com
+1. **Email:** Mitchell.r.palmer@gmail.com
 2. **Subject:** `[SECURITY] Ventulus daemon — <brief description>`
 
 Please include:
