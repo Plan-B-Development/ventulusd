@@ -1,0 +1,2491 @@
+//! Request handlers for the IPC API.
+//!
+//! Read handlers read from the `StateCache` — no direct hardware access.
+//! Write handlers dispatch through the `FanController`.
+
+mod assessment;
+pub mod config;
+mod control;
+pub mod discovery;
+mod gpu;
+mod hw_diagnostics;
+mod hwmon_ctl;
+mod inventory;
+mod openfan;
+mod openfan_firmware;
+mod path_confine;
+mod profile;
+pub mod stall_probe;
+mod status;
+pub mod validation;
+
+pub use assessment::*;
+pub use config::*;
+pub use control::*;
+pub use gpu::*;
+pub use hw_diagnostics::*;
+pub use hwmon_ctl::*;
+pub use inventory::*;
+pub use openfan::*;
+pub use openfan_firmware::*;
+pub use profile::*;
+pub use status::*;
+
+use parking_lot::Mutex;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::http::StatusCode;
+use axum::response::Json;
+
+use crate::constants;
+use crate::health::cache::StateCache;
+use crate::health::staleness::StalenessConfig;
+use crate::serial::controller::FanController;
+
+use super::responses::*;
+use crate::health::state::DaemonState;
+
+/// Build the sorted list of sensor entries from a cache snapshot.
+pub(crate) fn build_sensor_entries(snap: &DaemonState, now: Instant) -> Vec<SensorEntry> {
+    let mut entries: Vec<SensorEntry> = snap
+        .sensors
+        .values()
+        .map(|s| {
+            let age_ms = now.duration_since(s.updated_at).as_millis() as u64;
+            SensorEntry {
+                id: s.id.clone(),
+                kind: s.kind.to_string(),
+                label: s.label.clone(),
+                value_c: s.value_c,
+                source: s.source.to_string(),
+                age_ms,
+                rate_c_per_s: s.rate_c_per_s,
+                session_min_c: s.session_min_c,
+                session_max_c: s.session_max_c,
+                chip_name: s.chip_name.clone(),
+                temp_type: s.temp_type,
+                thresholds: s.thresholds.as_ref().map(SensorThresholdsResponse::from),
+                // DEC-193: wireless-radio PHY temps (e.g. ath12k WiFi) must not
+                // drive a fan curve — derived from the chip name (the daemon
+                // engine never consults this; it is an advisory hint the GUI uses
+                // to filter its curve-source picker).
+                control_eligible: !crate::hwmon::is_wireless_phy_chip(&s.chip_name),
+            }
+        })
+        .collect();
+    // DEC-146 P3-11: deterministic wire order, matching build_fan_entries —
+    // and this function's doc comment, which promised "sorted" all along.
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries
+}
+
+/// Build the sorted list of currently-unavailable sensor entries (DEC-193) from
+/// a cache snapshot — sensors that exist but fail every read (e.g. an `ath12k`
+/// WiFi temp while the radio is down). Surfaced on `/status` + `/poll` for
+/// display only; they are absent from `build_sensor_entries` (evicted on
+/// quarantine).
+pub(crate) fn build_unavailable_entries(
+    snap: &DaemonState,
+    now: Instant,
+) -> Vec<UnavailableSensorEntry> {
+    let mut entries: Vec<UnavailableSensorEntry> = snap
+        .unavailable_sensors
+        .iter()
+        .map(|u| UnavailableSensorEntry {
+            id: u.id.clone(),
+            label: u.label.clone(),
+            reason: u.reason.clone(),
+            unavailable_for_ms: now.duration_since(u.since).as_millis() as u64,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries
+}
+
+/// Build the sorted list of controls the engine cannot resolve (273-i) from a
+/// cache snapshot. Display-only, and empty in every healthy configuration —
+/// a non-empty list means some fan is not being commanded at all.
+pub(crate) fn build_skipped_entries(snap: &DaemonState, now: Instant) -> Vec<SkippedControlEntry> {
+    let mut entries: Vec<SkippedControlEntry> = snap
+        .skipped_controls
+        .iter()
+        .map(|c| SkippedControlEntry {
+            control_id: c.control_id.clone(),
+            control_name: c.control_name.clone(),
+            reason: c.reason.as_token().to_string(),
+            skipped_for_ms: now.duration_since(c.since).as_millis() as u64,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.control_id.cmp(&b.control_id));
+    entries
+}
+
+/// Build the DEC-443 status fields from a cache snapshot: the emergency's
+/// causes, the pumps under a stall response and the advisories in force.
+pub(crate) fn build_cooling_safety_entries(
+    snap: &DaemonState,
+    now: Instant,
+) -> CoolingSafetyEntries {
+    let ms = |since: Instant| now.saturating_duration_since(since).as_millis() as u64;
+    CoolingSafetyEntries {
+        emergency_causes: snap
+            .emergency_causes
+            .iter()
+            .map(|c| (*c).to_string())
+            .collect(),
+        pump_stalls: snap
+            .pump_stalls
+            .iter()
+            .map(|p| PumpStallEntry {
+                header_id: p.header_id.clone(),
+                state: p.state.to_string(),
+                since_ms: ms(p.since),
+                stall_count: p.stall_count,
+            })
+            .collect(),
+        advisories: snap
+            .cooling_advisories
+            .iter()
+            .map(|a| CoolingAdvisoryEntry {
+                code: a.code.to_string(),
+                since_ms: ms(a.since),
+                cpu_temp_c: a.cpu_temp_c,
+                ceiling_c: a.ceiling_c,
+                max_duty_pct: a.max_duty_pct,
+            })
+            .collect(),
+    }
+}
+
+/// Build the per-control applied-output list from a cache snapshot (277-k).
+///
+/// Already sorted by `control_id` upstream (`ProfileEngineState::outputs_snapshot`)
+/// — re-sorted here anyway so the wire ordering is a property of this boundary
+/// and cannot silently depend on how the engine happened to build the map.
+pub(crate) fn build_control_output_entries(snap: &DaemonState) -> Vec<ControlOutputEntry> {
+    let mut entries: Vec<ControlOutputEntry> = snap
+        .control_outputs
+        .iter()
+        .map(|c| ControlOutputEntry {
+            control_id: c.control_id.clone(),
+            output_pct: c.output_pct,
+        })
+        .collect();
+    entries.sort_by(|a, b| a.control_id.cmp(&b.control_id));
+    entries
+}
+
+/// The `stall_detected` verdict for one hwmon header (DEC-458, `PTR-k`).
+///
+/// A header the daemon commands is measured against the duty it commanded
+/// (`pwm_commanded_pct`, one producer). One it does not command — never taken,
+/// or given back — is measured against the hardware readback, but only once
+/// its fan has been seen spinning: a header with no fan reads 0 RPM under a
+/// firmware duty exactly as a fan that stopped does, and only the fan ever
+/// turned. Never `last_commanded_pwm`, which mixes the two (AIO5-a). `None` is
+/// "not evaluated", never "not stalled".
+///
+/// A duty a diagnostic wrote is not a command (`PTR-ag`): while that diagnostic
+/// holds the write pause there is no verdict, and once it has ended the header
+/// is judged as one the daemon does not command.
+fn hwmon_stall_verdict(snap: &DaemonState, id: &str, now: Instant) -> Option<bool> {
+    let fan = snap.hwmon_fans.get(id)?;
+    let rpm = fan.rpm?;
+    let commanded = match snap.hwmon_diagnostic_commanded.get(id) {
+        None => fan.pwm_commanded_pct,
+        Some(&epoch) if epoch == snap.verify_epoch && snap.verify_active_at(now) => {
+            return None;
+        }
+        Some(_) => None,
+    };
+    let seen_spinning = snap.hwmon_seen_spinning.contains(id);
+    let duty = match commanded {
+        Some(commanded) => commanded,
+        None if seen_spinning => fan.pwm_readback_pct?,
+        None => return None,
+    };
+    Some(rpm == 0 && duty > constants::STALL_PWM_THRESHOLD)
+}
+
+/// Build the sorted list of fan entries from a cache snapshot.
+pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntry> {
+    let mut fans: Vec<FanEntry> = Vec::new();
+
+    // OpenFanController fans. No stall verdict while an update holds them
+    // (DEC-481): their last command is its parking duty, and no tach is read
+    // after it until the poll loop has the port back — nor while the board
+    // awaits recovery — so a channel with no fan would read as stalled.
+    let held_by_update = snap.openfan_writes_suspended();
+    for (ch, fan) in &snap.openfan_fans {
+        let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
+        let stall = if fan.rpm_polled && !held_by_update {
+            fan.last_commanded_pwm
+                .map(|pwm| fan.rpm == 0 && pwm > constants::STALL_PWM_THRESHOLD)
+        } else {
+            None
+        };
+        fans.push(FanEntry {
+            id: crate::serial::openfan_member_id(*ch),
+            source: "openfan".into(),
+            // OFS-l: a channel the daemon has only ever WRITTEN has `rpm == 0`
+            // because that is the struct's initial value, not because anything
+            // measured it. `rpm_polled` exists for exactly this distinction and
+            // was already consulted for `stall` three lines up; publishing
+            // `Some(0)` regardless made an unmeasured channel indistinguishable
+            // from a genuinely stalled one. `rpm` is optional on the wire
+            // (`skip_serializing_if`), and every other source already emits
+            // `None` when it has no reading, so absence is the established shape
+            // rather than a new one.
+            rpm: fan.rpm_polled.then_some(fan.rpm),
+            last_commanded_pwm: fan.last_commanded_pwm,
+            duty_pct: None,
+            age_ms,
+            stall_detected: stall,
+            fan_alarm: None,
+            pwm_enable_mode: None,
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            duty_corrections: None,
+            duty_not_holding: None,
+        });
+    }
+
+    // Hwmon fans
+    for (id, fan) in &snap.hwmon_fans {
+        let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
+        let reconciliation = snap
+            .hwmon_duty_reconciliation
+            .get(id)
+            .copied()
+            .unwrap_or_default();
+        let stall = hwmon_stall_verdict(snap, id, now);
+        fans.push(FanEntry {
+            id: id.clone(),
+            source: "hwmon".into(),
+            rpm: fan.rpm,
+            last_commanded_pwm: fan.last_commanded_pwm,
+            duty_pct: None,
+            age_ms,
+            stall_detected: stall,
+            fan_alarm: fan.alarm,
+            pwm_enable_mode: fan.pwm_enable_mode,
+            pwm_readback_pct: fan.pwm_readback_pct,
+            pwm_commanded_pct: fan.pwm_commanded_pct,
+            // DEC-406: on every hwmon entry; a header never corrected reads 0.
+            duty_corrections: Some(reconciliation.corrections),
+            duty_not_holding: Some(reconciliation.not_holding),
+        });
+    }
+
+    // Discrete GPU fans (AMD + Intel + NVIDIA share the gpu_fans map; the vendor
+    // is encoded in the ID prefix — `amd_gpu:` / `intel_gpu:` / `nvidia_gpu:` —
+    // DEC-121/DEC-204).
+    for (id, fan) in &snap.gpu_fans {
+        let age_ms = now.duration_since(fan.updated_at).as_millis() as u64;
+        let source = if id.starts_with("intel_gpu:") {
+            "intel_gpu"
+        } else if id.starts_with("nvidia_gpu:") {
+            "nvidia_gpu"
+        } else {
+            "amd_gpu"
+        };
+        fans.push(FanEntry {
+            id: id.clone(),
+            source: source.into(),
+            rpm: fan.rpm,
+            last_commanded_pwm: fan.last_commanded_pct,
+            duty_pct: fan.duty_pct,
+            age_ms,
+            stall_detected: None,
+            fan_alarm: None,
+            pwm_enable_mode: None,
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            duty_corrections: None,
+            duty_not_holding: None,
+        });
+    }
+
+    fans.sort_by(|a, b| a.id.cmp(&b.id));
+    fans
+}
+
+/// What the last completed OpenFan rescan probe saw (register row 10-e).
+///
+/// The candidate list is half the value. Rate-limiting on elapsed time alone
+/// refused the single most likely legitimate retry — plug a controller in, click
+/// rescan — because that is a human action measured in seconds. Recording which
+/// ports were probed lets the cooldown apply only while nothing has changed: a
+/// newly attached controller enumerates a new tty, so the sets differ and the
+/// retry proceeds immediately.
+#[derive(Debug, Clone)]
+pub struct LastRescan {
+    /// When the probe finished (stamped by `RescanGuard::drop`, so the quiet
+    /// period runs from the end of the last DTR assertion, not from the request
+    /// that started it).
+    pub at: Instant,
+    /// The candidate ports that probe actually walked.
+    pub candidates: Vec<String>,
+}
+
+/// Parameters needed to start an OpenFan poll loop for a late-adopted
+/// controller (DEC-265). Cloned from config at boot; never discovery-dependent.
+#[derive(Clone)]
+pub struct OpenFanRuntime {
+    /// Serial read/write timeout.
+    pub timeout: std::time::Duration,
+    /// Poll cadence.
+    pub interval: std::time::Duration,
+    /// Shutdown signal shared with the loops spawned at boot, so a loop started
+    /// by a rescan stops with the rest of them.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+}
+
+/// Poll-loop handles for post-boot OpenFan adoptions, plus the one-way flag that
+/// closes registration once shutdown has begun (`OFN-t`).
+///
+/// The flag and the list live under **one** lock deliberately. Splitting them —
+/// an `AtomicBool` beside a `Mutex<Vec<_>>`, say — would let an installer read
+/// "open", be descheduled, and push after the drain had already taken
+/// everything: precisely the race this type exists to remove. Closing-and-taking
+/// is one critical section; so is checking-then-registering
+/// ([`AppState::adopt_openfan_controller`], the only thing that may push).
+#[derive(Default)]
+pub struct AdoptedTasks {
+    handles: Vec<tokio::task::JoinHandle<()>>,
+    closed: bool,
+}
+
+impl AdoptedTasks {
+    /// Whether registration has closed — i.e. shutdown has taken the list.
+    ///
+    /// Only meaningful while the caller still holds the guard it was read
+    /// through. A caller that drops the lock between this and a `push` has
+    /// reintroduced the race.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Register a poll handle.
+    ///
+    /// Deliberately **private to this module**, so the only route to it is
+    /// [`AppState::adopt_openfan_controller`], which checks [`Self::is_closed`]
+    /// under the same guard. A public `push` would be an invitation to do the
+    /// check-then-act across two lock acquisitions.
+    fn push(&mut self, handle: tokio::task::JoinHandle<()>) {
+        debug_assert!(
+            !self.closed,
+            "a poll handle was registered after registration closed — it will never be joined"
+        );
+        self.handles.push(handle);
+    }
+
+    /// Close registration and take everything registered so far, atomically.
+    ///
+    /// The ONE call `main` makes at shutdown. Closing and taking must be the
+    /// same critical section: closing first and draining second would let an
+    /// install that had already passed its check push into a list that was about
+    /// to be emptied, and draining first would leave the window open for a
+    /// fresh registration.
+    pub fn close_and_drain(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.closed = true;
+        std::mem::take(&mut self.handles)
+    }
+
+    /// Whether any poll loop is registered.
+    ///
+    /// The only accessor a caller needs. A sibling `len()` was written alongside
+    /// it and had no caller at all — a public method produced and read by
+    /// nothing is the `ACK-y`/`AU-h` shape, and clippy cannot see it because
+    /// `pub` items in a lib are never dead code.
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+}
+
+/// What [`AppState::adopt_openfan_controller`] did (DEC-265/266, `OFN-t`).
+///
+/// Module-private for the same reason the method is: it appears in no public
+/// signature, so widening it would only widen the set of callers whose closures
+/// have to obey a rule the type cannot state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AdoptOutcome {
+    /// Installed, and its poll loop is registered for the shutdown drain.
+    Adopted,
+    /// A concurrent adoption had already installed one; this controller was
+    /// discarded rather than replacing the live one (DEC-266).
+    AlreadyAdopted,
+    /// Registration has closed — the daemon is shutting down, so nothing was
+    /// installed and no loop was started.
+    ShuttingDown,
+    /// A firmware update holds the controller (DEC-484); only that run may
+    /// install one, so nothing was installed and no loop was started.
+    MaintenanceRunning,
+}
+
+/// Shared application state passed to all handlers.
+pub struct AppState {
+    pub cache: Arc<StateCache>,
+    pub staleness_config: StalenessConfig,
+    pub daemon_version: String,
+    /// Fan controller for OpenFanController write operations. `None` if not connected.
+    /// Arc-wrapped to share between API handlers and the profile engine task.
+    ///
+    /// DEC-265: behind an `RwLock` so it can be filled in *after* startup. It used
+    /// to be a plain `Option` set once during boot, which meant a controller that
+    /// enumerated late — or failed its identity probe once — left the daemon with
+    /// no OpenFan backend for the whole process lifetime, and no way to recover
+    /// short of a restart. That is not only lost fan control: the profile engine's
+    /// thermal force skips any backend that is absent (`force_present_backends`,
+    /// DEC-371 — it was an inline `if let Some(be) = openfan_be` until then), so the
+    /// thermal emergency lost its reach to every OpenFan-attached fan too.
+    /// `POST /fans/openfan/rescan` is what fills it. Read it through
+    /// [`AppState::openfan`] rather than locking by hand.
+    pub fan_controller: Arc<parking_lot::RwLock<Option<Arc<Mutex<FanController>>>>>,
+    /// Everything needed to start the OpenFan poll loop for a controller adopted
+    /// after boot (DEC-265). Present regardless of whether a device was found —
+    /// these are configuration, not discovery.
+    pub openfan_runtime: OpenFanRuntime,
+    /// Hwmon PWM controller for motherboard fan header writes. `None` if no headers found.
+    /// Shared with the profile engine; a handler reads its headers from the
+    /// handle's snapshot and never locks it on a tokio worker (FFA-h).
+    pub hwmon_controller: Option<crate::api::hwmon_handle::HwmonHandle>,
+    /// Daemon process start time for uptime calculation.
+    pub start_time: Instant,
+    /// Per-entity time-series history ring buffer.
+    pub history: Arc<crate::health::history::HistoryRing>,
+    /// Active profile for headless curve evaluation.
+    pub active_profile: Arc<Mutex<Option<crate::profile::DaemonProfile>>>,
+    /// The current or most recent OpenFan calibration run (DEC-452), the flag
+    /// `DELETE /diagnostics/openfan-calibration` sets to ask it to stop, and
+    /// whether a calibration task is alive.
+    ///
+    /// Same detached-task caveat as `stall_probe` below. A calibration claims
+    /// the single verify slot, so it is one more claimant, never a concurrent
+    /// writer with another diagnostic; the slot's own `alive` claim is what
+    /// keeps two calibrations apart when the verify slot's deadman has lapsed
+    /// under a live run (the `calibrating` flag it replaced is gone).
+    pub openfan_calibration: Arc<crate::api::calibration::OpenFanCalibrationSlot>,
+    /// The current or most recent PWM/RPM characterisation run (AIO-MB Phase 3),
+    /// and the flag `DELETE /diagnostics/characterization` sets to ask it to stop.
+    ///
+    /// The run itself is a **detached** `tokio::spawn`, unlike every other
+    /// hardware diagnostic here: the sweep is minutes long and the client polls
+    /// `GET /diagnostics/characterization` rather than holding a request open.
+    /// It claims the same single verify slot as verify and calibrate, so at most
+    /// one of the three can be in flight; concurrency is bounded by that slot,
+    /// not by this field.
+    ///
+    /// [SAFETY] Because the task is detached it is NOT in
+    /// `main::shutdown_sequence`'s `task_handles`. What makes that safe is the
+    /// shutdown check inside `characterization::RestoreGuard` — see its docs.
+    pub characterization: crate::api::characterization::RunSlot,
+    /// The validation-session engine (AIO-MB Phase 5).
+    ///
+    /// Holds at most one session and derives its event timeline by diffing the
+    /// state cache. It is a **pure observer**, in the narrowed sense
+    /// `validation/recorder.rs` states at length: it plants no hooks in the
+    /// engine or the write path and contains no code that commands a duty, and
+    /// every sysfs read it does perform is **read-only and outside the session
+    /// slot guard**. The stronger "performs no sysfs I/O" was true until DEC-335
+    /// added power sampling and is retracted (`P8-ao`); the narrowed form was
+    /// itself untrue at `start` until DEC-342 (`P8-v`).
+    ///
+    /// Where a session runs a diagnostic it calls the existing
+    /// verify/characterize handler, which already owns the lease, the pump floor
+    /// and the thermal refusal — so this adds no second PWM ownership path (§2).
+    pub validation: Arc<crate::validation::recorder::ValidationEngine>,
+    pub characterization_cancel: Arc<AtomicBool>,
+    /// The current or most recent control-path discovery run (AIO Phase 8
+    /// Batch 1).
+    ///
+    /// Same shape, same lifetime and the same detached-task caveat as
+    /// `characterization` above — including that its safety comes from the
+    /// shutdown check inside the shared `RestoreGuard`. It claims the SAME
+    /// single verify slot, so discovery, verify, characterise and calibrate are
+    /// still mutually exclusive: this field adds a fourth claimant, not a fourth
+    /// concurrent writer.
+    pub control_path: crate::api::discovery::ControlPathSlot,
+    pub control_path_cancel: Arc<AtomicBool>,
+    /// The current or most recent stall/restart probe run (DEC-407), and the
+    /// flag `DELETE /diagnostics/stall-probe` sets to ask it to stop.
+    ///
+    /// Same shape and the same detached-task caveat as `characterization`: its
+    /// safety at shutdown comes from the shared `RestoreGuard` plus the probe's
+    /// own per-sample shutdown check. It claims the SAME single verify slot, so
+    /// it is a fifth claimant, never a fifth concurrent writer.
+    pub stall_probe: crate::api::stall_probe::StallProbeSlot,
+    pub stall_probe_cancel: Arc<AtomicBool>,
+    /// Persisted PWM to tach relationships, keyed by header id (§6.3).
+    ///
+    /// An `Arc` swapped under a write lock, exactly like `header_roles` and
+    /// `cooling_devices`, so a reader clones the pointer and never holds the lock
+    /// while it works.
+    pub control_paths: Arc<parking_lot::RwLock<Arc<crate::control_paths::ControlPathStore>>>,
+    /// AIO Phase 8 Batch 2 `§6` learned response bands. **Diagnostic evidence
+    /// only — nothing in the control path reads this** (DEC-334).
+    pub pwm_baselines: Arc<parking_lot::RwLock<Arc<crate::pwm_baselines::PwmBaselineStore>>>,
+    /// Per-header PWM-control verdicts (DEC-456): the latest conclusive verify
+    /// or characterisation result, published on `/hwmon/headers` and counted by
+    /// the `pwm_control_unverified` readiness item. Reported, never read by the
+    /// control path.
+    pub pwm_verification:
+        Arc<parking_lot::RwLock<Arc<crate::pwm_verification::PwmVerificationStore>>>,
+    /// Prevents concurrent `POST /fans/openfan/rescan` probes (DEC-265).
+    /// Two racing probes would open the same tty, and the loser would install
+    /// a controller over the winner's — orphaning a poll loop on a transport
+    /// nothing writes through.
+    ///
+    /// Shared (`Arc`) since DEC-484: an update of a silent OpenFAN board holds
+    /// it from before it signals the board until it has handed the board over,
+    /// so no probe — the user's rescan, the post-boot search, the recovery
+    /// watch, all of which run through the rescan — opens the board meanwhile.
+    pub openfan_rescanning: Arc<AtomicBool>,
+    /// What the last completed `POST /fans/openfan/rescan` probe saw (register
+    /// row 10-e). `openfan_rescanning` above bounds **concurrency**; this bounds
+    /// **repetition**, which is a different hazard: every probe asserts DTR on
+    /// each candidate tty, and that *resets* Arduino-class boards. A caller
+    /// looping on a failing rescan therefore holds unrelated hardware in reset.
+    ///
+    /// Carries the candidate set, not just a timestamp, because the cooldown is
+    /// conditional on the world being unchanged — see `OPENFAN_RESCAN_COOLDOWN`.
+    /// A successful adoption never reaches the check at all: the handler returns
+    /// early once a controller is connected.
+    pub last_openfan_rescan: Arc<Mutex<Option<LastRescan>>>,
+    /// Poll-loop handles for OpenFan controllers adopted *after* boot, and the
+    /// flag that closes registration at shutdown (DEC-265, register rows 277-c
+    /// and `OFN-t`).
+    ///
+    /// `main` builds its `task_handles` list once at startup, long before a
+    /// rescan can adopt anything, so a poll loop spawned by the rescan path had
+    /// nowhere to be joined and `shutdown_sequence` never drained it. Harmless
+    /// as shipped — that loop only reads status and RPM, so there is no PWM
+    /// hazard — but "the restore is the guaranteed last writer" was simply not
+    /// established for a rescan-adopted controller, and any future write added
+    /// there would have fallen silently outside the drain invariant. Drained
+    /// alongside `task_handles` so the invariant holds for both.
+    ///
+    /// **The drain alone did not establish it, which is `OFN-t`.** `main` drained
+    /// this list into `task_handles` and only *then* called `finish_shutdown`,
+    /// whose first act is to set the shutdown watch — so the drain provably runs
+    /// BEFORE the signal, and an adoption completing in between registered a
+    /// handle into a list nothing would read again. Nothing on the install path
+    /// consulted a shutdown signal at any point, so a controller could be
+    /// installed and its loop spawned after `restore_hardware()` had run. It is
+    /// a [`AdoptedTasks`] rather than a bare `Vec` for exactly that: closing and
+    /// draining is one critical section, and so is checking-then-registering.
+    pub adopted_poll_tasks: Arc<Mutex<AdoptedTasks>>,
+    /// OpenFan firmware updates (DEC-481): the poll loop's port-lending channel,
+    /// the current or last run's record, its cancel flag and its task for the
+    /// shutdown drain. The run's claim on the controller lives in the cache.
+    pub openfan_maintenance: Arc<crate::openfan_maintenance::MaintenanceSlot>,
+    /// Detected AMD GPU info (populated at startup). Empty if no AMD GPU found.
+    pub amd_gpus: Vec<crate::hwmon::gpu_detect::AmdGpuInfo>,
+    /// Detected Intel discrete GPU info (populated at startup). Empty if none
+    /// found. Read-only telemetry — no fan write path (DEC-121).
+    pub intel_gpus: Vec<crate::hwmon::intel_gpu_detect::IntelGpuInfo>,
+    /// Unified NVIDIA discrete GPU identity (nouveau + NVML legs), gathered at
+    /// startup. Empty if none found. Read-only telemetry — no fan write path
+    /// (DEC-204).
+    pub nvidia_gpus: Vec<crate::hwmon::nvidia::NvidiaGpuIdentity>,
+    /// Configured profile search directories (from daemon.toml [profiles] section).
+    /// Wrapped in RwLock to allow runtime updates via SIGHUP reload or API endpoint.
+    pub profile_search_dirs: parking_lot::RwLock<Vec<std::path::PathBuf>>,
+    /// Path to the admin-owned daemon.toml (read-only to handlers).
+    pub config_path: String,
+    /// Path to the daemon-owned runtime.toml (read/write by handlers).
+    /// Lives at `{state_dir}/runtime.toml`. See ADR-002.
+    pub runtime_config_path: std::path::PathBuf,
+    /// Serialises the whole load → mutate → persist → commit sequence of every
+    /// `POST`/`DELETE /config/*` setter (`AIO1-d`) — **twelve write routes, served
+    /// by eleven acquisition sites** (the two preferred-sensor routes share
+    /// `set_preferred_sensor`).
+    ///
+    /// Each setter reads all of `runtime.toml`, changes one key, and writes the
+    /// whole file back. Unserialised, two of them from the same base lose one
+    /// edit: the later `save_to` wins the file and the later in-memory commit
+    /// wins the cache, and **both requests answer `updated: true`**.
+    ///
+    /// [SAFETY] The consequence is asymmetric, which is why this is a lock and
+    /// not a doc note. Losing a poll-interval edit is annoying; losing a
+    /// `header_roles` edit drops a **pump's 30% floor** and its identify
+    /// protection at the next daemon restart. Since DEC-316 the GUI's
+    /// Configure-AIO flow posts `/config/header-role` and then
+    /// `/config/cooling-device` in one user action, so the interleaving window
+    /// is opened by ordinary use rather than by two operators racing.
+    ///
+    /// This is a `tokio::sync::Mutex` rather than a `parking_lot` one precisely
+    /// because it is held across the `.await` on `persist_off_runtime`.
+    ///
+    /// **Lock order.** Acquired FIRST, before any other lock a setter takes, and
+    /// held until the setter has persisted and committed. Inside it a setter
+    /// takes only leaf locks — `profile_search_dirs`, `header_roles`,
+    /// `cooling_devices`, `override_table` — none of which ever reaches back for
+    /// this one, so no cycle exists.
+    ///
+    /// **It must never be held across `hwmon_controller`**, which is the one lock
+    /// the profile engine holds across a blocking sysfs write (the DEC-278/289
+    /// wedge): holding both would park every `/config/*` write route behind a
+    /// wedged header rather than the one request that touched it, and
+    /// `AppState::header_role_parts` already documents that pair as ABBA-sensitive.
+    /// Setters that validate against live headers do so *before* acquiring this.
+    /// `update_header_role_handler` additionally **drops the guard before building
+    /// its response** (`AIO1-d`). Since FFA-h `resolved_header_role` reads the
+    /// headers from `HwmonHandle`'s snapshot and takes no controller lock, so
+    /// the drop is no longer what keeps the pair apart; it stays, as the cheaper
+    /// critical section.
+    pub config_write: tokio::sync::Mutex<()>,
+    /// Set when a `runtime.toml` load fell back to defaults, mirrored onto
+    /// `/status` + `/poll` so a client can see it (`AUD3-m`).
+    ///
+    /// [SAFETY] `RuntimeConfig::load_from` degrades silently and the default it
+    /// returns carries **no `header_roles`**, so a failed boot load removes
+    /// every user-assigned pump role — its 30% floor, its stop exemption and its
+    /// pump-safe identify — with one `warn!` in the journal as the only trace.
+    /// Nothing on any endpoint reported it.
+    ///
+    /// **Sticky for the process lifetime, deliberately.** A later successful
+    /// `POST /config/*` repairs the *file*, and `header_roles` /
+    /// `cooling_devices` are re-committed live by their setters — but nearly
+    /// every other runtime-mutable key is consumed once at boot, so the daemon
+    /// genuinely is still running on defaults for those. Clearing this on the
+    /// next successful write would therefore claim a recovery that did not
+    /// happen.
+    ///
+    /// **Most-severe wins, not latest-wins** (`WIRE-ao`, 2.36.0). A `startup`
+    /// record survives any number of later failed reloads: a startup failure
+    /// drops every `header_roles` assignment while a reload failure drops
+    /// nothing, so letting the cheaper record overwrite the expensive one made
+    /// `phase` under-report. An `update` record — a `/config/*` setter moved
+    /// the unreadable file aside (`TS-r`) — likewise survives a later failed
+    /// reload. Latest-wins is kept *within* a phase, so a second failed reload
+    /// still refreshes `detail`. After construction, written only through
+    /// `runtime_config::record_degraded`, which owns the rule.
+    pub runtime_config_degraded:
+        Arc<parking_lot::RwLock<Option<crate::runtime_config::RuntimeConfigDegraded>>>,
+    /// Set by `POST /hwmon/rescan` to ask the sensor polling loop to refresh
+    /// its cached descriptor set (labels, types, DEC-117 threshold snapshot)
+    /// on its next tick. Swap-checked (and cleared) by the loop (DEC-133).
+    pub sensor_rescan_requested: Arc<AtomicBool>,
+    /// Daemon-owned manual-override + fan-identify state (DEC-163 / DEC-166).
+    /// Mutated by the `/control/*/override` + `/fans/*/identify` handlers and
+    /// swept + applied by the profile engine tick (both hold this same `Arc`).
+    pub override_table: Arc<Mutex<crate::control_override::OverrideTable>>,
+    /// DEC-311: user-assigned PWM header roles, keyed by the header's stable id
+    /// (which for hwmon is also its fan id and its profile `member_id` — one key
+    /// space, so a lookup works from any of the three).
+    ///
+    /// Loaded from `runtime.toml` at boot, replaced wholesale by
+    /// `POST /config/header-role`, and read every tick by the profile engine
+    /// (which holds this same `Arc`). Behind an `RwLock` because the read side
+    /// is the 1 Hz engine plus every `/hwmon/headers` request while the write
+    /// side is a rare operator action.
+    ///
+    /// [SAFETY] Stored as `Arc<HashMap>` *inside* the lock, not `HashMap`, so
+    /// the engine's per-tick read is a clone of the `Arc` under a momentarily
+    /// held read guard rather than a map clone — and, more importantly, so no
+    /// guard is ever held across the evaluation. The engine must never hold a
+    /// lock an API handler can block on while it is computing PWM.
+    pub header_roles:
+        Arc<parking_lot::RwLock<Arc<HashMap<String, crate::hwmon::roles::HeaderRole>>>>,
+    /// Cooling-device topology (AIO-MB Phase 4, DEC-316).
+    ///
+    /// Cached here for the same reason as `header_roles`: `/hwmon/headers` is
+    /// polled, and re-reading + parsing `runtime.toml` per request would put
+    /// blocking file I/O on an async handler for data that changes only on an
+    /// operator action.
+    ///
+    /// Unlike `header_roles`, this is **never read by the profile engine**.
+    /// Topology is metadata; no evaluation, no floor and no write consults it.
+    /// The only safety-adjacent thing a device carries is a `device_policy_id`,
+    /// and that is a selector for a compiled-in policy, never a number.
+    pub cooling_devices:
+        Arc<parking_lot::RwLock<Arc<Vec<crate::hwmon::cooling_device::CoolingDeviceConfig>>>>,
+    /// DEC-203: whether the opt-in active Super-I/O `/dev/port` probe is enabled
+    /// (`[detection] allow_port_probe`). Off by default; the probe also needs the
+    /// `CAP_SYS_RAWIO` drop-in to actually function.
+    pub allow_port_probe: bool,
+    /// The fully-resolved config this process is *running* on — `daemon.toml`
+    /// with the `runtime.toml` overlay applied, captured at startup (DEC-243).
+    ///
+    /// `GET /config` compares this against a fresh read of the same two files to
+    /// decide `restart_pending` per key. Nearly every runtime-mutable key is
+    /// consumed once at process start, so "persisted" and "in effect" are
+    /// genuinely different states and the API must not conflate them.
+    pub running_config: crate::config::DaemonConfig,
+    /// Cached compact readiness rollup (DEC-206) mirrored onto `/status` + `/poll`
+    /// for the GUI Dashboard health chip. `None` until the first scan completes
+    /// (startup seed). Written by [`AssessmentCache::store`] as the poll mirror of
+    /// the full hardware-assessment snapshot (DEC-207) — refreshed only on
+    /// discovery-changing events (startup / rescan / preferred-sensor /
+    /// `/inventory/*` GET), never recomputed on the poll path. `build_status_response`
+    /// only clones this small struct on the 1 Hz poll — it never re-runs the
+    /// expensive scan (cache snapshot + sysfs walk + disk read + Super-I/O detect).
+    pub readiness_rollup: Arc<Mutex<Option<crate::hwmon::readiness::ReadinessRollup>>>,
+    /// Daemon-owned hardware-assessment cache + single-flight coordinator
+    /// (DEC-207): ONE coalesced passive scan feeds the readiness rollup above,
+    /// the `/inventory/readiness` + `/inventory/superio` compat readers, and the
+    /// combined `/inventory/hardware-readiness` endpoint — so the expensive
+    /// Super-I/O scan runs once instead of three times. Holds the SAME
+    /// `readiness_rollup` `Arc` as its poll mirror. Never on the 1 Hz poll path.
+    pub assessment: Arc<AssessmentCache>,
+}
+
+impl AppState {
+    /// The OpenFan controller, if one is currently adopted (DEC-265).
+    ///
+    /// Clones out from under the read lock so callers never hold it across an
+    /// `.await` — the field became a lock precisely so it could change at
+    /// runtime, and a handler that held it open would block a rescan.
+    pub fn openfan(&self) -> Option<Arc<Mutex<FanController>>> {
+        self.fan_controller.read().clone()
+    }
+
+    /// Install a freshly probed OpenFanController and start its poll loop —
+    /// **or refuse, in one critical section** (DEC-265/266, `OFN-t`).
+    ///
+    /// [SAFETY] This is the only place a post-boot adoption may install, and the
+    /// only route to [`AdoptedTasks::push`]. Three things have to be indivisible
+    /// and this is what makes them so:
+    ///
+    /// 1. the shutdown check, so a controller is never installed into a daemon
+    ///    that has already restored its hardware and is on its way out;
+    /// 2. the DEC-266 conditional install, so two concurrent adoptions cannot
+    ///    both write the slot and leave one poll loop reading a transport
+    ///    nothing writes through;
+    /// 3. the 277-c handle registration, so the loop this spawns is in the list
+    ///    `shutdown_sequence` drains.
+    ///
+    /// Doing (1) and (3) under separate acquisitions is the `OFN-t` race itself:
+    /// `main` takes the list and closes it in one go, so an installer holding
+    /// this guard either registers into a list that will still be drained, or
+    /// sees `closed` and does not install at all. There is no third outcome.
+    ///
+    /// **Lock order is `adopted_poll_tasks` → `fan_controller`, and nothing
+    /// takes them the other way round** — [`Self::openfan`] takes only the
+    /// controller lock and drops it, and `main`'s shutdown drain takes only this
+    /// one.
+    ///
+    /// **`start_poll_loop` runs under the guard, and must therefore be a bare
+    /// `tokio::spawn` — no blocking, no `.await`.** `main`'s `close_and_drain()`
+    /// waits on this same lock, on the shutdown path, ahead of
+    /// `restore_hardware()`, so a closure that did real work here would delay the
+    /// hardware restore. **That is why this method is module-private rather than
+    /// `pub`**: a rule your code needs is a rule your code should enforce
+    /// (DEC-361), and stating it in a doc comment on a `pub` signature enforces
+    /// nothing. Private to `api::handlers`, the set of callers is the one below
+    /// plus anything a future edit to this module adds, which is a set a reader
+    /// can actually check. Taking a `JoinHandle` by value instead was considered
+    /// and rejected: it would spawn the poll loop *before* the install race is
+    /// decided, so a losing probe's loop could write RPM into the shared cache
+    /// before it was aborted.
+    ///
+    /// **And while a firmware update holds the controller, only that run
+    /// installs one** (DEC-484): `owner` names the run adopting the silent
+    /// board it brought back; every other adoption passes `None` and is refused
+    /// with [`AdoptOutcome::MaintenanceRunning`]. The run's claim is read under
+    /// the cache's own guard, so a claim that lands after this check finds the
+    /// controller installed, and an update of a silent board then finds the
+    /// board answering.
+    fn adopt_openfan_controller(
+        &self,
+        controller: FanController,
+        owner: Option<&str>,
+        start_poll_loop: impl FnOnce() -> tokio::task::JoinHandle<()>,
+    ) -> AdoptOutcome {
+        let mut adopted = self.adopted_poll_tasks.lock();
+        if adopted.is_closed() {
+            return AdoptOutcome::ShuttingDown;
+        }
+        let held_by_another = self.cache.read_with(|s| match &s.openfan_maintenance {
+            Some(crate::health::state::OpenFanMaintenance::Running { run_id, .. }) => {
+                owner != Some(run_id.as_str())
+            }
+            _ => false,
+        });
+        if held_by_another {
+            return AdoptOutcome::MaintenanceRunning;
+        }
+
+        // DEC-266: check AND set under one write guard. The caller's
+        // `already_connected` early return and its single-flight CAS are two
+        // adjacent statements with no `.await` between them, but on the
+        // multi-thread runtime two handlers on different OS threads can still
+        // interleave there — B reads the slot empty, A wins the CAS, probes,
+        // installs and releases, then B's CAS succeeds and B installs a SECOND
+        // controller over A's. The engine only re-reads the slot while it has no
+        // backend, so it would keep writing through A's controller while B's
+        // poll loop read a different transport.
+        let won = {
+            let mut slot = self.fan_controller.write();
+            if slot.is_none() {
+                *slot = Some(Arc::new(Mutex::new(controller)));
+                true
+            } else {
+                false
+            }
+        };
+        if !won {
+            return AdoptOutcome::AlreadyAdopted;
+        }
+
+        // Install BEFORE spawning the loop: the engine polls this slot every
+        // tick while it has no backend, and a controller that is reachable but
+        // not yet polled is strictly better than the reverse.
+        adopted.push(start_poll_loop());
+        AdoptOutcome::Adopted
+    }
+
+    /// The current header-role assignment map (DEC-311).
+    ///
+    /// Clones the inner `Arc` out from under the read lock — cheap, and it means
+    /// no caller can hold the lock while doing real work.
+    pub fn header_roles(&self) -> Arc<HashMap<String, crate::hwmon::roles::HeaderRole>> {
+        Arc::clone(&self.header_roles.read())
+    }
+
+    /// Snapshot of the configured cooling devices (AIO-MB Phase 4).
+    ///
+    /// Clones the `Arc` under a momentarily held read guard, so no guard is
+    /// held while a caller iterates — the same discipline as `header_roles`.
+    /// Takes no other lock, so it composes with the controller lock in either
+    /// order.
+    pub fn cooling_devices(&self) -> Arc<Vec<crate::hwmon::cooling_device::CoolingDeviceConfig>> {
+        Arc::clone(&self.cooling_devices.read())
+    }
+
+    /// The role in force for one header id: the user's assignment if any,
+    /// otherwise the role discovery inferred.
+    ///
+    /// [SAFETY] The single lookup every consumer uses — the headers/inventory
+    /// responses, pump-safe identify, and the role-aware verify duty. Going
+    /// through one function is what stops a new caller reading the descriptor's
+    /// inferred `role` directly and silently ignoring the user's assignment.
+    ///
+    /// This is the **display** role: a user assignment fully replaces the
+    /// inference, which is the honest thing to report back. For the *safety*
+    /// question — may this header be stopped or under-driven? — use
+    /// [`AppState::header_is_pump_protected`], which unions instead.
+    pub fn resolved_header_role(&self, header_id: &str) -> crate::hwmon::roles::HeaderRole {
+        let (assigned, inferred) = self.header_role_parts(header_id);
+        crate::hwmon::roles::resolve_role(assigned, inferred).0
+    }
+
+    /// The user's assignment for a header (if any) and the role discovery
+    /// inferred for it. Split out so the display and safety questions read the
+    /// same two facts and cannot drift apart.
+    ///
+    /// Takes the `header_roles` read lock and releases it; the inferred role
+    /// comes from `HwmonHandle`'s header snapshot, so no controller lock is
+    /// taken (FFA-h) — this runs on tokio workers, from `/poll`'s neighbours
+    /// and identify, and the engine holds that lock across blocking writes.
+    pub(crate) fn header_role_parts(
+        &self,
+        header_id: &str,
+    ) -> (
+        Option<crate::hwmon::roles::HeaderRole>,
+        (
+            crate::hwmon::roles::HeaderRole,
+            crate::hwmon::roles::RoleSource,
+        ),
+    ) {
+        let assigned = self
+            .header_roles()
+            .get(crate::hwmon::roles::role_key(header_id).as_ref())
+            .copied();
+        // `ROLE-f`: an OpenFan channel has no discovery evidence — no label, no
+        // chip — so its inferred role is always `Unknown`. Answered without the
+        // controller lock, which the calibration walk's per-sample pump check
+        // would otherwise take on the executor.
+        if crate::serial::openfan_channel_of(header_id).is_ok() {
+            return (assigned, Default::default());
+        }
+        // FFA-h: from the frozen header snapshot, so no lock is taken here.
+        let inferred = self
+            .hwmon_controller
+            .as_ref()
+            .and_then(|c| c.header(header_id))
+            .map(|h| (h.role, h.role_source))
+            .unwrap_or_default();
+        (assigned, inferred)
+    }
+
+    /// The pump floor for one header, as a duty (DEC-443): the DC pump floor when
+    /// its `pwmN_mode` says DC, otherwise the 30 % pump floor.
+    ///
+    /// [SAFETY] Says nothing about WHETHER the header is a pump — that is
+    /// [`Self::header_is_pump_protected`]. Every site that floors a pump asks
+    /// both and applies this value only when the answer is yes. Reads the
+    /// header from `HwmonHandle`'s snapshot and takes no lock (FFA-h). An
+    /// unknown header gets the 30 % floor — the value it had before the mode
+    /// was read.
+    pub fn header_pump_floor_pct(&self, header_id: &str) -> u8 {
+        let mode = self
+            .hwmon_controller
+            .as_ref()
+            .and_then(|c| c.header(header_id))
+            .and_then(|h| h.pwm_mode);
+        pump_floor_duty(mode)
+    }
+
+    /// Header ids the active profile names as pumps: every member whose label
+    /// satisfies [`crate::profile::member_label_names_pump`] (TS-h, DEC-384).
+    ///
+    /// Collected under the `active_profile` lock alone and returned owned, so no
+    /// caller holds that lock while taking another. A caller that needs the hwmon
+    /// controller lock must call this BEFORE taking it: the two are never held
+    /// together, in either order. The engine holds the controller across
+    /// blocking sysfs writes, so waiting for it with `active_profile` held would
+    /// stall everything else that takes `active_profile` — the engine tick and
+    /// `/poll`'s status build — behind one wedged header.
+    pub fn profile_pump_header_ids(&self) -> std::collections::HashSet<String> {
+        self.active_profile
+            .lock()
+            .as_ref()
+            .map(pump_header_ids)
+            .unwrap_or_default()
+    }
+
+    /// [SAFETY] Whether this header must never be stopped or driven below the
+    /// pump floor — the predicate behind pump-safe identify (DEC-311), the
+    /// role-aware verify duty (`AIO1-a`) and the published `stop_permitted`.
+    ///
+    /// A **union** of three pieces of evidence: the role in force is `Pump`; the
+    /// daemon's own discovery evidence (a `PUMP` label, or channel 1 of a known
+    /// liquid cooler) says pump; or a member of the active profile bound to this
+    /// header has a label naming a pump (DEC-384). A user assignment can
+    /// therefore ADD protection — the entire point on a board that publishes no
+    /// labels — but cannot REMOVE protection the hardware's own evidence
+    /// established.
+    ///
+    /// Without the second term the daemon held two contradictory beliefs about
+    /// the same header: `member_effective_floor` unions with
+    /// `member_needs_hard_floor` and so kept a label-derived pump at its 30%
+    /// floor, while identify consulted the fully-substituted role and would
+    /// happily drive that same pump to 0. `POST /config/header-role
+    /// {"role": "chassis_fan"}` on an `AIO_PUMP` header was all it took. The
+    /// third term closes the same contradiction for the floor's other input, the
+    /// profile's `member_label` — the only evidence on a chip with no label files.
+    ///
+    /// **It is not the engine's floor predicate, and the difference is
+    /// deliberate.** The floor also takes CPU-labelled members and every channel
+    /// of a liquid cooler; identify stops a CPU fan and a radiator fan on
+    /// purpose (DEC-311). This docstring used to say "exactly like the floor",
+    /// which was never true and hid the `member_label` gap (TS-h).
+    ///
+    /// The profile term makes the answer — and the published `stop_permitted` /
+    /// `effective_min_pwm_pct` — change when the active profile does.
+    pub fn header_is_pump_protected(&self, header_id: &str) -> bool {
+        // The profile term first, its lock already released.
+        let profile_names_pump = self.profile_pump_header_ids().contains(header_id);
+        let (assigned, inferred) = self.header_role_parts(header_id);
+        // One definition of the union, in `roles`. This wrapper only adds the
+        // lookups — see `roles::is_pump_protected` for why a caller already
+        // holding the controller lock must call that directly instead.
+        crate::hwmon::roles::is_pump_protected(assigned, inferred, profile_names_pump)
+    }
+}
+
+/// [`crate::profile::pump_floor_pct`] as a whole duty, for the diagnostic paths
+/// that write `u8` (DEC-443). Both floors are whole numbers, so the conversion
+/// is exact.
+pub(crate) fn pump_floor_duty(pwm_mode: Option<u8>) -> u8 {
+    crate::profile::pump_floor_pct(pwm_mode) as u8
+}
+
+/// Header ids `profile` names as pumps: every member whose label satisfies
+/// [`crate::profile::member_label_names_pump`] (TS-h, DEC-384).
+///
+/// The one definition of the profile term of the pump union, over a profile the
+/// caller already holds. [`AppState::profile_pump_header_ids`] wraps it for a
+/// caller that holds nothing; `fan_identify_handler` and activation call it
+/// directly, because each needs the answer and its own write under ONE
+/// `active_profile` guard (TS-af, DEC-394).
+pub(crate) fn pump_header_ids(
+    profile: &crate::profile::DaemonProfile,
+) -> std::collections::HashSet<String> {
+    profile
+        .controls
+        .iter()
+        .flat_map(|c| &c.members)
+        .filter(|m| crate::profile::member_label_names_pump(m))
+        .map(|m| m.member_id.clone())
+        .collect()
+}
+
+/// RAII guard that clears the profile engine's verify pause on drop (DEC-165),
+/// so a dropped or panicked verify handler never leaves the engine paused.
+/// Construct via [`begin_verify_pause`].
+pub(crate) struct VerifyPauseGuard {
+    cache: Arc<crate::health::cache::StateCache>,
+    /// The claim this guard owns (DEC-296). `end_verify` ignores a release from
+    /// a guard whose claim has since been superseded.
+    epoch: u64,
+}
+
+impl VerifyPauseGuard {
+    /// Prove this verify is still alive and keep the slot (DEC-296). `false`
+    /// means the deadman already elapsed and another diagnostic superseded us —
+    /// our lease has been force-taken and any write we still attempt will fail.
+    pub(crate) fn renew(&self, window: std::time::Duration) -> bool {
+        self.cache.renew_verify(self.epoch, window)
+    }
+}
+
+impl Drop for VerifyPauseGuard {
+    fn drop(&mut self) {
+        self.cache.end_verify(self.epoch);
+    }
+}
+
+/// Claim the single verify slot and pause the profile engine's write phase,
+/// returning a guard that clears it on drop — or `None` if a verify is already
+/// in progress (single-flight; the caller must reject with 409). While paused,
+/// the engine skips its write phase so a verify's controlled test writes are not
+/// overwritten. `window` is the deadman backstop; the guard is the normal clear
+/// path.
+pub(crate) fn begin_verify_pause(
+    cache: &Arc<crate::health::cache::StateCache>,
+    window: std::time::Duration,
+) -> Option<VerifyPauseGuard> {
+    cache
+        .try_begin_verify(window)
+        .map(|epoch| VerifyPauseGuard {
+            cache: cache.clone(),
+            epoch,
+        })
+}
+
+/// The 409 for a refused [`begin_verify_pause`]. While a firmware update holds
+/// the OpenFan controller every claimant is refused (DEC-481), and the answer
+/// says so in `details.reason`, so a client can tell it from a diagnostic.
+pub(crate) fn verify_slot_refusal(
+    cache: &crate::health::cache::StateCache,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if cache.openfan_maintenance_running() {
+        return openfan_maintenance_conflict();
+    }
+    error_response(
+        StatusCode::CONFLICT,
+        &ErrorEnvelope::validation("a hardware verify or calibration is already in progress"),
+    )
+}
+
+/// The `details.reason` of a request refused because the hwmon controller's
+/// lock did not come free in time (FFA-h).
+pub const HWMON_CONTROLLER_BUSY_REASON: &str = "hwmon_controller_busy";
+
+/// The answer of a request that needs the hwmon controller's live state when
+/// its lock did not come free within `HWMON_CONTROLLER_WAIT` (FFA-h) — a
+/// motherboard fan write that has not returned is holding it: 503
+/// `hardware_unavailable`, retryable, `details.reason: "hwmon_controller_busy"`.
+pub(crate) fn hwmon_controller_busy() -> (StatusCode, Json<serde_json::Value>) {
+    let mut e = ErrorEnvelope::hardware_unavailable(
+        "the motherboard fan controller is busy with a write that has not returned — try again",
+    );
+    e.error.details = Some(serde_json::json!({ "reason": HWMON_CONTROLLER_BUSY_REASON }));
+    error_response(StatusCode::SERVICE_UNAVAILABLE, &e)
+}
+
+/// The `details.reason` of every refusal caused by a running firmware update.
+pub const OPENFAN_MAINTENANCE_REASON: &str = "openfan_maintenance";
+
+/// The answer of every route refused while a firmware update runs (DEC-481):
+/// 409 `validation_error`, retryable, `details.reason: "openfan_maintenance"`.
+/// An older client that reads only `message` still shows why.
+pub(crate) fn openfan_maintenance_conflict() -> (StatusCode, Json<serde_json::Value>) {
+    let mut e = ErrorEnvelope::validation(
+        "an OpenFan firmware update is running — try again once it has finished",
+    );
+    e.error.retryable = true;
+    e.error.details = Some(serde_json::json!({ "reason": OPENFAN_MAINTENANCE_REASON }));
+    error_response(StatusCode::CONFLICT, &e)
+}
+
+/// Refuse to START a hardware fan verify when it would fight thermal safety.
+///
+/// **Corrected in DEC-297 (AUD-l).** This comment used to say a verify "pauses
+/// the engine's write phase for its window, which also suppresses the thermal
+/// thermal `force_all_with_floor`". **It does not, and never did.** `force_all_with_floor` runs at
+/// `profile_engine/mod.rs:970/973` and `continue`s well BEFORE the
+/// `verify_active()` gate at `:1120`, so an emergency outranks a verify and is
+/// unaffected by the pause — which `profile_engine/mod.rs:1072-1074` has always
+/// said. The guard is still worth having; its real justification is that a
+/// verify drives a header AWAY from its commanded duty, which must not happen
+/// while the system is hot or while the ladder is actively forcing.
+///
+/// Two conditions, and they are not the same test (DEC-297):
+/// 1. **Too hot** — any sensor above the calibrate/verify limit (85 °C), via
+///    `check_thermal_safety`, matching the calibrate sweep (DEC-201/DEC-134).
+///    Returns `409 thermal_abort`.
+/// 2. **The ladder is forcing** — `thermal_force_state` is `Some`. The
+///    temperature test above does NOT cover this: the emergency latches at
+///    at least 105 °C (per-machine since DEC-308) and releases only at ≤80 °C,
+///    so the band 80 < T ≤ 85 passes it while
+///    every fan is still being forced. Returns `409 validation_error` with
+///    `retryable: true`, the shape DEC-295 established for the same refusal on
+///    the calibrate endpoint.
+///
+/// `None` when it is safe to proceed.
+pub(crate) fn verify_thermal_guard(
+    cache: &crate::health::cache::StateCache,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if let Err(crate::api::calibration::CalibrationError::ThermalAbort {
+        sensor_id,
+        temp_c,
+        limit_c,
+    }) = crate::api::calibration::check_thermal_safety(cache)
+    {
+        return Some(error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::thermal_abort(format!(
+                "Cannot run a fan verify while hot: {sensor_id} at {temp_c:.1}°C \
+                 (limit {limit_c:.0}°C). Let the system cool, then retry."
+            )),
+        ));
+    }
+    // DEC-297 (295-a): the latched band the temperature test above cannot see.
+    if let Some(state) = crate::api::calibration::thermal_force_state(cache) {
+        return Some(error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope {
+                error: ErrorBody {
+                    code: "validation_error".into(),
+                    message: format!(
+                        "thermal safety is forcing fan output ({state}); a fan verify \
+                         cannot run"
+                    ),
+                    retryable: true,
+                    source: "validation".into(),
+                    details: None,
+                },
+            },
+        ));
+    }
+    None
+}
+
+/// [SAFETY] Refuse a diagnostic whose temperature telemetry is too old to trust
+/// (DEC-336 for discovery; every diagnostic since DEC-385, `TS-q`).
+///
+/// The third thermal gate, beside [`verify_thermal_guard`]'s two. Those compare
+/// `value_c` and cannot see age, so a wedged poll presents its last reading
+/// forever and both pass — while the ladder, which DOES see the age, treats a
+/// hot stale reading as unusable and cannot force. Keyed on `diagnostic` through
+/// [`crate::api::calibration::stale_temperature_refusal`], the same predicate the
+/// published preflight verdict is derived from, so the two cannot disagree.
+///
+/// `409 validation_error`, `retryable: true`, deliberately not `thermal_abort`:
+/// the machine may be perfectly cool, and the honest statement is that the
+/// daemon cannot tell — the shape of `verify_thermal_guard`'s forcing branch.
+/// `what` names the operation in the message.
+pub(crate) fn stale_temperature_guard(
+    cache: &crate::health::cache::StateCache,
+    diagnostic: crate::api::preflight::Diagnostic,
+    what: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let reason = crate::api::calibration::stale_temperature_refusal(cache, diagnostic)?;
+    Some(error_response(
+        StatusCode::CONFLICT,
+        &ErrorEnvelope {
+            error: ErrorBody {
+                code: "validation_error".into(),
+                message: format!(
+                    "{what} cannot run: {reason}. Retry once sensor polling recovers."
+                ),
+                retryable: true,
+                source: "validation".into(),
+                details: None,
+            },
+        },
+    ))
+}
+
+/// Run a blocking, fsync-ing persistence call off the async worker threads
+/// (DEC-252).
+///
+/// `atomic_io::write_atomic` does `write` + `fsync` + `rename` + a directory
+/// `fsync`. That is unbounded wall-clock time on whichever tokio worker thread
+/// polls the handler — the same runtime the 1 Hz profile engine, and therefore
+/// the thermal-safety decision, is scheduled on.
+///
+/// Severity, stated honestly: the runtime is multi-threaded with one worker per
+/// core (`#[tokio::main]` with no arguments), so a single write cannot starve
+/// the engine on its own — every other worker keeps polling. This removes the
+/// coupling rather than leaving the engine's timing dependent on how many cores
+/// the machine happens to have and how many writes arrive at once. It also
+/// matches what `gpu.rs` and `hw_diagnostics.rs` already do for their blocking
+/// sysfs work.
+pub(crate) async fn persist_off_runtime<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        // The closure panicked or the runtime is shutting down. Report it as a
+        // persistence failure rather than unwrapping — a panicking write must
+        // not take an API worker down with it.
+        Err(e) => Err(format!("persistence task failed: {e}")),
+    }
+}
+
+/// Run `fut` holding the profile store lock (FFA-j), in a task of its own.
+///
+/// The task is what makes the critical section whole: axum drops a handler's
+/// future when its client disconnects, and a lock held by that future would be
+/// released mid-step — after a swap but before its persist, or while a
+/// `spawn_blocking` write still runs — letting the next holder interleave. A
+/// spawned task runs to the end whatever happens to the request. `Err` only if
+/// the task panicked.
+pub(crate) async fn under_store_lock<T, F>(fut: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::spawn(async move {
+        let _store = crate::profile_store::STORE_LOCK.lock().await;
+        fut.await
+    })
+    .await
+    .map_err(|e| format!("store task failed: {e}"))
+}
+
+/// Why a [`bounded_profile_io`] call produced no answer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProfileIoError {
+    /// [`PROFILE_IO_MAX_OUTSTANDING`](crate::constants::PROFILE_IO_MAX_OUTSTANDING)
+    /// reads stayed outstanding for the whole budget; nothing was started.
+    Busy,
+    /// The read did not finish within the budget. It may still be running.
+    TimedOut,
+    /// The read panicked.
+    Failed(String),
+}
+
+/// [SAFETY] Run a profile-directory read off the async workers, bounded in time
+/// and in how many may be outstanding (FFA-b).
+///
+/// A profile read touches directories any local user can register, and those
+/// can sit on a FUSE or network mount that stops answering. Run on a tokio
+/// worker, such a read parked the worker, and a few concurrent requests parked
+/// every worker the 1 Hz engine (and so the thermal decision) ticks on, until
+/// the watchdog killed the daemon. Here the read runs on the blocking pool, and
+/// the request waits at most `budget` in all: for a free slot, then for the
+/// read. Because `spawn_blocking` cannot be cancelled, the slot stays with the
+/// read until it really ends, so at most `slots` threads can ever be parked by
+/// hung reads. A request that finds every slot held by such reads for its whole
+/// budget is refused without starting one. Waiting for a slot parks no thread;
+/// a burst of healthy reads just queues for microseconds.
+///
+/// The slots are a parameter so a test can use its own.
+pub(crate) async fn bounded_profile_io<T, F>(
+    slots: &'static tokio::sync::Semaphore,
+    budget: std::time::Duration,
+    f: F,
+) -> Result<T, ProfileIoError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let permit = match tokio::time::timeout_at(deadline, slots.acquire()).await {
+        Ok(Ok(permit)) => permit,
+        // Elapsed, or closed (these semaphores never are).
+        _ => return Err(ProfileIoError::Busy),
+    };
+    let join = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    });
+    match tokio::time::timeout_at(deadline, join).await {
+        Err(_elapsed) => Err(ProfileIoError::TimedOut),
+        Ok(Err(join_error)) => Err(ProfileIoError::Failed(join_error.to_string())),
+        Ok(Ok(value)) => Ok(value),
+    }
+}
+
+/// The slots reads of registered profile directories share. `profile_store`
+/// leaves at most one read per directory hung, so hung directories alone cannot
+/// hold them all.
+pub(crate) static PROFILE_IO_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(crate::constants::PROFILE_IO_MAX_OUTSTANDING);
+
+/// The slots resolutions of client-supplied paths share: a pool of their own,
+/// so paths a client names cannot take the slots registered directories are
+/// read with.
+static PATH_RESOLVE_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(crate::constants::PATH_RESOLVE_MAX_OUTSTANDING);
+
+/// One outstanding path resolution per uid, so one user's hung or slow mount
+/// parks one thread and refuses only that user's later edits, not everyone's.
+static RESOLVING_USERS: crate::io_gate::Gate<u32> = crate::io_gate::Gate::new();
+
+/// Read registered profile directories: [`bounded_profile_io`] over
+/// [`PROFILE_IO_SLOTS`] and
+/// [`PROFILE_IO_BUDGET`](crate::constants::PROFILE_IO_BUDGET). `f` gets the
+/// instant its walk must stop starting reads, a
+/// [`PROFILE_IO_REPLY_MARGIN`](crate::constants::PROFILE_IO_REPLY_MARGIN)
+/// before the budget runs out.
+pub(crate) async fn profile_io<T, F>(f: F) -> Result<T, ProfileIoError>
+where
+    F: FnOnce(std::time::Instant) -> T + Send + 'static,
+    T: Send + 'static,
+{
+    use crate::constants::{PROFILE_IO_BUDGET, PROFILE_IO_REPLY_MARGIN};
+    let stop_at = std::time::Instant::now() + PROFILE_IO_BUDGET - PROFILE_IO_REPLY_MARGIN;
+    bounded_profile_io(&PROFILE_IO_SLOTS, PROFILE_IO_BUDGET, move || f(stop_at)).await
+}
+
+/// Resolve paths a client named, for the client `peer_uid`: bounded as
+/// [`profile_io`], in its own pool, and one at a time per uid.
+///
+/// The uid is claimed before a slot is taken, and a request waits for its
+/// uid's earlier resolution here, on the async side, holding neither a slot nor
+/// a thread: so one user, however many requests it sends and however slow its
+/// mount, holds at most one slot (concurrency review of FFA-b). A uid whose
+/// resolution has been outstanding for
+/// [`PROFILE_DIR_HUNG_AFTER`](crate::constants::PROFILE_DIR_HUNG_AFTER) is
+/// refused as [`ProfileIoError::Busy`] at once.
+pub(crate) async fn resolve_io<T, F>(peer_uid: Option<u32>, f: F) -> Result<T, ProfileIoError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    use crate::constants::{PROFILE_DIR_HUNG_AFTER, PROFILE_IO_BUDGET};
+    /// How often a request looks again for its uid's turn.
+    const RECHECK: std::time::Duration = std::time::Duration::from_millis(10);
+    let key = peer_uid.unwrap_or(u32::MAX);
+    let deadline = std::time::Instant::now() + PROFILE_IO_BUDGET;
+    let claim = loop {
+        if let Some(claim) = RESOLVING_USERS.try_claim(key) {
+            break claim;
+        }
+        let hung = RESOLVING_USERS
+            .held_for(&key)
+            .is_some_and(|age| age >= PROFILE_DIR_HUNG_AFTER);
+        if hung || std::time::Instant::now() + RECHECK >= deadline {
+            return Err(ProfileIoError::Busy);
+        }
+        tokio::time::sleep(RECHECK).await;
+    };
+    // The claim goes with the work, so it is held until the resolution really
+    // ends, not just until this request gives up on it.
+    let left = deadline.saturating_duration_since(std::time::Instant::now());
+    bounded_profile_io(&PATH_RESOLVE_SLOTS, left, move || {
+        let _claim = claim;
+        f()
+    })
+    .await
+}
+
+/// The answer to a [`ProfileIoError`]: a retryable `500 internal_error`. The
+/// detail goes to the log, never the envelope (DEC-173).
+pub(crate) fn profile_io_error_response(
+    what: &str,
+    error: ProfileIoError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let message = match error {
+        ProfileIoError::Busy => {
+            log::warn!("{what}: refused, earlier profile reads have still not finished");
+            "profile storage is busy with reads that have not finished; try again"
+        }
+        ProfileIoError::TimedOut => {
+            log::warn!(
+                "{what}: a profile read did not finish within {} s",
+                crate::constants::PROFILE_IO_BUDGET.as_secs()
+            );
+            "profile storage did not respond in time; try again"
+        }
+        ProfileIoError::Failed(detail) => {
+            log::error!("{what}: the profile read failed: {detail}");
+            "profile storage failed; try again"
+        }
+    };
+    error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        &ErrorEnvelope::internal(message),
+    )
+}
+
+/// `status.openfan_link`, `status.openfan_maintenance` (DEC-481) and
+/// `status.openfan_silent_board` (DEC-484), read under the same guard as the
+/// health entry they explain.
+pub(crate) struct OpenFanStatusEntries {
+    pub link: Option<String>,
+    pub maintenance: Option<OpenFanMaintenanceSummary>,
+    pub silent_board: Option<OpenFanSilentBoardEntry>,
+}
+
+pub(crate) fn build_openfan_status_entries(snap: &DaemonState) -> OpenFanStatusEntries {
+    use crate::health::state::OpenFanMaintenance;
+    OpenFanStatusEntries {
+        link: snap.openfan_link_wire().map(str::to_string),
+        // Not while an update runs: the run is what the client shows then, and
+        // the watch may not have looked since it started.
+        silent_board: snap
+            .openfan_silent_board
+            .as_ref()
+            .filter(|_| !snap.openfan_maintenance_running())
+            .map(|b| OpenFanSilentBoardEntry {
+                usb_serial: b.usb_serial.clone(),
+                usb_port: b.usb_port.clone(),
+            }),
+        maintenance: snap.openfan_maintenance.as_ref().map(|m| match m {
+            OpenFanMaintenance::Running { run_id, stage, .. } => OpenFanMaintenanceSummary {
+                run_id: run_id.clone(),
+                stage: stage.to_string(),
+                state: "running".into(),
+                outcome: None,
+            },
+            OpenFanMaintenance::NeedsRecovery { run_id, outcome } => OpenFanMaintenanceSummary {
+                run_id: run_id.clone(),
+                stage: crate::openfan_maintenance::stage::FINISHED.into(),
+                state: "needs_recovery".into(),
+                outcome: Some(outcome.to_string()),
+            },
+        }),
+    }
+}
+
+// Nine since DEC-481's `openfan`: each argument is one snapshot-guarded read
+// the two callers build under a single `read_with`, so bundling them would only
+// move the list into a struct both callers must fill field by field.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_status_response(
+    state: &AppState,
+    thermal_state: String,
+    unavailable_sensors: Vec<UnavailableSensorEntry>,
+    skipped_controls: Vec<SkippedControlEntry>,
+    control_outputs: Vec<ControlOutputEntry>,
+    health: crate::health::staleness::HealthSummary,
+    verify_active: bool,
+    cooling: CoolingSafetyEntries,
+    openfan: OpenFanStatusEntries,
+) -> StatusResponse {
+    // `AUD3-m`. Hoisted out of the struct literal deliberately: a temporary in a
+    // field initialiser lives until the end of the whole statement, so reading it
+    // inline would hold this guard across `state.validation.live_summary()` (which
+    // takes the recorder's `live` mutex) and across the `override_table` lock
+    // below. No cycle exists today — nothing takes those and then reaches for this
+    // — but a guard held across two unrelated acquisitions on the 1 Hz poll path is
+    // exactly the latent ordering hazard this file warns about elsewhere. Cloning
+    // into a local makes it a genuine leaf read, which is what the field's doc
+    // claims it is.
+    let degraded = state.runtime_config_degraded.read().clone();
+
+    let subsystems = health
+        .subsystems
+        .into_iter()
+        .map(|s| SubsystemStatus {
+            name: s.name,
+            status: s.status.to_string(),
+            age_ms: s.age_ms,
+            reason: s.reason,
+        })
+        .collect();
+
+    let uptime = state.start_time.elapsed().as_secs();
+
+    // Daemon-owned override + identify state (DEC-163/DEC-166) — poll surface.
+    let (override_rows, identify_rows) = state.override_table.lock().status_rows();
+    let overrides = override_rows
+        .into_iter()
+        .map(|r| OverrideStatusEntry {
+            control_id: r.control_id,
+            pwm_percent: r.pwm_percent,
+            expires_in_secs: r.expires_in_secs,
+        })
+        .collect();
+    let fan_identify = identify_rows
+        .into_iter()
+        .map(|r| IdentifyStatusEntry {
+            fan_id: r.fan_id,
+            expires_in_secs: r.expires_in_secs,
+            // DEC-311: a GUI polling into an identify it did not initiate still
+            // needs to describe it truthfully — "stopped" vs "held at 85%".
+            mode: r.mode.as_str().into(),
+            identify_pwm_percent: r.identify_pwm_percent,
+        })
+        .collect();
+
+    // Active profile (DEC-194) — mirror id+name onto the poll surface so an
+    // external activation shows within one poll. Tight lock: clone out and drop
+    // the guard within this statement; the override_table lock above is already
+    // released, so lock order (EFF-1) is preserved.
+    let (active_profile_id, active_profile_name) = state
+        .active_profile
+        .lock()
+        .as_ref()
+        .map(|p| (Some(p.id.clone()), Some(p.name.clone())))
+        .unwrap_or((None, None));
+    // `CTRL-d`: derived from the id built immediately above — the same value, not
+    // a second read of `state.active_profile` and not a daemon-version constant.
+    // Two arguments to the same response drawn from different sources eventually
+    // disagree (DEC-325), and here the whole point of the field is that a client
+    // may trust it when the id is absent.
+    let has_active_profile = active_profile_id.is_some();
+
+    // DEC-206: mirror the cached readiness rollup for the GUI Dashboard chip.
+    // Cheap — clones a small `Option<ReadinessRollup>` under a tight lock (no
+    // sysfs/disk; the rollup is refreshed off the poll path). Independent lock,
+    // taken and released within this statement, so lock order is preserved.
+    let readiness = state.readiness_rollup.lock().clone();
+
+    StatusResponse {
+        api_version: API_VERSION,
+        daemon_version: state.daemon_version.clone(),
+        overall_status: health.overall.to_string(),
+        subsystems,
+        uptime_seconds: Some(uptime),
+        // DEC-132: surface the profile engine's thermal override state. The
+        // caller extracts it from the cache (defaulting "normal" before the
+        // engine's first tick) so this builder no longer needs a `DaemonState`
+        // snapshot — only the `override_table` lock, which must stay OUTSIDE any
+        // cache read guard to preserve the lock order (EFF-1).
+        thermal_state,
+        overrides,
+        fan_identify,
+        unavailable_sensors,
+        skipped_controls,
+        control_outputs,
+        // `live_summary`, NOT `snapshot`: this runs on `/status` AND `/poll`, the
+        // GUI's 1 Hz path. `snapshot` clones every sample and event to produce
+        // eight scalars — order 10^5 allocations for a full two-hour session,
+        // growing as it records — while holding the very lock the recorder tick
+        // needs. The summary is fixed-size and lives behind its own mutex.
+        runtime_config_degraded: degraded,
+        validation_session: state
+            .validation
+            .live_summary()
+            .map(|s| ValidationSessionSummary {
+                session_id: s.session_id,
+                kind: s.kind,
+                state: s.state,
+                elapsed_ms: s.elapsed_ms,
+                sample_count: s.sample_count,
+                event_count: s.event_count,
+                sample_limit_reached: s.sample_limit_reached,
+                cooling_device_id: s.cooling_device_id,
+            }),
+        active_profile_id,
+        active_profile_name,
+        has_active_profile,
+        readiness,
+        // `WIRE-n`: extracted by the caller under the same cache read guard the
+        // rest of this response is built from, because `Cache::verify_active`
+        // would re-enter that lock. Passed in for the same reason
+        // `thermal_state` is.
+        verify_active,
+        // DEC-443: built under the same guard, so the causes and the
+        // `thermal_state` above describe the same engine tick.
+        emergency_causes: cooling.emergency_causes,
+        pump_stalls: cooling.pump_stalls,
+        advisories: cooling.advisories,
+        // DEC-481: under the same guard as `health`'s `openfan` entry.
+        openfan_link: openfan.link,
+        openfan_maintenance: openfan.maintenance,
+        openfan_silent_board: openfan.silent_board,
+    }
+}
+
+/// Serialize any `Serialize` value into a JSON response, returning HTTP 500
+/// with a proper error envelope if serialization unexpectedly fails.
+pub(crate) fn json_ok(
+    status: StatusCode,
+    val: impl serde::Serialize,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match serde_json::to_value(val) {
+        Ok(v) => (status, Json(v)),
+        Err(e) => {
+            log::error!("response serialization failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "internal_error",
+                        "message": "response serialization failed",
+                        "retryable": true,
+                        "source": "internal"
+                    }
+                })),
+            )
+        }
+    }
+}
+
+/// Helper to serialize an ErrorEnvelope into a JSON value response.
+pub(crate) fn error_response(
+    status: StatusCode,
+    envelope: &ErrorEnvelope,
+) -> (StatusCode, Json<serde_json::Value>) {
+    json_ok(status, envelope)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::health::state::DaemonState;
+    use std::time::Instant;
+
+    /// DEC-481: a refused diagnostic says why — a firmware update holding the
+    /// slot is a reason a client can show, not the generic "already running".
+    #[test]
+    fn a_refused_diagnostic_names_a_running_firmware_update() {
+        use crate::health::state::OpenFanLink;
+        let cache = crate::health::cache::StateCache::new();
+        let (code, Json(v)) = verify_slot_refusal(&cache);
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert!(v["error"]["details"].is_null(), "{v}");
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        let (code, Json(v)) = verify_slot_refusal(&cache);
+        assert_eq!(code, StatusCode::CONFLICT);
+        assert_eq!(v["error"]["code"], "validation_error");
+        assert_eq!(v["error"]["retryable"], true);
+        assert_eq!(v["error"]["details"]["reason"], OPENFAN_MAINTENANCE_REASON);
+    }
+
+    #[test]
+    fn a_board_needing_recovery_is_summarised_with_its_outcome() {
+        use crate::health::state::{OpenFanLink, OpenFanMaintenance};
+        let mut snap = DaemonState::default();
+        let none = build_openfan_status_entries(&snap);
+        assert!(none.link.is_none() && none.maintenance.is_none());
+        snap.openfan_link = Some(OpenFanLink::Reconnecting);
+        snap.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+            run_id: "r1".into(),
+            outcome: "needs_recovery",
+        });
+        let e = build_openfan_status_entries(&snap);
+        assert_eq!(e.link.as_deref(), Some("reconnecting"));
+        let m = e.maintenance.unwrap();
+        assert_eq!(
+            (m.state.as_str(), m.outcome.as_deref(), m.run_id.as_str()),
+            ("needs_recovery", Some("needs_recovery"), "r1")
+        );
+    }
+
+    /// DEC-484: the silent board is published while no update runs, and not
+    /// while one does — the run is what the client shows then.
+    #[test]
+    fn a_silent_board_is_published_except_while_an_update_runs() {
+        use crate::health::state::{OpenFanMaintenance, SilentBoardEntry};
+        let mut snap = DaemonState {
+            openfan_silent_board: Some(SilentBoardEntry {
+                usb_serial: "DE615CB14721492C".into(),
+                usb_port: "8-8".into(),
+            }),
+            ..DaemonState::default()
+        };
+        let b = build_openfan_status_entries(&snap).silent_board.unwrap();
+        assert_eq!(
+            (b.usb_serial.as_str(), b.usb_port.as_str()),
+            ("DE615CB14721492C", "8-8")
+        );
+        snap.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+            run_id: "r0".into(),
+            outcome: "needs_recovery",
+        });
+        assert!(
+            build_openfan_status_entries(&snap).silent_board.is_some(),
+            "a board left needing recovery may be the silent one"
+        );
+        let cache = crate::health::cache::StateCache::new();
+        cache.set_openfan_silent_board(snap.openfan_silent_board.clone());
+        cache
+            .try_begin_silent_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        let running = cache.read_with(|s| s.clone());
+        assert!(running.openfan_maintenance_running(), "precondition");
+        assert!(running.openfan_silent_board.is_some(), "precondition");
+        assert!(build_openfan_status_entries(&running)
+            .silent_board
+            .is_none());
+    }
+
+    #[test]
+    fn json_ok_serializes_valid_struct() {
+        let val = serde_json::json!({"key": "value"});
+        let (status, Json(body)) = json_ok(StatusCode::OK, &val);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["key"], "value");
+    }
+
+    /// `DC-ce`: a body that cannot be serialised answers `500 internal_error`,
+    /// never a success with an empty or partial body. A tuple-keyed map is the
+    /// smallest value `serde_json` refuses ("key must be a string").
+    #[test]
+    fn json_ok_answers_500_when_the_body_cannot_be_serialised() {
+        let unserialisable: std::collections::BTreeMap<(u8, u8), u8> = [((1, 2), 3)].into();
+        let (status, Json(body)) = json_ok(StatusCode::OK, &unserialisable);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["code"], "internal_error");
+        assert_eq!(body["error"]["source"], "internal");
+        assert_eq!(body["error"]["retryable"], true);
+    }
+
+    /// `DC-ce`: every handler serialises its response through `json_ok`, so a
+    /// serialisation failure is a `500` everywhere. `GET /config` used to call
+    /// `serde_json::to_value` itself and answer `200 {}` on failure.
+    ///
+    /// Walks the directory rather than naming files, so a handler module added
+    /// later is covered without anyone enrolling it. Production half only (up to
+    /// the `mod tests` block) and comment lines skipped, or this would match its
+    /// own text.
+    #[test]
+    fn json_ok_is_the_only_response_serialiser_in_the_handlers() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/handlers");
+        let mut sites = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("handlers dir is readable") {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let whole = std::fs::read_to_string(&path).unwrap();
+            let prod = whole
+                .split_once("#[cfg(test)]\nmod tests")
+                .map_or(whole.as_str(), |(before, _)| before);
+            for (n, line) in prod.lines().enumerate() {
+                if !line.trim_start().starts_with("//") && line.contains("serde_json::to_value(") {
+                    sites.push(format!(
+                        "{}:{}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        n + 1
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            sites.len(),
+            1,
+            "only `json_ok` may serialise a handler's response — a handler that \
+             calls `serde_json::to_value` itself chooses its own failure answer \
+             (found: {sites:?})"
+        );
+        assert!(
+            sites[0].starts_with("mod.rs:"),
+            "the one serialiser must be `json_ok` in mod.rs (found: {sites:?})"
+        );
+    }
+
+    #[test]
+    fn build_sensor_entries_returns_empty_for_empty_state() {
+        let state = DaemonState::default();
+        let entries = build_sensor_entries(&state, Instant::now());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn build_fan_entries_returns_empty_for_empty_state() {
+        let state = DaemonState::default();
+        let entries = build_fan_entries(&state, Instant::now());
+        assert!(entries.is_empty());
+    }
+
+    /// OFS-l: a channel the daemon has only ever WRITTEN must not publish a
+    /// fabricated `rpm: 0`.
+    ///
+    /// `OpenFanState.rpm` starts at 0 because that is the struct's initial value,
+    /// not because anything measured it. `rpm_polled` records the difference and
+    /// was already consulted for `stall_detected` — publishing `Some(0)` anyway
+    /// made an unmeasured channel indistinguishable on the wire from a genuinely
+    /// stalled one.
+    #[test]
+    fn a_never_polled_openfan_channel_publishes_no_rpm() {
+        let mut state = DaemonState::default();
+        state.openfan_fans.insert(
+            3,
+            crate::health::state::OpenFanState {
+                channel: 3,
+                rpm: 0,
+                last_commanded_pwm: Some(70),
+                updated_at: Instant::now(),
+                rpm_polled: false,
+                poll_seq: 0,
+            },
+        );
+        state.openfan_fans.insert(
+            4,
+            crate::health::state::OpenFanState {
+                channel: 4,
+                rpm: 0,
+                last_commanded_pwm: Some(70),
+                updated_at: Instant::now(),
+                rpm_polled: true,
+                poll_seq: 0,
+            },
+        );
+
+        let entries = build_fan_entries(&state, Instant::now());
+        let ch3 = entries.iter().find(|e| e.id == "openfan:ch03").unwrap();
+        let ch4 = entries.iter().find(|e| e.id == "openfan:ch04").unwrap();
+
+        assert_eq!(
+            ch3.rpm, None,
+            "a channel nothing has polled must report no rpm, not a measured-looking zero"
+        );
+        assert_eq!(
+            ch4.rpm,
+            Some(0),
+            "a channel that WAS polled and genuinely read 0 must still report it — \
+             the fix must not suppress a real stalled-fan reading"
+        );
+        assert_eq!(
+            ch4.stall_detected,
+            Some(true),
+            "precondition: the polled zero is the stall signal, and it must survive"
+        );
+        assert_eq!(
+            ch3.stall_detected, None,
+            "precondition: an unpolled channel already reported no stall verdict"
+        );
+    }
+
+    /// An update parks every OpenFan channel at 100 % and then lends the port
+    /// (DEC-481): no tach is read after that command until the poll loop has
+    /// the port back, nor while a board awaits recovery. A verdict then paired
+    /// the parking duty with a reading taken before it, so a channel with no
+    /// fan read as stalled for the whole update.
+    #[test]
+    fn an_update_holding_the_openfan_channels_gives_no_stall_verdict() {
+        use crate::health::state::OpenFanMaintenance;
+        use crate::openfan_maintenance::{outcome, stage};
+
+        let verdict = |maintenance: Option<OpenFanMaintenance>| {
+            let mut state = DaemonState::default();
+            state.openfan_fans.insert(
+                0,
+                crate::health::state::OpenFanState {
+                    channel: 0,
+                    rpm: 0,
+                    last_commanded_pwm: Some(100),
+                    updated_at: Instant::now(),
+                    rpm_polled: true,
+                    poll_seq: 1,
+                },
+            );
+            state.openfan_maintenance = maintenance;
+            build_fan_entries(&state, Instant::now())[0].stall_detected
+        };
+        let running = |writes_suspended| OpenFanMaintenance::Running {
+            run_id: "r1".into(),
+            stage: stage::PARKING,
+            stage_deadline: None,
+            writes_suspended,
+        };
+
+        assert_eq!(verdict(None), Some(true), "precondition: 0 RPM at 100 %");
+        assert_eq!(
+            verdict(Some(running(false))),
+            Some(true),
+            "before the channels are parked the poll loop still reads them"
+        );
+        assert_eq!(verdict(Some(running(true))), None, "parked, the port lent");
+        assert_eq!(
+            verdict(Some(OpenFanMaintenance::NeedsRecovery {
+                run_id: "r1".into(),
+                outcome: outcome::NEEDS_RECOVERY,
+            })),
+            None,
+            "a board awaiting recovery is not polled"
+        );
+    }
+
+    #[test]
+    fn build_sensor_entries_sorts_by_id() {
+        // DEC-146 P3-11: deterministic wire order across restarts/rescans.
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        for id in ["z_temp", "a_temp", "m_temp"] {
+            state.sensors.insert(
+                id.into(),
+                crate::health::state::CachedSensorReading {
+                    id: id.into(),
+                    kind: crate::hwmon::types::SensorKind::CpuTemp,
+                    label: "t".into(),
+                    value_c: 40.0,
+                    source: crate::health::state::DeviceLabel::Hwmon,
+                    updated_at: now,
+                    rate_c_per_s: None,
+                    session_min_c: None,
+                    session_max_c: None,
+                    chip_name: "k10temp".into(),
+                    temp_type: None,
+                    thresholds: None,
+                },
+            );
+        }
+        let ids: Vec<String> = build_sensor_entries(&state, now)
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["a_temp", "m_temp", "z_temp"]);
+    }
+
+    #[test]
+    fn build_fan_entries_sorts_by_id() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+
+        // Insert fans in reverse order
+        state.hwmon_fans.insert(
+            "hwmon:z_fan".into(),
+            crate::health::state::HwmonFanState {
+                id: "hwmon:z_fan".into(),
+                rpm: Some(1000),
+                last_commanded_pwm: None,
+                pwm_readback_pct: None,
+                pwm_commanded_pct: None,
+                updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
+            },
+        );
+        state.hwmon_fans.insert(
+            "hwmon:a_fan".into(),
+            crate::health::state::HwmonFanState {
+                id: "hwmon:a_fan".into(),
+                rpm: Some(500),
+                last_commanded_pwm: None,
+                pwm_readback_pct: None,
+                pwm_commanded_pct: None,
+                updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
+            },
+        );
+
+        let entries = build_fan_entries(&state, now);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "hwmon:a_fan");
+        assert_eq!(entries[1].id, "hwmon:z_fan");
+    }
+
+    #[test]
+    fn build_fan_entries_routes_gpu_source_by_id_prefix() {
+        // The wire `source` the GUI keys on is derived from the gpu_fans id
+        // prefix. Each vendor prefix must map to the right source string
+        // (DEC-121/DEC-204); a transposed branch would mislabel GPU fans.
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        let cases = [
+            ("amd_gpu:0000:03:00.0", "amd_gpu"),
+            ("intel_gpu:0000:04:00.0", "intel_gpu"),
+            ("nvidia_gpu:0000:05:00.0", "nvidia_gpu"),
+        ];
+        for (id, _) in cases {
+            state.gpu_fans.insert(
+                id.into(),
+                crate::health::state::AmdGpuFanState {
+                    id: id.into(),
+                    rpm: Some(1200),
+                    last_commanded_pct: None,
+                    duty_pct: Some(33),
+                    updated_at: now,
+                },
+            );
+        }
+
+        let entries = build_fan_entries(&state, now);
+        for (id, expected_source) in cases {
+            let e = entries.iter().find(|e| e.id == id).unwrap();
+            assert_eq!(e.source.as_str(), expected_source, "source for {id}");
+            // GPU fan telemetry here is read-only — no commanded PWM.
+            assert_eq!(e.last_commanded_pwm, None);
+            // The measured duty % must route from the cache to the wire (DEC-204).
+            assert_eq!(e.duty_pct, Some(33), "duty_pct for {id}");
+        }
+    }
+
+    /// AIO-MB Phase 6: the command and the readback must reach the wire as two
+    /// independent numbers, and an hwmon header is the only source that has both.
+    ///
+    /// Asserts the disagreeing case on purpose. Equal values would pass with the
+    /// two fields wired to the same cache member, which is the bug this split
+    /// exists to prevent — and is what `last_commanded_pwm` still does (AIO5-a).
+    #[test]
+    fn hwmon_fan_entry_publishes_command_and_readback_separately() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        state.hwmon_fans.insert(
+            "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            crate::health::state::HwmonFanState {
+                id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+                rpm: Some(1284),
+                last_commanded_pwm: Some(30),
+                pwm_readback_pct: Some(30),
+                pwm_commanded_pct: Some(45),
+                updated_at: now,
+                alarm: None,
+                pwm_enable_mode: Some(1),
+            },
+        );
+
+        let entries = build_fan_entries(&state, now);
+        let e = &entries[0];
+        assert_eq!(e.pwm_commanded_pct, Some(45), "the daemon commanded 45%");
+        assert_eq!(e.pwm_readback_pct, Some(30), "the hardware reports 30%");
+        assert_ne!(
+            e.pwm_commanded_pct, e.pwm_readback_pct,
+            "the two axes must not be wired to the same source"
+        );
+    }
+
+    /// Absent, never 0%, and never an echo of the command: an OpenFan channel
+    /// and a GPU fan have no hwmon command/readback split to report, and
+    /// synthesising one would make a fabricated number indistinguishable from a
+    /// measured one.
+    #[test]
+    fn non_hwmon_fan_entries_omit_the_pwm_command_split() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        state.openfan_fans.insert(
+            3,
+            crate::health::state::OpenFanState {
+                channel: 3,
+                rpm: 900,
+                last_commanded_pwm: Some(50),
+                updated_at: now,
+                rpm_polled: true,
+                poll_seq: 0,
+            },
+        );
+        state.gpu_fans.insert(
+            "amd_gpu:0000:03:00.0".into(),
+            crate::health::state::AmdGpuFanState {
+                id: "amd_gpu:0000:03:00.0".into(),
+                rpm: Some(1500),
+                last_commanded_pct: Some(60),
+                duty_pct: None,
+                updated_at: now,
+            },
+        );
+
+        for e in build_fan_entries(&state, now) {
+            assert_eq!(
+                e.pwm_commanded_pct, None,
+                "{} must not synthesise a commanded-PWM readback split",
+                e.id
+            );
+            assert_eq!(e.pwm_readback_pct, None, "{}", e.id);
+            // Their own single-producer command field is untouched.
+            assert!(e.last_commanded_pwm.is_some(), "{}", e.id);
+        }
+    }
+
+    /// The `/fans` stall verdict for one hwmon header, shaped as the 1 Hz poll
+    /// leaves it: `last_commanded_pwm` holds the sysfs readback (AIO5-a),
+    /// `pwm_commanded_pct` what the daemon asked for, if it asked, and `seen`
+    /// whether its fan has been seen spinning.
+    fn hwmon_stall(
+        rpm: Option<u16>,
+        readback: u8,
+        commanded: Option<u8>,
+        seen: bool,
+    ) -> Option<bool> {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        state.hwmon_fans.insert(
+            "hwmon:fan1".into(),
+            crate::health::state::HwmonFanState {
+                id: "hwmon:fan1".into(),
+                rpm,
+                last_commanded_pwm: Some(readback),
+                pwm_readback_pct: Some(readback),
+                pwm_commanded_pct: commanded,
+                updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
+            },
+        );
+        if seen {
+            state.hwmon_seen_spinning.insert("hwmon:fan1".into());
+        }
+        build_fan_entries(&state, now)[0].stall_detected
+    }
+
+    /// A commanded header is measured against the COMMAND. Each case puts the
+    /// readback on the other side of the threshold, so a verdict taken from the
+    /// readback flips both answers.
+    #[test]
+    fn stall_detection_uses_constant_threshold() {
+        let at = constants::STALL_PWM_THRESHOLD;
+        // Commanded 20 % at 0 RPM is not a stall (the threshold is > 20).
+        assert_eq!(hwmon_stall(Some(0), at + 1, Some(at), true), Some(false));
+        // Commanded 21 % at 0 RPM is.
+        assert_eq!(hwmon_stall(Some(0), at, Some(at + 1), true), Some(true));
+    }
+
+    /// PTR-k: a header the daemon does not command, whose fan it has never
+    /// seen spinning, reports no verdict whatever duty the firmware holds it
+    /// at. A BIOS-held 40 % on an empty header read as a stall before this,
+    /// and the GUI raised it as an error alert.
+    #[test]
+    fn an_empty_uncommanded_header_has_no_stall_verdict() {
+        // Presence first: the same header, once its fan has been seen spinning.
+        assert_eq!(hwmon_stall(Some(0), 40, None, true), Some(true));
+        assert_eq!(hwmon_stall(Some(0), 40, None, false), None);
+        // A commanded header needs no such evidence: the daemon asked for 40 %.
+        assert_eq!(hwmon_stall(Some(0), 40, Some(40), false), Some(true));
+    }
+
+    /// DEC-458: a fan that stops while the firmware drives it is still a stall,
+    /// measured against the readback and the same threshold.
+    #[test]
+    fn an_uncommanded_fan_seen_spinning_is_measured_against_the_readback() {
+        let at = constants::STALL_PWM_THRESHOLD;
+        assert_eq!(hwmon_stall(Some(0), at + 1, None, true), Some(true));
+        assert_eq!(hwmon_stall(Some(0), at, None, true), Some(false));
+        assert_eq!(hwmon_stall(Some(900), 40, None, true), Some(false));
+    }
+
+    /// A low command is not a stall even when the firmware holds the header
+    /// higher, and no RPM reading is still no verdict.
+    #[test]
+    fn hwmon_stall_needs_a_high_command_and_an_rpm_reading() {
+        assert_eq!(hwmon_stall(Some(0), 40, Some(10), true), Some(false));
+        assert_eq!(hwmon_stall(None, 40, Some(40), true), None);
+        assert_eq!(hwmon_stall(Some(900), 40, Some(40), true), Some(false));
+    }
+
+    /// `PTR-ag`: the `/fans` verdict for a header at 0 RPM whose duty — 60 %
+    /// commanded, `readback` in sysfs — a diagnostic wrote under verify epoch
+    /// `marked` (`None`: the engine wrote it), while the verify slot is at
+    /// `current` and `active` or not.
+    fn stall_after_diagnostic(
+        marked: Option<u64>,
+        current: u64,
+        active: bool,
+        readback: u8,
+        seen: bool,
+    ) -> Option<bool> {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        state.hwmon_fans.insert(
+            "hwmon:fan1".into(),
+            crate::health::state::HwmonFanState {
+                id: "hwmon:fan1".into(),
+                rpm: Some(0),
+                last_commanded_pwm: Some(readback),
+                pwm_readback_pct: Some(readback),
+                pwm_commanded_pct: Some(60),
+                updated_at: now,
+                alarm: None,
+                pwm_enable_mode: None,
+            },
+        );
+        if let Some(epoch) = marked {
+            state
+                .hwmon_diagnostic_commanded
+                .insert("hwmon:fan1".into(), epoch);
+        }
+        state.verify_epoch = current;
+        state.verify_in_progress = active;
+        state.verify_active_until = active.then(|| now + std::time::Duration::from_secs(60));
+        if seen {
+            state.hwmon_seen_spinning.insert("hwmon:fan1".into());
+        }
+        build_fan_entries(&state, now)[0].stall_detected
+    }
+
+    /// `PTR-ag`: no verdict while the diagnostic that wrote the duty holds the
+    /// write pause, even for a fan seen spinning.
+    #[test]
+    fn a_header_under_a_diagnostic_has_no_stall_verdict() {
+        // Presence first: the same duty from the engine is a stall.
+        assert_eq!(stall_after_diagnostic(None, 3, true, 60, true), Some(true));
+        assert_eq!(stall_after_diagnostic(Some(3), 3, true, 60, true), None);
+        assert_eq!(stall_after_diagnostic(Some(3), 3, true, 60, false), None);
+    }
+
+    /// `PTR-ag`: once the diagnostic has ended, the duty it left is not a
+    /// command: the header is judged as one the daemon does not command —
+    /// against the readback, and only for a fan seen spinning. A later
+    /// diagnostic (a newer epoch) does not hold a header it never wrote.
+    #[test]
+    fn a_duty_a_finished_diagnostic_left_is_judged_as_uncommanded() {
+        // Ended: the readback decides, on either side of the threshold.
+        let at = constants::STALL_PWM_THRESHOLD;
+        assert_eq!(
+            stall_after_diagnostic(Some(3), 3, false, at + 1, true),
+            Some(true)
+        );
+        assert_eq!(
+            stall_after_diagnostic(Some(3), 3, false, at, true),
+            Some(false)
+        );
+        // An empty header the test restored reports nothing, not a stall.
+        assert_eq!(stall_after_diagnostic(Some(3), 3, false, 60, false), None);
+        // The engine's command, by contrast, is judged against itself.
+        assert_eq!(
+            stall_after_diagnostic(None, 3, false, at, false),
+            Some(true)
+        );
+        // A newer diagnostic elsewhere: judged as uncommanded, not withheld.
+        assert_eq!(
+            stall_after_diagnostic(Some(3), 4, true, 60, true),
+            Some(true)
+        );
+        assert_eq!(stall_after_diagnostic(Some(3), 4, true, 60, false), None);
+    }
+
+    /// DEC-458 at the call site: the cache's own record of a spinning fan is
+    /// what `/fans` reads. Two uncommanded headers at a firmware 40 % stop
+    /// reading RPM; only the one whose fan had turned is a stall.
+    #[test]
+    fn the_caches_seen_spinning_record_reaches_the_stall_verdict() {
+        let cache = StateCache::new();
+        let poll = |id: &str, rpm: u16| crate::health::state::HwmonFanState {
+            id: id.into(),
+            rpm: Some(rpm),
+            last_commanded_pwm: Some(40),
+            pwm_readback_pct: Some(40),
+            pwm_commanded_pct: None,
+            updated_at: Instant::now(),
+            alarm: None,
+            pwm_enable_mode: Some(5),
+        };
+        cache.update_hwmon_fans(vec![poll("hwmon:fan", 900), poll("hwmon:empty", 0)]);
+        cache.update_hwmon_fans(vec![poll("hwmon:fan", 0), poll("hwmon:empty", 0)]);
+        let entries = build_fan_entries(&cache.snapshot(), Instant::now());
+        let stall = |id: &str| entries.iter().find(|e| e.id == id).unwrap().stall_detected;
+        assert_eq!(stall("hwmon:fan"), Some(true));
+        assert_eq!(stall("hwmon:empty"), None);
+    }
+
+    #[test]
+    fn build_sensor_entries_includes_chip_name_and_temp_type() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+
+        state.sensors.insert(
+            "hwmon:nct6683:nodev:SYSTIN".into(),
+            crate::health::state::CachedSensorReading {
+                id: "hwmon:nct6683:nodev:SYSTIN".into(),
+                kind: crate::hwmon::types::SensorKind::MbTemp,
+                label: "SYSTIN".into(),
+                value_c: 42.0,
+                source: crate::health::state::DeviceLabel::Hwmon,
+                updated_at: now,
+                rate_c_per_s: None,
+                session_min_c: None,
+                session_max_c: None,
+                chip_name: "nct6683".into(),
+                temp_type: Some(3),
+                thresholds: None,
+            },
+        );
+
+        let entries = build_sensor_entries(&state, now);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].chip_name, "nct6683");
+        assert_eq!(entries[0].temp_type, Some(3));
+
+        // Verify JSON serialization includes the fields
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(json["chip_name"], "nct6683");
+        assert_eq!(json["temp_type"], 3);
+    }
+
+    #[test]
+    fn build_sensor_entries_marks_wireless_phy_not_control_eligible() {
+        // DEC-193: an ath12k WiFi temp is surfaced for display but flagged
+        // control_eligible=false so the GUI won't offer it as a curve source;
+        // a real motherboard/CPU sensor stays eligible.
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        let mk = |id: &str, chip: &str| crate::health::state::CachedSensorReading {
+            id: id.into(),
+            kind: crate::hwmon::types::SensorKind::MbTemp,
+            label: "temp1".into(),
+            value_c: 44.0,
+            source: crate::health::state::DeviceLabel::Hwmon,
+            updated_at: now,
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: chip.into(),
+            temp_type: None,
+            thresholds: None,
+        };
+        state.sensors.insert(
+            "hwmon:ath12k_hwmon:phy0:temp1".into(),
+            mk("hwmon:ath12k_hwmon:phy0:temp1", "ath12k_hwmon"),
+        );
+        state.sensors.insert(
+            "hwmon:k10temp:nodev:Tctl".into(),
+            mk("hwmon:k10temp:nodev:Tctl", "k10temp"),
+        );
+
+        let entries = build_sensor_entries(&state, now);
+        let wifi = entries
+            .iter()
+            .find(|e| e.chip_name == "ath12k_hwmon")
+            .unwrap();
+        let cpu = entries.iter().find(|e| e.chip_name == "k10temp").unwrap();
+        assert!(
+            !wifi.control_eligible,
+            "wireless PHY must not be a curve source"
+        );
+        assert!(cpu.control_eligible, "real sensors stay control-eligible");
+    }
+
+    #[test]
+    fn build_unavailable_entries_sorts_and_computes_age() {
+        // DEC-193: unavailable sensors are surfaced sorted by id, with a
+        // millisecond age since quarantine.
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        let since = now - std::time::Duration::from_millis(1500);
+        state.unavailable_sensors = vec![
+            crate::health::state::UnavailableSensor {
+                id: "z_sensor".into(),
+                label: "z".into(),
+                reason: "Network is down".into(),
+                since,
+            },
+            crate::health::state::UnavailableSensor {
+                id: "a_sensor".into(),
+                label: "a".into(),
+                reason: "Network is down".into(),
+                since,
+            },
+        ];
+        let entries = build_unavailable_entries(&state, now);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "a_sensor");
+        assert_eq!(entries[1].id, "z_sensor");
+        assert!(entries[0].unavailable_for_ms >= 1500);
+    }
+
+    #[test]
+    fn build_sensor_entries_omits_temp_type_when_none() {
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+
+        state.sensors.insert(
+            "hwmon:k10temp:nodev:Tctl".into(),
+            crate::health::state::CachedSensorReading {
+                id: "hwmon:k10temp:nodev:Tctl".into(),
+                kind: crate::hwmon::types::SensorKind::CpuTemp,
+                label: "Tctl".into(),
+                value_c: 55.0,
+                source: crate::health::state::DeviceLabel::Hwmon,
+                updated_at: now,
+                rate_c_per_s: None,
+                session_min_c: None,
+                session_max_c: None,
+                chip_name: "k10temp".into(),
+                temp_type: None,
+                thresholds: None,
+            },
+        );
+
+        let entries = build_sensor_entries(&state, now);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].chip_name, "k10temp");
+        assert_eq!(entries[0].temp_type, None);
+
+        // Verify JSON serialization omits temp_type when None
+        let json = serde_json::to_value(&entries[0]).unwrap();
+        assert_eq!(json["chip_name"], "k10temp");
+        assert!(json.get("temp_type").is_none());
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::persist_off_runtime;
+
+    #[tokio::test]
+    async fn a_panicking_persistence_task_becomes_an_error_not_a_dead_worker() {
+        // DEC-255: `persist_off_runtime`'s doc claims "a panicking write must not
+        // take an API worker down with it". That property had no test, and it is
+        // cheap and deterministic to pin.
+        let result: Result<(), String> =
+            persist_off_runtime(|| panic!("simulated write panic")).await;
+        assert!(
+            result.is_err(),
+            "a panic must surface as Err, not unwind the handler"
+        );
+        assert!(
+            result.unwrap_err().contains("persistence task failed"),
+            "and must be distinguishable from an ordinary IO failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_persistence_task_passes_its_value_through() {
+        let result = persist_off_runtime(|| Ok::<u8, String>(7)).await;
+        assert_eq!(result, Ok(7));
+    }
+}
+
+#[cfg(test)]
+mod profile_io_tests {
+    use super::{bounded_profile_io, ProfileIoError};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn a_hung_read_is_abandoned_and_keeps_its_slot_until_it_ends() {
+        // FFA-b. A read that never returns (a hung FUSE mount) must answer the
+        // request at the budget, and must keep its slot while its thread is
+        // still parked, so repeated requests cannot park more threads than the
+        // slots allow.
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let budget = Duration::from_millis(100);
+        let (release, wedge) = std::sync::mpsc::channel::<()>();
+
+        let started = Instant::now();
+        let first = bounded_profile_io(&SLOTS, budget, move || {
+            // Self-releasing, so a failed assertion cannot leave the runtime
+            // waiting on this thread for ever.
+            let _ = wedge.recv_timeout(Duration::from_secs(10));
+        })
+        .await;
+        assert_eq!(first, Err(ProfileIoError::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the request waited {:?}, not the budget",
+            started.elapsed()
+        );
+
+        // The hung read still holds the only slot: refused at the budget, and
+        // never started.
+        let ran = Arc::new(AtomicBool::new(false));
+        let second = bounded_profile_io(&SLOTS, budget, {
+            let ran = Arc::clone(&ran);
+            move || ran.store(true, Ordering::SeqCst)
+        })
+        .await;
+        assert_eq!(second, Err(ProfileIoError::Busy));
+        assert!(!ran.load(Ordering::SeqCst), "a refused read must not start");
+
+        // Once the read really ends, its slot comes back.
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while SLOTS.available_permits() == 0 {
+            assert!(Instant::now() < deadline, "the slot was never returned");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(bounded_profile_io(&SLOTS, budget, || 7).await, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_read_is_an_error_and_returns_its_slot() {
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let budget = Duration::from_secs(2);
+        let out: Result<(), _> =
+            bounded_profile_io(&SLOTS, budget, || panic!("simulated read panic")).await;
+        assert!(matches!(out, Err(ProfileIoError::Failed(_))), "{out:?}");
+        assert_eq!(SLOTS.available_permits(), 1);
+    }
+}

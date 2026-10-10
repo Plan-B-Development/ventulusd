@@ -1,0 +1,165 @@
+name: CI
+
+# Push/PR quality gates for the daemon — the safety-critical PWM writer. The
+# canonical "Standard gates" (fmt/clippy/test) run on every change to
+# main, and the DEC-174 supply-chain policy (deny.toml) is enforced per-PR here
+# instead of only at release-tag time. release.yml stays publish-only; this
+# workflow is the correctness net.
+#
+# NOTE: the decision log and its parity check are local-only and never reach
+# the runner, so ADR parity stays a local gate, not a CI job.
+#
+# Third-party actions are SHA-pinned for supply-chain hygiene; the trailing
+# comment records the human-readable version.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build deps
+        # serialport pulls libudev-sys on Linux (see Cargo.lock); it needs
+        # libudev-dev + pkg-config to link. This is the one CI-specific bit that
+        # can't be verified locally — the daemon's equivalent of the GUI's
+        # headless-Qt step. Add libs here if a future -sys dep needs them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+      # DEC-300. The toolchain and its components come from `rust-toolchain.toml`
+      # at the repo root and are deliberately NOT restated here: a second source
+      # of truth is the exact failure DEC-258 recorded for the GUI's ruff pin,
+      # where CI resolved a different version from the dev environment and lint
+      # went red on a commit whose local check was green. This action reads that
+      # file when no `toolchain:` input is given; `dtolnay/rust-toolchain` does
+      # not, which is why it was swapped out.
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # This action denies warnings by default and EXPORTS that globally —
+          # v1 as `RUSTFLAGS=-D warnings`, v2 as `CARGO_BUILD_WARNINGS=deny`
+          # (`build-warnings` defaults to `deny`). Either would apply to
+          # `cargo build` and `cargo test` as well, widening the very problem the
+          # pin exists to close. An empty value exports nothing; clippy's own
+          # `-- -D warnings` below stays the only gate.
+          rustflags: ''
+          build-warnings: ''
+          # It also bundles Swatinem/rust-cache. This repo pins its own copy by
+          # SHA on the next line, per the supply-chain note at the top of the
+          # file, so the bundled one is turned off rather than layered on top.
+          cache: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      # `--locked` is load-bearing, not tidiness (DEC-272 round 2). Without it
+      # cargo silently RE-RESOLVES and rewrites Cargo.lock on disk before doing
+      # anything else, so a commit that bumps daemon/Cargo.toml without running
+      # `cargo update -w` builds green here and only fails inside makepkg's
+      # `cargo fetch --locked` — in the clean-room build-test job, after the tag
+      # is already public, forcing a delete-and-retag. It also defeats any test
+      # that tries to catch the same thing by reading the lockfile, because the
+      # act of running the test repairs the file it is about to read (measured).
+      #
+      # `--all-features` was dropped and `--doc` added to reconcile this job with
+      # the project's documented quality gates, which call themselves the single
+      # source of truth and were not what ran (register row AUD-t). `daemon/Cargo.toml` has no
+      # `[features]` table, so `--all-features` never selected anything — it only
+      # made this job look meaningfully different from the documented one. And
+      # `--all-targets` SUPPRESSES doctests, so without the separate `--doc` step
+      # CI ran no doctests at all: harmless today (the crate has none) but it
+      # meant the first doctest anyone wrote would have had no CI coverage and no
+      # signal saying so. `--locked` is the one deliberate CI-only addition, for
+      # the reason directly above.
+      - name: cargo clippy -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --locked --all-targets
+      - name: cargo test --doc
+        run: cargo test --locked --doc
+
+  clippy-next:
+    # DEC-300 early warning. `rust-toolchain.toml` makes the gate above
+    # deterministic, but a pin nobody bumps quietly accumulates lint debt and
+    # then breaks loudly, all at once, with no attribution to any one commit.
+    # This job runs clippy against FLOATING latest stable so a new lint is
+    # discovered on an ordinary push instead of at a tagged release.
+    #
+    # Advisory ONLY: `continue-on-error` keeps it out of the job's conclusion, so
+    # it can never block a merge or a release. When it goes red, a pin bump is
+    # due — see the "HOW TO BUMP IT" section of rust-toolchain.toml.
+    name: clippy on latest stable (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          components: clippy
+      # No `shared-key` here on purpose. This job's artifacts are built by a
+      # different compiler from the `test` job's, but rust-cache already separates
+      # them twice over: its default key is job-based, and it hashes the rust
+      # environment into the key as well. `shared-key` REPLACES the job-based key
+      # with one deliberately stable across jobs, which is the opposite of what is
+      # wanted — it was set here briefly with a comment claiming it provided the
+      # separation the default already provides.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Both steps below set RUSTUP_TOOLCHAIN, and it is load-bearing rather than
+      # belt-and-braces. The rustup shim reads the repo's pin file and would
+      # override whatever the action above installed, so WITHOUT this the job
+      # silently re-runs clippy on the pinned toolchain and asserts nothing about
+      # a newer one — green, inert, and indistinguishable from working. The env
+      # var beats the file (verified in both directions); that precedence is the
+      # only reason this job can see a compiler the pin does not name.
+      - name: Show the toolchain actually in use
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        # Printed, not asserted: when the pin IS the newest stable these agree
+        # legitimately, so a difference cannot be required. A human reading a red
+        # run needs to know which compiler produced it.
+        run: rustc --version && cargo --version
+      - name: cargo clippy on latest stable
+        env:
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  deny:
+    # DEC-174 supply-chain gate, moved from release-only to every PR. Runs in its
+    # own container (no project build → no libudev needed) against the committed
+    # Cargo.lock + deny.toml. The advisories lane is allowed to soft-fail so a
+    # freshly-published RustSec advisory doesn't red-X unrelated PRs; bans /
+    # licenses / sources stay hard failures.
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check ${{ matrix.checks }}

@@ -1,0 +1,1714 @@
+//! AMD GPU PMFW fan curve control via sysfs.
+//!
+//! RDNA3+ GPUs expose a firmware-managed fan curve at:
+//! `/sys/class/drm/cardN/device/gpu_od/fan_ctrl/fan_curve`
+//!
+//! The file format is:
+//! ```text
+//! OD_FAN_CURVE:
+//! 0: 40C 30%
+//! 1: 50C 35%
+//! ...
+//! OD_RANGE:
+//! FAN_CURVE(hotspot temp): 25C 100C
+//! FAN_CURVE(fan speed): 15% 100%
+//! ```
+//!
+//! Write format: `echo "N TEMP SPEED" > fan_curve` (e.g. `echo "0 45 40"`)
+//! Commit: `echo "c" > fan_curve`
+//! Reset to auto: `echo "r" > fan_curve`
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::error::HwmonError;
+use crate::pwm::percent_to_raw;
+
+/// Trait for writing to sysfs fan curve files — allows test mocks to
+/// capture every intermediate write (each of which the kernel processes
+/// independently, but a regular file only retains the last).
+pub trait FanCurveWriter {
+    fn write(&self, path: &Path, content: &str) -> Result<(), HwmonError>;
+}
+
+/// Default writer using `std::fs::write`.
+pub struct RealFanCurveWriter;
+
+impl FanCurveWriter for RealFanCurveWriter {
+    fn write(&self, path: &Path, content: &str) -> Result<(), HwmonError> {
+        std::fs::write(path, content).map_err(|e| HwmonError::WriteError {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })
+    }
+}
+
+/// A single point on the PMFW fan curve.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FanCurvePoint {
+    /// Point index (0-4 typically).
+    pub index: u8,
+    /// Temperature threshold in degrees Celsius.
+    pub temp_c: i32,
+    /// Fan speed as a percentage (0-100).
+    pub speed_pct: u8,
+}
+
+/// Parsed PMFW fan curve with optional range limits.
+#[derive(Debug, Clone)]
+pub struct FanCurve {
+    /// Curve points, ordered by index.
+    pub points: Vec<FanCurvePoint>,
+    /// Allowed temperature range (min, max) in Celsius, if reported.
+    pub temp_range: Option<(i32, i32)>,
+    /// Allowed fan speed range (min, max) as percentage, if reported.
+    pub speed_range: Option<(u8, u8)>,
+}
+
+/// Parse the PMFW fan_curve sysfs file contents.
+///
+/// Expected format:
+/// ```text
+/// OD_FAN_CURVE:
+/// 0: 40C 30%
+/// 1: 50C 35%
+/// ...
+/// OD_RANGE:
+/// FAN_CURVE(hotspot temp): 25C 100C
+/// FAN_CURVE(fan speed): 15% 100%
+/// ```
+pub fn parse_fan_curve(content: &str) -> Result<FanCurve, HwmonError> {
+    let mut points = Vec::new();
+    let mut temp_range = None;
+    let mut speed_range = None;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Parse curve points: "N: TTT°C SS%" or "N: TTTC SS%"
+        if let Some(rest) = trimmed
+            .strip_prefix(|c: char| c.is_ascii_digit())
+            .and_then(|r| r.strip_prefix(':'))
+        {
+            let index: u8 = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0);
+
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let temp = parse_value_with_suffix(parts[0], 'C');
+                let speed = parse_value_with_suffix(parts[1], '%');
+                if let (Some(t), Some(s)) = (temp, speed) {
+                    points.push(FanCurvePoint {
+                        index,
+                        temp_c: t,
+                        speed_pct: s.clamp(0, 100) as u8,
+                    });
+                }
+            }
+        }
+
+        // Parse temp range: "FAN_CURVE(hotspot temp): 25C 100C"
+        if trimmed.contains("hotspot temp") {
+            if let Some(rest) = trimmed.split(':').nth(1) {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let lo = parse_value_with_suffix(parts[0], 'C');
+                    let hi = parse_value_with_suffix(parts[1], 'C');
+                    // DEC-265: ordering is checked, not assumed. These bounds are
+                    // parsed from device-supplied text and reach `Ord::clamp`
+                    // below, which panics outright on an inverted range — the
+                    // same panic class DEC-249 fixed in `tuning.rs` and whose
+                    // sweep missed this file. An inverted line is nonsense, so
+                    // drop it and let the caller's safe fallback stand.
+                    //
+                    // DEC-266: bounded, not merely ordered. `temp_max - temp_min`
+                    // is computed downstream in i32, so a wildly wide reported
+                    // range overflows — wrapping in release, panicking in debug
+                    // and under test, on the once-per-second sole-writer path.
+                    // Anything outside a plausible silicon range is nonsense from
+                    // the device, so treat it the same as an inversion.
+                    const TEMP_SANE: std::ops::RangeInclusive<i32> = -50..=200;
+                    if let (Some(l), Some(h)) = (lo, hi) {
+                        if l <= h && TEMP_SANE.contains(&l) && TEMP_SANE.contains(&h) {
+                            temp_range = Some((l, h));
+                        } else {
+                            log::warn!(
+                                "GPU fan_curve reported an implausible or inverted hotspot \
+                                 temp range ({l}C..{h}C) — ignoring it and using the default"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Parse speed range: "FAN_CURVE(fan speed): 15% 100%"
+        if trimmed.contains("fan speed") {
+            if let Some(rest) = trimmed.split(':').nth(1) {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let lo = parse_value_with_suffix(parts[0], '%');
+                    let hi = parse_value_with_suffix(parts[1], '%');
+                    // DEC-265: same ordering rule as the temp range above. This
+                    // pair feeds `.max(lo).min(hi)`, which does not panic — but an
+                    // inverted range there silently pins every speed to `hi`, so
+                    // it is wrong in a quieter way rather than a safe one.
+                    //
+                    // DEC-266: convert BEFORE comparing. `parse_value_with_suffix`
+                    // returns i32 and accepts a leading `-`, so ordering checked in
+                    // i32 and then cast with `as u8` re-admits the exact inversion
+                    // this guard exists to reject: `-1% 100%` passes `-1 <= 100` and
+                    // truncates to `(255, 100)`, and `0% 300%` to `(0, 44)`, which
+                    // silently caps every GPU fan at 44%.
+                    if let (Some(l), Some(h)) = (lo, hi) {
+                        match (u8::try_from(l), u8::try_from(h)) {
+                            (Ok(l), Ok(h)) if l <= h && h <= 100 => {
+                                speed_range = Some((l, h));
+                            }
+                            _ => {
+                                log::warn!(
+                                    "GPU fan_curve reported an out-of-range or inverted fan \
+                                     speed range ({l}%..{h}%) — ignoring it and using the \
+                                     default"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if points.is_empty() {
+        return Err(HwmonError::ReadError {
+            path: "<fan_curve>".into(),
+            message: "no curve points found in fan_curve output".into(),
+        });
+    }
+
+    points.sort_by_key(|p| p.index);
+
+    Ok(FanCurve {
+        points,
+        temp_range,
+        speed_range,
+    })
+}
+
+/// Parse an integer value with a trailing suffix character (e.g. "45C" → 45, "30%" → 30).
+fn parse_value_with_suffix(s: &str, _suffix: char) -> Option<i32> {
+    let digits: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
+/// Read and parse the current PMFW fan curve from a sysfs file.
+pub fn read_fan_curve(fan_curve_path: &Path) -> Result<FanCurve, HwmonError> {
+    let content = std::fs::read_to_string(fan_curve_path).map_err(|e| HwmonError::ReadError {
+        path: fan_curve_path.display().to_string(),
+        message: e.to_string(),
+    })?;
+    parse_fan_curve(&content)
+}
+
+/// The flat speed of a curve where every point shares the same fan speed %,
+/// i.e. a "static" curve as written by [`set_static_speed`]. Returns `None` for
+/// an empty curve or a varying (firmware-default / auto) curve.
+///
+/// Used by the GPU fan verify to (a) confirm a static-speed write took effect
+/// (read-back flat speed == requested) and (b) decide whether the GPU was being
+/// driven at a static speed before the test (so it can be restored).
+pub fn flat_speed_pct(curve: &FanCurve) -> Option<u8> {
+    let first = curve.points.first()?.speed_pct;
+    curve
+        .points
+        .iter()
+        .all(|p| p.speed_pct == first)
+        .then_some(first)
+}
+
+/// Best-effort parse of the PMFW `fan_minimum_pwm` sysfs attribute into a
+/// percentage (0..=100).
+///
+/// The exact format is not documented upstream ("Reading back the file shows
+/// you the current setting and the permitted ranges if changable"), but it
+/// follows the same `fan_ctrl` convention as `fan_curve`: a current-value
+/// section followed by an `OD_RANGE:` block, with fan speeds written as
+/// `NN%`. We read the **current setting** only (everything before `OD_RANGE`)
+/// and return the first plausible 0..=100 value, ignoring header labels.
+///
+/// Returns `None` when nothing parseable is found — diagnostics treat the
+/// attribute as optional, so a fail-soft `None` is preferable to a guess.
+pub fn parse_fan_minimum_pwm(content: &str) -> Option<u8> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Stop at the range section — we want the active setting, not the
+        // permitted `OD_RANGE` bounds.
+        if trimmed.to_ascii_uppercase().starts_with("OD_RANGE") {
+            break;
+        }
+        // Tokens may include a "FAN_MINIMUM_PWM:" label prefix; skip any token
+        // that isn't a bare/`%`-suffixed integer in range.
+        for tok in trimmed.split_whitespace() {
+            let stripped = tok.trim_end_matches('%').trim_end_matches(':');
+            if let Ok(v) = stripped.parse::<u32>() {
+                if v <= 100 {
+                    return Some(v as u8);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Read and parse the current PMFW `fan_minimum_pwm` setting (percent).
+///
+/// Diagnostics-only; never written by the daemon. Returns `None` on any read
+/// or parse failure (the attribute is absent on many GPUs).
+pub fn read_fan_minimum_pwm(path: &Path) -> Option<u8> {
+    let content = std::fs::read_to_string(path).ok()?;
+    parse_fan_minimum_pwm(&content)
+}
+
+/// Write a fan curve to the PMFW sysfs file and commit it.
+///
+/// Each point is written as `"INDEX TEMP SPEED\n"`, followed by `"c\n"` to commit.
+///
+/// **Non-atomic:** if the process is killed between individual point writes
+/// and the final commit, the GPU retains a partial curve. The daemon panic
+/// hook resets to auto (`"r\n"` + `"c\n"`) to mitigate this.
+pub fn write_fan_curve(fan_curve_path: &Path, points: &[FanCurvePoint]) -> Result<(), HwmonError> {
+    write_fan_curve_with(&RealFanCurveWriter, fan_curve_path, points)
+}
+
+/// Write a fan curve using a custom writer (allows test mocks to capture
+/// every intermediate write that the kernel processes independently).
+pub fn write_fan_curve_with(
+    writer: &dyn FanCurveWriter,
+    fan_curve_path: &Path,
+    points: &[FanCurvePoint],
+) -> Result<(), HwmonError> {
+    for p in points {
+        let cmd = format!("{} {} {}\n", p.index, p.temp_c, p.speed_pct);
+        writer
+            .write(fan_curve_path, &cmd)
+            .map_err(|_| HwmonError::WriteError {
+                path: fan_curve_path.display().to_string(),
+                message: format!(
+                    "failed to write curve point {} ({}°C {}%)",
+                    p.index, p.temp_c, p.speed_pct
+                ),
+            })?;
+    }
+
+    // Commit
+    writer
+        .write(fan_curve_path, "c\n")
+        .map_err(|_| HwmonError::WriteError {
+            path: fan_curve_path.display().to_string(),
+            message: "failed to commit fan curve".into(),
+        })?;
+
+    log::info!(
+        "Wrote {} PMFW fan curve points to {}",
+        points.len(),
+        fan_curve_path.display()
+    );
+    Ok(())
+}
+
+/// Disable fan zero-RPM mode so the fan actually spins when a curve is applied.
+///
+/// RDNA3+ firmware keeps fans stopped below a temperature threshold when zero-RPM
+/// is enabled. This must be disabled before writing a static speed, otherwise the
+/// fan won't spin at idle temperatures. Each write to fan_zero_rpm_enable requires
+/// its own commit ("c").
+pub fn disable_zero_rpm(zero_rpm_path: &Path) -> Result<(), HwmonError> {
+    // Read current state — skip if already disabled to avoid redundant
+    // sysfs writes that cause GPU firmware churn (stuttering under load).
+    // The file returns multi-line formatted output like:
+    //   FAN_ZERO_RPM_ENABLE:
+    //   0
+    //   OD_RANGE:
+    //   ZERO_RPM_ENABLE: 0 1
+    // We check the line after the header for the current value.
+    if let Ok(content) = std::fs::read_to_string(zero_rpm_path) {
+        let mut found_header = false;
+        for line in content.lines() {
+            if line.contains("FAN_ZERO_RPM_ENABLE:") && !line.contains("OD_RANGE") {
+                found_header = true;
+                continue;
+            }
+            if found_header {
+                if line.trim() == "0" {
+                    return Ok(());
+                }
+                break;
+            }
+        }
+    }
+
+    std::fs::write(zero_rpm_path, "0\n").map_err(|e| HwmonError::WriteError {
+        path: zero_rpm_path.display().to_string(),
+        message: format!("failed to disable fan zero-RPM: {e}"),
+    })?;
+    std::fs::write(zero_rpm_path, "c\n").map_err(|e| HwmonError::WriteError {
+        path: zero_rpm_path.display().to_string(),
+        message: format!("failed to commit zero-RPM disable: {e}"),
+    })?;
+    log::info!("Disabled GPU fan zero-RPM: {}", zero_rpm_path.display());
+    Ok(())
+}
+
+/// Parse the multi-line `fan_zero_rpm_enable` sysfs output to its current bool.
+///
+/// The file is formatted like `fan_curve` — a labelled current-value section
+/// followed by an `OD_RANGE:` block:
+/// ```text
+/// FAN_ZERO_RPM_ENABLE:
+/// 0
+/// OD_RANGE:
+/// ZERO_RPM_ENABLE: 0 1
+/// ```
+/// We read the value line immediately after the `FAN_ZERO_RPM_ENABLE:` header.
+/// Returns `None` when nothing parseable is found.
+pub fn parse_zero_rpm_enabled(content: &str) -> Option<bool> {
+    let mut found_header = false;
+    for line in content.lines() {
+        if line.contains("FAN_ZERO_RPM_ENABLE:") && !line.contains("OD_RANGE") {
+            found_header = true;
+            continue;
+        }
+        if found_header {
+            return match line.trim() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Read the current `fan_zero_rpm_enable` state. Diagnostics-only (used by the
+/// GPU fan verify to distinguish a legitimately idle/stopped fan from a broken
+/// one). Returns `None` on any read or parse failure.
+pub fn read_zero_rpm_enabled(zero_rpm_path: &Path) -> Option<bool> {
+    parse_zero_rpm_enabled(&std::fs::read_to_string(zero_rpm_path).ok()?)
+}
+
+/// Re-enable fan zero-RPM mode (restore firmware idle fan-stop behaviour).
+pub fn enable_zero_rpm(zero_rpm_path: &Path) -> Result<(), HwmonError> {
+    std::fs::write(zero_rpm_path, "1\n").map_err(|e| HwmonError::WriteError {
+        path: zero_rpm_path.display().to_string(),
+        message: format!("failed to enable fan zero-RPM: {e}"),
+    })?;
+    std::fs::write(zero_rpm_path, "c\n").map_err(|e| HwmonError::WriteError {
+        path: zero_rpm_path.display().to_string(),
+        message: format!("failed to commit zero-RPM enable: {e}"),
+    })?;
+    log::info!("Re-enabled GPU fan zero-RPM: {}", zero_rpm_path.display());
+    Ok(())
+}
+
+/// Set a static (flat) fan speed by writing all curve points to the same percentage.
+///
+/// If `zero_rpm_path` is provided, disables zero-RPM first so the fan actually
+/// spins at low temperatures. This effectively gives "manual" control via the PMFW curve.
+///
+/// This is a thin convenience wrapper around
+/// [`set_static_speed_with_zero_rpm`] with ``preserve_zero_rpm = false``,
+/// preserving pre-v4 behaviour for callers that haven't opted in.
+pub fn set_static_speed(
+    fan_curve_path: &Path,
+    zero_rpm_path: Option<&Path>,
+    speed_pct: u8,
+    num_points: u8,
+) -> Result<(), HwmonError> {
+    set_static_speed_with_zero_rpm(fan_curve_path, zero_rpm_path, speed_pct, num_points, false)
+}
+
+/// Set a static fan speed, with explicit control over zero-RPM handling.
+///
+/// When ``preserve_zero_rpm`` is ``false`` (default for manual API writes),
+/// the daemon disables ``fan_zero_rpm_enable`` before writing the curve so
+/// the fan spins continuously at the commanded speed. When ``true``
+/// (profile-driven write where the user opted into idle stop, see DEC-095
+/// and ``ControlMember.fan_zero_rpm``), the existing zero-RPM state is
+/// preserved — the GPU firmware decides when to stop the fan based on the
+/// curve and its idle threshold.
+pub fn set_static_speed_with_zero_rpm(
+    fan_curve_path: &Path,
+    zero_rpm_path: Option<&Path>,
+    speed_pct: u8,
+    num_points: u8,
+    preserve_zero_rpm: bool,
+) -> Result<(), HwmonError> {
+    if !preserve_zero_rpm {
+        // Disable zero-RPM so the fan spins at any temperature
+        if let Some(zrp) = zero_rpm_path {
+            if let Err(e) = disable_zero_rpm(zrp) {
+                log::warn!("Could not disable zero-RPM (continuing): {e}");
+            }
+        }
+    }
+
+    // Read the device's OD_RANGE to clamp values within PMFW-accepted bounds.
+    // The AMDGPU driver rejects curve points outside the PPTable limits with
+    // EINVAL. Typical ranges: temp 25-100°C, speed 15-100%.
+    let (temp_min, temp_max, speed_min, speed_max) = match read_fan_curve(fan_curve_path) {
+        Ok(curve) => {
+            let (tlo, thi) = curve.temp_range.unwrap_or((25, 100));
+            let (slo, shi) = curve.speed_range.unwrap_or((15, 100));
+            (tlo, thi, slo, shi)
+        }
+        Err(_) => (25, 100, 15, 100), // safe fallback
+    };
+
+    let clamped_speed = speed_pct.max(speed_min).min(speed_max);
+    if clamped_speed != speed_pct {
+        log::debug!(
+            "GPU fan speed clamped {speed_pct}% → {clamped_speed}% (OD_RANGE {speed_min}–{speed_max}%)"
+        );
+    }
+
+    let points: Vec<FanCurvePoint> = (0..num_points)
+        .map(|i| {
+            let divisor = (num_points.max(1) as i32 - 1).max(1);
+            let raw_temp = temp_min + (i as i32 * (temp_max - temp_min) / divisor);
+            FanCurvePoint {
+                index: i,
+                // DEC-265: `.max().min()`, matching `clamped_speed` above and
+                // `api/handlers/gpu.rs`. `Ord::clamp` panics when min > max, and
+                // this ran on the 1 Hz write path with bounds parsed from device
+                // text — so the one thing this call could do that the arithmetic
+                // above had not already done was kill the sole PWM writer. The
+                // parse now rejects an inverted range, which makes this
+                // unreachable; it stays panic-free anyway, because "unreachable"
+                // is what `tuning.rs` was too (DEC-249).
+                temp_c: raw_temp.max(temp_min).min(temp_max),
+                speed_pct: clamped_speed,
+            }
+        })
+        .collect();
+
+    write_fan_curve(fan_curve_path, &points)
+}
+
+/// Reset the GPU fan curve to automatic (firmware default).
+///
+/// Resets the curve via `"r\n"` + `"c\n"`, then re-enables zero-RPM if the path
+/// is provided (restoring firmware idle fan-stop behaviour).
+///
+/// Zero-RPM is re-enabled even if the curve reset fails, because a prior
+/// `set_static_speed` may have disabled it; leaving zero-RPM off means
+/// the fan runs continuously when it otherwise would stop at idle.
+pub fn reset_to_auto(
+    fan_curve_path: &Path,
+    zero_rpm_path: Option<&Path>,
+) -> Result<(), HwmonError> {
+    let reset_err = std::fs::write(fan_curve_path, "r\n")
+        .and_then(|()| std::fs::write(fan_curve_path, "c\n"))
+        .err();
+
+    // Always attempt to re-enable zero-RPM, even if the curve reset failed.
+    if let Some(zrp) = zero_rpm_path {
+        if let Err(e) = enable_zero_rpm(zrp) {
+            log::warn!("Could not re-enable zero-RPM (continuing): {e}");
+        }
+    }
+
+    if let Some(io_err) = reset_err {
+        return Err(HwmonError::WriteError {
+            path: fan_curve_path.display().to_string(),
+            message: format!("failed to reset fan curve to auto: {io_err}"),
+        });
+    }
+
+    log::info!("Reset PMFW fan curve to auto: {}", fan_curve_path.display());
+    Ok(())
+}
+
+// ── Pre-RDNA3 legacy PWM control ─────────────────────────────────────
+//
+// Pre-RDNA3 GPUs (RX 6000 and older) use the standard hwmon pwm1/pwm1_enable
+// interface. These functions encapsulate those raw sysfs writes.
+
+/// Set a legacy GPU fan speed via hwmon pwm1 (pre-RDNA3).
+///
+/// Writes `pwm1_enable=1` (manual mode) then the raw PWM value to `pwm1`.
+/// amdgpu rejects `pwm1` writes with EINVAL unless manual mode is active.
+pub fn set_legacy_pwm(hwmon_path: &Path, speed_pct: u8) -> Result<(), HwmonError> {
+    let enable_path = hwmon_path.join("pwm1_enable");
+    std::fs::write(&enable_path, "1\n").map_err(|e| HwmonError::WriteError {
+        path: enable_path.display().to_string(),
+        message: format!("failed to set manual mode: {e}"),
+    })?;
+
+    let pwm_path = hwmon_path.join("pwm1");
+    let raw = percent_to_raw(speed_pct);
+    std::fs::write(&pwm_path, format!("{raw}\n")).map_err(|e| HwmonError::WriteError {
+        path: pwm_path.display().to_string(),
+        message: format!("failed to write PWM value {raw}: {e}"),
+    })?;
+
+    log::info!(
+        "Set legacy GPU fan to {speed_pct}% (raw {raw}) via {}",
+        hwmon_path.display()
+    );
+    Ok(())
+}
+
+/// Put a legacy GPU fan back in manual mode at a RAW `pwm1` duty — the duty
+/// another tool had it at, which the verify gives back exactly (DEC-447).
+pub fn set_legacy_raw(hwmon_path: &Path, raw: u8) -> Result<(), HwmonError> {
+    let enable_path = hwmon_path.join("pwm1_enable");
+    std::fs::write(&enable_path, "1\n").map_err(|e| HwmonError::WriteError {
+        path: enable_path.display().to_string(),
+        message: format!("failed to set manual mode: {e}"),
+    })?;
+    let pwm_path = hwmon_path.join("pwm1");
+    std::fs::write(&pwm_path, format!("{raw}\n")).map_err(|e| HwmonError::WriteError {
+        path: pwm_path.display().to_string(),
+        message: format!("failed to write PWM value {raw}: {e}"),
+    })?;
+    log::info!(
+        "Restored legacy GPU fan to manual raw {raw} via {}",
+        hwmon_path.display()
+    );
+    Ok(())
+}
+
+/// Write a legacy GPU fan's `pwm1_enable` back to `mode` — the mode it had
+/// before the verify took it (DEC-447). Automatic is `2`.
+pub fn set_legacy_mode(hwmon_path: &Path, mode: u8) -> Result<(), HwmonError> {
+    let enable_path = hwmon_path.join("pwm1_enable");
+    std::fs::write(&enable_path, format!("{mode}\n")).map_err(|e| HwmonError::WriteError {
+        path: enable_path.display().to_string(),
+        message: format!("failed to restore pwm1_enable={mode}: {e}"),
+    })?;
+    log::info!(
+        "Restored legacy GPU fan to pwm1_enable={mode} via {}",
+        hwmon_path.display()
+    );
+    Ok(())
+}
+
+/// Reset a legacy GPU fan to automatic mode via hwmon pwm1_enable (pre-RDNA3).
+///
+/// Writes `pwm1_enable=2` to restore firmware-managed fan control.
+pub fn reset_legacy_to_auto(hwmon_path: &Path) -> Result<(), HwmonError> {
+    let enable_path = hwmon_path.join("pwm1_enable");
+    std::fs::write(&enable_path, "2\n").map_err(|e| HwmonError::WriteError {
+        path: enable_path.display().to_string(),
+        message: format!("failed to reset to auto mode: {e}"),
+    })?;
+
+    log::info!("Reset legacy GPU fan to auto via {}", hwmon_path.display());
+    Ok(())
+}
+
+// ── Crash backstop for the legacy verify (DEC-414, `TS-aa`) ──────────
+//
+// The legacy GPU verify is the one path that puts a pre-RDNA3 fan in manual
+// mode (`pwm1_enable=1`), and amdgpu is outside the hwmon hand-back ledger by
+// design. So before that write the verify records the fan here, in the
+// line format of the hwmon record (`handback.rs`), and `ventulus-restore-auto`
+// — `ExecStopPost` — replays it after a crash. Only a GPU the daemon took is
+// named, so a card another tool put in manual mode is never touched.
+
+/// File name of the legacy GPU hand-back record in the unit's runtime directory.
+pub const GPU_RECORD_FILE_NAME: &str = "gpu-handback";
+
+const GPU_RECORD_HEADER: &str = "# ventulus GPU hand-back record v1";
+
+/// amdgpu's automatic fan mode — what a record gives back when the original
+/// mode could not be read (the user's choice, DEC-414), or the card was in
+/// manual with a duty that could not be read (DEC-447).
+const AMDGPU_PWM_ENABLE_AUTO: u8 = 2;
+
+/// What a legacy take gives the fan back: the state the daemon first found it
+/// in (DEC-447, `TS-bj`). Mirrors the hwmon ledger's `mode` / `manual <raw>`
+/// lines, which `ventulus-restore-auto` already replays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyOriginal {
+    /// `pwm1_enable` to write back; automatic is `2`.
+    Mode(u8),
+    /// Manual mode (`pwm1_enable=1`) at this raw `pwm1` duty — the duty another
+    /// tool had the card at.
+    Manual(u8),
+}
+
+impl LegacyOriginal {
+    /// From what the verify read before its first write. A card in manual whose
+    /// duty could not be read, or whose mode could not be read, is given back
+    /// on automatic: firmware then cools it (the user's choices, DEC-414 and
+    /// DEC-447).
+    pub fn from_read(enable: Option<u8>, raw_pwm: Option<u8>) -> Self {
+        match (enable, raw_pwm) {
+            (Some(1), Some(raw)) => Self::Manual(raw),
+            (Some(1), None) | (None, _) => Self::Mode(AMDGPU_PWM_ENABLE_AUTO),
+            (Some(mode), _) => Self::Mode(mode),
+        }
+    }
+
+    fn record_fields(self) -> (&'static str, u8) {
+        match self {
+            Self::Mode(mode) => ("mode", mode),
+            Self::Manual(raw) => ("manual", raw),
+        }
+    }
+
+    fn from_record_fields(kind: &str, value: &str) -> Option<Self> {
+        let value: u8 = value.trim().parse().ok()?;
+        match kind {
+            "mode" => Some(Self::Mode(value)),
+            "manual" => Some(Self::Manual(value)),
+            _ => None,
+        }
+    }
+}
+
+/// Record a legacy take in `record` BEFORE the `pwm1_enable=1` write: one line
+/// per fan, giving back `original`. Returns the original that STANDS for this
+/// fan, which the verify's own restore then targets (DEC-447, `TS-bi`).
+///
+/// The FIRST take's line is kept, as the hwmon ledger keeps the first original
+/// (`needs_original`): a line still here means an earlier verify's restore
+/// failed, so the fan is in the daemon's manual mode now, and what was just
+/// read is the daemon's own leftover — so that line's original is returned,
+/// not `original`. Restoring to the leftover is what `TS-bi` was.
+///
+/// A failure is logged and the verify goes on: the verify still restores the
+/// fan itself on every path it survives — only the crash backstop is lost.
+pub fn note_legacy_take(
+    record: &Path,
+    hwmon_path: &Path,
+    original: LegacyOriginal,
+) -> LegacyOriginal {
+    let enable = hwmon_path.join("pwm1_enable");
+    let pwm = hwmon_path.join("pwm1");
+    let enable_str = enable.display().to_string();
+    if let Some(standing) = gpu_record_lines(record).iter().find_map(|l| {
+        let mut fields = l.split('\t');
+        (fields.next() == Some(enable_str.as_str())).then_some(())?;
+        let (_pwm, kind, value) = (fields.next()?, fields.next()?, fields.next()?);
+        LegacyOriginal::from_record_fields(kind, value)
+    }) {
+        return standing; // this fan already has a line: its first original stands
+    }
+    let (kind, value) = original.record_fields();
+    let line = format!("{}\t{}\t{kind}\t{value}", enable.display(), pwm.display());
+    if line.matches('\t').count() != 3 || line.contains('\n') {
+        return original; // a separator in a path could not be parsed back; never replay it wrong
+    }
+    let mut lines = other_gpu_lines(record, &enable);
+    if gpu_record_lines(record).len() != lines.len() {
+        // An unparseable line for this fan: its original is unknown, and what was
+        // just read may be the daemon's own leftover — give it back automatic.
+        return LegacyOriginal::Mode(AMDGPU_PWM_ENABLE_AUTO);
+    }
+    lines.push(line);
+    write_gpu_record(record, &lines);
+    original
+}
+
+/// Drop `hwmon_path`'s line from `record` once the verify has given the fan back,
+/// removing the file when no line is left.
+pub fn note_legacy_handed_back(record: &Path, hwmon_path: &Path) {
+    let lines = other_gpu_lines(record, &hwmon_path.join("pwm1_enable"));
+    if lines.is_empty() {
+        match std::fs::remove_file(record) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log::warn!(
+                "could not remove the GPU hand-back record {}: {e} — ExecStopPost will \
+                 give the fan back its original mode again, which is harmless",
+                record.display()
+            ),
+        }
+    } else {
+        write_gpu_record(record, &lines);
+    }
+}
+
+/// Every line of `record` — each a fan whose take has not been given back.
+fn gpu_record_lines(record: &Path) -> Vec<String> {
+    std::fs::read_to_string(record)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every record line that is not `enable`'s — other fans' takes a failed restore left.
+fn other_gpu_lines(record: &Path, enable: &Path) -> Vec<String> {
+    let enable = enable.display().to_string();
+    gpu_record_lines(record)
+        .into_iter()
+        .filter(|l| l.split('\t').next() != Some(enable.as_str()))
+        .collect()
+}
+
+fn write_gpu_record(record: &Path, lines: &[String]) {
+    let mut body = format!("{GPU_RECORD_HEADER}\n");
+    for l in lines {
+        body.push_str(l);
+        body.push('\n');
+    }
+    if let Err(e) = crate::hwmon::handback::write_replacing(record, &body) {
+        log::warn!(
+            "could not write the GPU hand-back record {}: {e} — if the daemon crashes \
+             during this verify, ExecStopPost cannot take the GPU fan out of manual mode",
+            record.display()
+        );
+    }
+}
+
+// ── Which PMFW cards the daemon drove (DEC-435, `DC-aa`) ──────────────
+//
+// A stop resets the PMFW fan curve only on a card the daemon wrote one to. Every
+// stop used to reset every AMD card on the machine, so a curve LACT or CoreCtrl
+// had put on a card no profile names was replaced on each stop and restart.
+// [`PmfwHandBack`] is the one list all three restores read — the clean stop, the
+// panic hook, and `ExecStopPost` through its on-disk record.
+
+/// File name of the PMFW hand-back record in the unit's runtime directory.
+pub const PMFW_RECORD_FILE_NAME: &str = "gpu-pmfw-handback";
+
+const PMFW_RECORD_HEADER: &str = "# ventulus PMFW GPU hand-back record v1";
+
+/// The PMFW cards the daemon has written a fan curve to and not yet put back on
+/// firmware auto itself, keyed by fan id (`amd_gpu:<bdf>`).
+///
+/// Held behind its own lock, like the hwmon [`HandBackLedger`], so the panic hook
+/// and the shutdown can read it with a deadline whatever else is held. Nothing
+/// under the lock touches a GPU; the only I/O is the record, which lives on
+/// the runtime directory's tmpfs.
+///
+/// [`HandBackLedger`]: crate::hwmon::handback::HandBackLedger
+#[derive(Debug, Default)]
+pub struct PmfwHandBack {
+    state: parking_lot::Mutex<PmfwState>,
+}
+
+#[derive(Debug, Default)]
+struct PmfwState {
+    /// fan id → (`fan_curve`, `fan_zero_rpm_enable`).
+    taken: std::collections::BTreeMap<String, (PathBuf, Option<PathBuf>)>,
+    record_path: Option<PathBuf>,
+    record_error_logged: bool,
+}
+
+impl PmfwHandBack {
+    /// Keep the on-disk record at `path` from now on, writing it at once so it
+    /// always describes this process.
+    pub fn set_record_path(&self, path: PathBuf) {
+        let mut state = self.state.lock();
+        state.record_path = Some(path);
+        persist_pmfw(&mut state);
+    }
+
+    /// Record that the daemon is about to write a curve to `fan_id`'s card.
+    ///
+    /// Call **before** the write: a line naming a card that never got the write
+    /// replays as a harmless reset, while a card on the daemon's curve that no
+    /// line names is left on it after a crash. The record is rewritten only when
+    /// the card is new, so the engine's 1 Hz writes cost a map lookup.
+    ///
+    /// A record that cannot be written is logged once and the write goes on
+    /// (the user's choice, DEC-435): the clean stop and the panic hook still read
+    /// this list; only the crash backstop is lost.
+    pub fn note_take(&self, fan_id: &str, fan_curve: &Path, zero_rpm: Option<&Path>) {
+        let mut state = self.state.lock();
+        if state.taken.contains_key(fan_id) {
+            // A record that failed to write is retried on every take until it
+            // lands; otherwise one refused write would leave the card off the
+            // crash record for the rest of the process.
+            if state.record_error_logged {
+                persist_pmfw(&mut state);
+            }
+            return;
+        }
+        state.taken.insert(
+            fan_id.to_string(),
+            (fan_curve.to_path_buf(), zero_rpm.map(Path::to_path_buf)),
+        );
+        persist_pmfw(&mut state);
+    }
+
+    /// Record that the daemon has put `fan_id`'s card back on firmware auto
+    /// itself — a successful `POST /gpu/{id}/fan/reset`, or a verify that
+    /// restored to auto — so no stop resets it again.
+    pub fn note_handed_back(&self, fan_id: &str) {
+        let mut state = self.state.lock();
+        if state.taken.remove(fan_id).is_some() {
+            persist_pmfw(&mut state);
+        }
+    }
+
+    /// True while the daemon holds `fan_id`'s card on a curve it wrote.
+    pub fn is_taken(&self, fan_id: &str) -> bool {
+        self.state.lock().taken.contains_key(fan_id)
+    }
+
+    /// The ids of the cards the daemon holds, or `None` while the lock is held:
+    /// the engine's per-tick peek (DEC-448), which runs on the async executor
+    /// and so must not wait. A contended peek costs one tick.
+    pub fn try_taken_ids(&self) -> Option<Vec<String>> {
+        let state = self.state.try_lock()?;
+        Some(state.taken.keys().cloned().collect())
+    }
+
+    /// `fan_id`'s `(fan_curve, fan_zero_rpm_enable)` while the daemon holds it.
+    pub fn taken_paths(&self, fan_id: &str) -> Option<(PathBuf, Option<PathBuf>)> {
+        self.state.lock().taken.get(fan_id).cloned()
+    }
+
+    /// The cards to reset — `(fan_curve, fan_zero_rpm_enable)` — or `None` when
+    /// the lock is still held after `timeout`: the caller may be the thread
+    /// holding it, and `parking_lot`'s mutex is not re-entrant.
+    pub fn try_taken(&self, timeout: Duration) -> Option<Vec<(PathBuf, Option<PathBuf>)>> {
+        let state = self.state.try_lock_for(timeout)?;
+        Some(state.taken.values().cloned().collect())
+    }
+}
+
+/// One record line: `<fan_curve>\t<fan_zero_rpm_enable or ->`, or `None` for a
+/// path the script could not parse back — never replayed wrong.
+fn pmfw_record_line(fan_curve: &Path, zero_rpm: Option<&Path>) -> Option<String> {
+    let zero_rpm = zero_rpm.map_or_else(|| "-".to_string(), |p| p.display().to_string());
+    let line = format!("{}\t{zero_rpm}", fan_curve.display());
+    (line.matches('\t').count() == 1 && !line.contains('\n')).then_some(line)
+}
+
+fn persist_pmfw(state: &mut PmfwState) {
+    let Some(path) = state.record_path.clone() else {
+        return;
+    };
+    let mut body = format!("{PMFW_RECORD_HEADER}\n");
+    for (fan_curve, zero_rpm) in state.taken.values() {
+        if let Some(line) = pmfw_record_line(fan_curve, zero_rpm.as_deref()) {
+            body.push_str(&line);
+            body.push('\n');
+        }
+    }
+    match crate::hwmon::handback::write_replacing(&path, &body) {
+        Ok(()) => {
+            if state.record_error_logged {
+                log::info!(
+                    "PMFW hand-back record {} is being written again",
+                    path.display()
+                );
+            }
+            state.record_error_logged = false;
+        }
+        Err(e) => {
+            if !state.record_error_logged {
+                log::warn!(
+                    "could not write the PMFW hand-back record {}: {e} — if the daemon \
+                     crashes now, ExecStopPost cannot reset the GPU fan curves it drove",
+                    path.display()
+                );
+            }
+            state.record_error_logged = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::fs;
+
+    /// Mock writer that records every write for verification.
+    struct RecordingWriter {
+        writes: RefCell<Vec<(String, String)>>,
+    }
+
+    impl RecordingWriter {
+        fn new() -> Self {
+            Self {
+                writes: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn writes(&self) -> Vec<(String, String)> {
+            self.writes.borrow().clone()
+        }
+    }
+
+    impl FanCurveWriter for RecordingWriter {
+        fn write(&self, path: &Path, content: &str) -> Result<(), HwmonError> {
+            self.writes
+                .borrow_mut()
+                .push((path.display().to_string(), content.to_string()));
+            Ok(())
+        }
+    }
+
+    const SAMPLE_CURVE: &str = "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+2: 60C 50%
+3: 70C 75%
+4: 80C 100%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): 15% 100%
+";
+
+    const FLAT_CURVE: &str = "\
+OD_FAN_CURVE:
+0: 40C 75%
+1: 50C 75%
+2: 60C 75%
+3: 70C 75%
+4: 80C 75%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): 15% 100%
+";
+
+    const ZERO_RPM_ENABLED: &str = "\
+FAN_ZERO_RPM_ENABLE:
+1
+OD_RANGE:
+ZERO_RPM_ENABLE: 0 1
+";
+
+    const ZERO_RPM_DISABLED: &str = "\
+FAN_ZERO_RPM_ENABLE:
+0
+OD_RANGE:
+ZERO_RPM_ENABLE: 0 1
+";
+
+    #[test]
+    fn flat_speed_detects_static_curve() {
+        let flat = parse_fan_curve(FLAT_CURVE).unwrap();
+        assert_eq!(flat_speed_pct(&flat), Some(75));
+    }
+
+    #[test]
+    fn flat_speed_none_for_varying_curve() {
+        let varying = parse_fan_curve(SAMPLE_CURVE).unwrap();
+        assert_eq!(flat_speed_pct(&varying), None);
+    }
+
+    #[test]
+    fn flat_speed_none_for_empty_curve() {
+        let empty = FanCurve {
+            points: vec![],
+            temp_range: None,
+            speed_range: None,
+        };
+        assert_eq!(flat_speed_pct(&empty), None);
+    }
+
+    #[test]
+    fn parse_zero_rpm_enabled_reads_value_line() {
+        assert_eq!(parse_zero_rpm_enabled(ZERO_RPM_ENABLED), Some(true));
+        assert_eq!(parse_zero_rpm_enabled(ZERO_RPM_DISABLED), Some(false));
+    }
+
+    #[test]
+    fn parse_zero_rpm_enabled_none_when_absent() {
+        assert_eq!(parse_zero_rpm_enabled("garbage\nmore garbage\n"), None);
+    }
+
+    #[test]
+    fn parse_standard_curve() {
+        let curve = parse_fan_curve(SAMPLE_CURVE).unwrap();
+        assert_eq!(curve.points.len(), 5);
+        assert_eq!(curve.points[0].index, 0);
+        assert_eq!(curve.points[0].temp_c, 40);
+        assert_eq!(curve.points[0].speed_pct, 30);
+        assert_eq!(curve.points[4].temp_c, 80);
+        assert_eq!(curve.points[4].speed_pct, 100);
+    }
+
+    #[test]
+    fn parse_ranges() {
+        let curve = parse_fan_curve(SAMPLE_CURVE).unwrap();
+        assert_eq!(curve.temp_range, Some((25, 100)));
+        assert_eq!(curve.speed_range, Some((15, 100)));
+    }
+
+    #[test]
+    fn parse_empty_fails() {
+        let result = parse_fan_curve("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_no_points_fails() {
+        let result = parse_fan_curve("OD_FAN_CURVE:\nOD_RANGE:\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_partial_curve() {
+        let content = "OD_FAN_CURVE:\n0: 40C 30%\n2: 60C 50%\n";
+        let curve = parse_fan_curve(content).unwrap();
+        assert_eq!(curve.points.len(), 2);
+        assert_eq!(curve.points[0].index, 0);
+        assert_eq!(curve.points[1].index, 2);
+    }
+
+    // ── DEC-119: fan_minimum_pwm parsing ────────────────────────────
+
+    #[test]
+    fn parse_fmp_value_on_own_line() {
+        let content = "FAN_MINIMUM_PWM:\n20%\nOD_RANGE:\nFAN_MINIMUM_PWM: 0% 100%\n";
+        assert_eq!(parse_fan_minimum_pwm(content), Some(20));
+    }
+
+    #[test]
+    fn parse_fmp_inline_label() {
+        assert_eq!(parse_fan_minimum_pwm("FAN_MINIMUM_PWM: 35%\n"), Some(35));
+    }
+
+    #[test]
+    fn parse_fmp_bare_integer() {
+        assert_eq!(parse_fan_minimum_pwm("15\n"), Some(15));
+    }
+
+    #[test]
+    fn parse_fmp_stops_before_range_bounds() {
+        // The current setting (20%) must win over the OD_RANGE lower bound (0).
+        let content = "FAN_MINIMUM_PWM:\n20%\nOD_RANGE:\nFAN_MINIMUM_PWM: 0 100\n";
+        assert_eq!(parse_fan_minimum_pwm(content), Some(20));
+    }
+
+    #[test]
+    fn parse_fmp_out_of_range_token_skipped() {
+        // A bare value above 100 (e.g. a raw 0-255 PWM with no '%') is NOT
+        // mistaken for a percentage — fail-soft to None rather than mislabel.
+        assert_eq!(parse_fan_minimum_pwm("FAN_MINIMUM_PWM: 255\n"), None);
+    }
+
+    #[test]
+    fn parse_fmp_garbage_is_none() {
+        assert_eq!(parse_fan_minimum_pwm("no numbers here\n"), None);
+        assert_eq!(parse_fan_minimum_pwm(""), None);
+    }
+
+    #[test]
+    fn read_fan_minimum_pwm_missing_file_is_none() {
+        assert_eq!(
+            read_fan_minimum_pwm(Path::new("/nonexistent/fan_minimum_pwm")),
+            None
+        );
+    }
+
+    #[test]
+    fn read_fan_curve_from_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fan_curve");
+        fs::write(&path, SAMPLE_CURVE).unwrap();
+
+        let curve = read_fan_curve(&path).unwrap();
+        assert_eq!(curve.points.len(), 5);
+    }
+
+    #[test]
+    fn write_fan_curve_captures_all_intermediate_writes() {
+        let writer = RecordingWriter::new();
+        let path = Path::new("/fake/fan_curve");
+
+        let points = vec![
+            FanCurvePoint {
+                index: 0,
+                temp_c: 40,
+                speed_pct: 30,
+            },
+            FanCurvePoint {
+                index: 1,
+                temp_c: 60,
+                speed_pct: 50,
+            },
+        ];
+        write_fan_curve_with(&writer, path, &points).unwrap();
+
+        let writes = writer.writes();
+        assert_eq!(writes.len(), 3, "Expected 2 point writes + 1 commit");
+        assert_eq!(writes[0].1, "0 40 30\n");
+        assert_eq!(writes[1].1, "1 60 50\n");
+        assert_eq!(writes[2].1, "c\n");
+    }
+
+    #[test]
+    fn write_fan_curve_creates_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fan_curve");
+        // Create file so writes succeed
+        fs::write(&path, "").unwrap();
+
+        let points = vec![
+            FanCurvePoint {
+                index: 0,
+                temp_c: 40,
+                speed_pct: 30,
+            },
+            FanCurvePoint {
+                index: 1,
+                temp_c: 60,
+                speed_pct: 50,
+            },
+        ];
+        write_fan_curve(&path, &points).unwrap();
+
+        // File should contain the last write (commit "c\n")
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "c\n");
+    }
+
+    #[test]
+    fn set_static_speed_writes_flat_curve() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fan_curve");
+        fs::write(&path, SAMPLE_CURVE).unwrap();
+
+        set_static_speed(&path, None, 75, 5).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "c\n");
+    }
+
+    #[test]
+    fn set_static_speed_clamps_below_od_range_minimum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fan_curve");
+        // OD_RANGE says fan speed minimum is 15%
+        fs::write(&path, SAMPLE_CURVE).unwrap();
+
+        // Request 5% — should be clamped to 15% and succeed (no EINVAL)
+        set_static_speed(&path, None, 5, 5).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "c\n"); // committed successfully
+    }
+
+    #[test]
+    fn set_static_speed_disables_zero_rpm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let curve_path = tmp.path().join("fan_curve");
+        let zrp_path = tmp.path().join("fan_zero_rpm_enable");
+        fs::write(&curve_path, SAMPLE_CURVE).unwrap();
+        fs::write(&zrp_path, "1\n").unwrap();
+
+        set_static_speed(&curve_path, Some(&zrp_path), 50, 5).unwrap();
+        // zero-RPM file should contain the commit "c\n" (last write)
+        let zrp_content = fs::read_to_string(&zrp_path).unwrap();
+        assert_eq!(zrp_content, "c\n");
+    }
+
+    #[test]
+    fn set_static_speed_with_preserve_zero_rpm_skips_disable() {
+        // Profile-driven path with ControlMember.fan_zero_rpm = true must
+        // not touch fan_zero_rpm_enable so the GPU's idle behaviour is
+        // honoured. The original sysfs contents must be left untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let curve_path = tmp.path().join("fan_curve");
+        let zrp_path = tmp.path().join("fan_zero_rpm_enable");
+        fs::write(&curve_path, SAMPLE_CURVE).unwrap();
+        fs::write(&zrp_path, "1\n").unwrap();
+
+        set_static_speed_with_zero_rpm(&curve_path, Some(&zrp_path), 50, 5, true).unwrap();
+
+        // zero-RPM file untouched by the daemon — still contains the
+        // pre-existing "1\n", not the "c\n" the disable path would write.
+        let zrp_content = fs::read_to_string(&zrp_path).unwrap();
+        assert_eq!(zrp_content, "1\n");
+        // Curve was still written and committed.
+        let curve_content = fs::read_to_string(&curve_path).unwrap();
+        assert_eq!(curve_content, "c\n");
+    }
+
+    #[test]
+    fn set_static_speed_with_preserve_zero_rpm_false_matches_legacy() {
+        // preserve_zero_rpm = false must behave exactly like the legacy
+        // set_static_speed wrapper (regression guard for DEC-053).
+        let tmp = tempfile::tempdir().unwrap();
+        let curve_path = tmp.path().join("fan_curve");
+        let zrp_path = tmp.path().join("fan_zero_rpm_enable");
+        fs::write(&curve_path, SAMPLE_CURVE).unwrap();
+        fs::write(&zrp_path, "1\n").unwrap();
+
+        set_static_speed_with_zero_rpm(&curve_path, Some(&zrp_path), 50, 5, false).unwrap();
+        let zrp_content = fs::read_to_string(&zrp_path).unwrap();
+        assert_eq!(zrp_content, "c\n");
+    }
+
+    #[test]
+    fn reset_to_auto_writes_r_then_c() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fan_curve");
+        fs::write(&path, "").unwrap();
+
+        reset_to_auto(&path, None).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "c\n");
+    }
+
+    #[test]
+    fn reset_to_auto_reenables_zero_rpm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let curve_path = tmp.path().join("fan_curve");
+        let zrp_path = tmp.path().join("fan_zero_rpm_enable");
+        fs::write(&curve_path, "").unwrap();
+        fs::write(&zrp_path, "0\n").unwrap();
+
+        reset_to_auto(&curve_path, Some(&zrp_path)).unwrap();
+        // zero-RPM should be re-enabled (last write is commit "c\n")
+        let zrp_content = fs::read_to_string(&zrp_path).unwrap();
+        assert_eq!(zrp_content, "c\n");
+    }
+
+    #[test]
+    fn read_missing_file_returns_error() {
+        let result = read_fan_curve(Path::new("/nonexistent/fan_curve"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn speed_clamped_to_100() {
+        let content = "OD_FAN_CURVE:\n0: 40C 120%\n";
+        let curve = parse_fan_curve(content).unwrap();
+        assert_eq!(curve.points[0].speed_pct, 100);
+    }
+
+    // ── Legacy PWM tests ───────────────────────────────────────────
+
+    #[test]
+    fn set_legacy_pwm_writes_enable_and_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path();
+        fs::write(hwmon.join("pwm1_enable"), "").unwrap();
+        fs::write(hwmon.join("pwm1"), "").unwrap();
+
+        set_legacy_pwm(hwmon, 50).unwrap();
+
+        let enable = fs::read_to_string(hwmon.join("pwm1_enable")).unwrap();
+        assert_eq!(enable, "1\n");
+        let pwm = fs::read_to_string(hwmon.join("pwm1")).unwrap();
+        assert_eq!(pwm, "128\n");
+    }
+
+    #[test]
+    fn set_legacy_pwm_full_speed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path();
+        fs::write(hwmon.join("pwm1_enable"), "").unwrap();
+        fs::write(hwmon.join("pwm1"), "").unwrap();
+
+        set_legacy_pwm(hwmon, 100).unwrap();
+        let pwm = fs::read_to_string(hwmon.join("pwm1")).unwrap();
+        assert_eq!(pwm, "255\n");
+    }
+
+    #[test]
+    fn reset_legacy_to_auto_writes_enable_2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = tmp.path();
+        fs::write(hwmon.join("pwm1_enable"), "1\n").unwrap();
+
+        reset_legacy_to_auto(hwmon).unwrap();
+
+        let enable = fs::read_to_string(hwmon.join("pwm1_enable")).unwrap();
+        assert_eq!(enable, "2\n");
+    }
+
+    #[test]
+    fn set_legacy_pwm_missing_path_returns_error() {
+        let result = set_legacy_pwm(Path::new("/nonexistent/hwmon99"), 50);
+        assert!(result.is_err());
+    }
+
+    // ── DEC-414 (`TS-aa`): the legacy verify's crash record ──
+
+    fn record_lines(record: &Path) -> Vec<String> {
+        gpu_record_lines(record)
+    }
+
+    #[test]
+    fn a_take_records_the_original_mode_and_a_hand_back_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        let card = dir.path().join("hwmon3");
+        note_legacy_take(&record, &card, LegacyOriginal::Mode(2));
+        assert_eq!(
+            record_lines(&record),
+            vec![format!(
+                "{}\t{}\tmode\t2",
+                card.join("pwm1_enable").display(),
+                card.join("pwm1").display()
+            )]
+        );
+        note_legacy_handed_back(&record, &card);
+        assert!(!record.exists(), "the last line going removes the file");
+    }
+
+    #[test]
+    fn an_unreadable_original_is_given_back_as_automatic() {
+        // The user's choice (DEC-414): amdgpu's automatic mode, which is what
+        // the verify's own restore writes.
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        note_legacy_take(
+            &record,
+            &dir.path().join("hwmon3"),
+            LegacyOriginal::from_read(None, Some(200)),
+        );
+        let lines = record_lines(&record);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with("\tmode\t2"), "{lines:?}");
+    }
+
+    #[test]
+    fn the_first_take_of_a_card_keeps_its_original_mode() {
+        // A line still present means an earlier verify's restore failed, so the
+        // card is in the daemon's manual mode; the next verify reads that
+        // leftover, and must neither record it as the card's original nor
+        // restore to it (DEC-447, `TS-bi`) — the standing original is returned.
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        let card = dir.path().join("hwmon3");
+        let first = note_legacy_take(&record, &card, LegacyOriginal::Mode(2));
+        assert_eq!(first, LegacyOriginal::Mode(2), "a new line: what was read");
+        let leftover = LegacyOriginal::from_read(Some(1), Some(191));
+        let second = note_legacy_take(&record, &card, leftover);
+        assert_eq!(
+            second,
+            LegacyOriginal::Mode(2),
+            "the standing original, not the leftover the second verify read"
+        );
+        let lines = record_lines(&record);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].ends_with("\tmode\t2"),
+            "the first original stands: {lines:?}"
+        );
+    }
+
+    /// DEC-447 (`TS-bj`): a card another tool had in manual is recorded with its
+    /// duty, as the hwmon ledger records `manual <raw>`, so a crash mid-verify
+    /// gives the duty back too, not only the mode.
+    #[test]
+    fn a_card_found_in_manual_is_recorded_with_its_duty() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        let card = dir.path().join("hwmon3");
+        note_legacy_take(
+            &record,
+            &card,
+            LegacyOriginal::from_read(Some(1), Some(120)),
+        );
+        let lines = record_lines(&record);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("\tmanual\t120"), "{lines:?}");
+    }
+
+    /// DEC-447, the user's choices: what the verify read maps to the original
+    /// it gives back. Manual with an unreadable duty, and an unreadable mode,
+    /// are automatic; any other mode is given back as it was.
+    #[test]
+    fn what_was_read_decides_the_original() {
+        let cases = [
+            (
+                Some(1),
+                Some(120),
+                LegacyOriginal::Manual(120),
+                "manual, duty read",
+            ),
+            (
+                Some(1),
+                None,
+                LegacyOriginal::Mode(2),
+                "manual, duty unreadable",
+            ),
+            (None, Some(120), LegacyOriginal::Mode(2), "mode unreadable"),
+            (Some(2), Some(120), LegacyOriginal::Mode(2), "automatic"),
+            (
+                Some(0),
+                None,
+                LegacyOriginal::Mode(0),
+                "full speed, as found",
+            ),
+        ];
+        for (enable, raw, want, why) in cases {
+            assert_eq!(LegacyOriginal::from_read(enable, raw), want, "{why}");
+        }
+    }
+
+    #[test]
+    fn a_hand_back_leaves_other_cards_lines_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(GPU_RECORD_FILE_NAME);
+        let (a, b) = (dir.path().join("hwmon3"), dir.path().join("hwmon4"));
+        note_legacy_take(&record, &a, LegacyOriginal::Mode(2));
+        note_legacy_take(&record, &b, LegacyOriginal::Mode(2));
+        note_legacy_handed_back(&record, &a);
+        let lines = record_lines(&record);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with(&b.join("pwm1_enable").display().to_string()));
+    }
+
+    #[test]
+    fn reset_legacy_missing_path_returns_error() {
+        let result = reset_legacy_to_auto(Path::new("/nonexistent/hwmon99"));
+        assert!(result.is_err());
+    }
+
+    // ── DEC-265: inverted OD_RANGE lines from the device ──
+
+    const INVERTED_TEMP_RANGE: &str = "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 100C 25C
+FAN_CURVE(fan speed): 15% 100%
+";
+
+    const INVERTED_SPEED_RANGE: &str = "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): 100% 15%
+";
+
+    #[test]
+    fn an_inverted_temp_range_is_rejected_rather_than_trusted() {
+        // `Ord::clamp` panics outright when min > max, and these bounds reach one
+        // on the 1 Hz write path — a panic there kills the sole PWM writer. The
+        // range is device-supplied text, so it is checked, not assumed.
+        let curve = parse_fan_curve(INVERTED_TEMP_RANGE).unwrap();
+        assert_eq!(
+            curve.temp_range, None,
+            "an inverted hotspot temp range must be dropped so the caller's safe \
+             fallback stands"
+        );
+    }
+
+    #[test]
+    fn an_inverted_speed_range_is_rejected_rather_than_trusted() {
+        // This pair feeds `.max(lo).min(hi)`, which does not panic — inverted, it
+        // would silently pin every speed to `hi`. Wrong quietly rather than safely.
+        let curve = parse_fan_curve(INVERTED_SPEED_RANGE).unwrap();
+        assert_eq!(curve.speed_range, None);
+    }
+
+    #[test]
+    fn a_well_ordered_range_is_still_accepted() {
+        // Guard against "fixed" by dropping every range.
+        let curve = parse_fan_curve(SAMPLE_CURVE).unwrap();
+        assert_eq!(curve.temp_range, Some((25, 100)));
+        assert_eq!(curve.speed_range, Some((15, 100)));
+    }
+
+    // ── DEC-266: the ordering guard must survive the conversion ──
+    //
+    // `parse_value_with_suffix` returns i32 and accepts a leading `-`. Checking
+    // order in i32 and *then* casting with `as u8` re-admits the exact inversion
+    // the guard rejects, silently — no panic, no log, just wrong fan speeds
+    // forever. These are the two shapes that slipped through.
+
+    #[test]
+    fn a_negative_speed_bound_cannot_wrap_past_the_ordering_guard() {
+        // -1 <= 100 passes in i32; `as u8` then yields (255, 100) — inverted
+        // again, and `.max(255).min(100)` pins every write to 100%.
+        let curve = parse_fan_curve(
+            "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): -1% 100%
+",
+        )
+        .unwrap();
+        assert_eq!(
+            curve.speed_range, None,
+            "a negative bound must be rejected, not truncated into an inverted pair"
+        );
+    }
+
+    #[test]
+    fn a_speed_bound_above_100_cannot_wrap_past_the_ordering_guard() {
+        // 0 <= 300 passes in i32; `as u8` yields (0, 44), silently capping every
+        // GPU fan at 44%.
+        let curve = parse_fan_curve(
+            "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): 25C 100C
+FAN_CURVE(fan speed): 0% 300%
+",
+        )
+        .unwrap();
+        assert_eq!(
+            curve.speed_range, None,
+            "an out-of-range bound must be rejected, not truncated to 44%"
+        );
+    }
+
+    #[test]
+    fn an_implausible_temp_range_is_rejected_before_it_can_overflow() {
+        // `temp_max - temp_min` is computed in i32 downstream, so a range this
+        // wide overflows — wrapping in release, panicking under test, on the
+        // once-per-second sole-writer path.
+        let curve = parse_fan_curve(
+            "\
+OD_FAN_CURVE:
+0: 40C 30%
+1: 50C 35%
+OD_RANGE:
+FAN_CURVE(hotspot temp): -2147483648C 2147483647C
+FAN_CURVE(fan speed): 15% 100%
+",
+        )
+        .unwrap();
+        assert_eq!(curve.temp_range, None);
+        assert_eq!(
+            curve.speed_range,
+            Some((15, 100)),
+            "one bad line must not discard the other"
+        );
+    }
+
+    #[test]
+    fn set_static_speed_survives_a_device_reporting_an_inverted_range() {
+        // The end-to-end shape of the panic: before DEC-265 this input reached
+        // `raw_temp.clamp(temp_min, temp_max)` with min > max and took the process
+        // down — on the 1 Hz write path, killing the sole PWM writer. It must now
+        // write a curve instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fan_curve");
+        fs::write(&path, INVERTED_TEMP_RANGE).unwrap();
+
+        set_static_speed(&path, None, 50, 5).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "c\n");
+    }
+
+    // ── PMFW hand-back list (DEC-435) ────────────────────────────────
+
+    /// [SAFETY] DEC-435: a card is on the record from its first take, the record
+    /// names exactly the taken cards, and a hand-back takes the card off it.
+    #[test]
+    fn the_pmfw_record_names_exactly_the_cards_taken_and_not_handed_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(PMFW_RECORD_FILE_NAME);
+        let ledger = PmfwHandBack::default();
+        ledger.set_record_path(record.clone());
+        assert!(record_lines(&record).is_empty(), "no card is taken yet");
+
+        let a = dir.path().join("a/gpu_od/fan_ctrl/fan_curve");
+        let a_zrp = dir.path().join("a/gpu_od/fan_ctrl/fan_zero_rpm_enable");
+        let b = dir.path().join("b/gpu_od/fan_ctrl/fan_curve");
+        ledger.note_take("amd_gpu:a", &a, Some(&a_zrp));
+        ledger.note_take("amd_gpu:b", &b, None);
+        ledger.note_take("amd_gpu:a", &a, Some(&a_zrp)); // a later tick: no second line
+        assert_eq!(
+            record_lines(&record),
+            vec![
+                format!("{}\t{}", a.display(), a_zrp.display()),
+                format!("{}\t-", b.display()),
+            ]
+        );
+        assert!(ledger.is_taken("amd_gpu:a") && ledger.is_taken("amd_gpu:b"));
+
+        ledger.note_handed_back("amd_gpu:a");
+        assert_eq!(record_lines(&record), vec![format!("{}\t-", b.display())]);
+        assert!(!ledger.is_taken("amd_gpu:a"));
+        assert_eq!(
+            ledger.try_taken(Duration::from_millis(50)),
+            Some(vec![(b.clone(), None)]),
+            "the in-process restores read the same list"
+        );
+    }
+
+    /// A record left by an earlier process is replaced at once, so it never
+    /// names a card this process did not take.
+    #[test]
+    fn setting_the_pmfw_record_path_replaces_a_stale_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(PMFW_RECORD_FILE_NAME);
+        fs::write(&record, "/sys/stale/gpu_od/fan_ctrl/fan_curve\t-\n").unwrap();
+
+        PmfwHandBack::default().set_record_path(record.clone());
+
+        assert!(record_lines(&record).is_empty());
+    }
+
+    /// A path the script could not parse back is kept in memory — the clean stop
+    /// still resets it — but never written as a line that would replay wrong.
+    #[test]
+    fn a_pmfw_path_with_a_tab_is_kept_in_memory_but_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = dir.path().join(PMFW_RECORD_FILE_NAME);
+        let ledger = PmfwHandBack::default();
+        ledger.set_record_path(record.clone());
+        let odd = dir.path().join("od\td/gpu_od/fan_ctrl/fan_curve");
+
+        ledger.note_take("amd_gpu:odd", &odd, None);
+
+        assert!(ledger.is_taken("amd_gpu:odd"));
+        assert!(record_lines(&record).is_empty());
+    }
+
+    /// A record that failed to write is retried on the next take of a card that
+    /// is already listed (the engine's next tick), not only when the list
+    /// changes (DEC-435 review).
+    #[test]
+    fn a_failed_pmfw_record_write_is_retried_on_the_next_take() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = dir.path().join("run");
+        let record = run.join(PMFW_RECORD_FILE_NAME);
+        let ledger = PmfwHandBack::default();
+        ledger.set_record_path(record.clone()); // `run/` does not exist yet: fails
+        let curve = dir.path().join("a/gpu_od/fan_ctrl/fan_curve");
+        ledger.note_take("amd_gpu:a", &curve, None);
+        assert!(!record.exists(), "precondition: the write failed");
+
+        fs::create_dir_all(&run).unwrap();
+        ledger.note_take("amd_gpu:a", &curve, None);
+
+        assert_eq!(
+            record_lines(&record),
+            vec![format!("{}\t-", curve.display())]
+        );
+    }
+
+    /// A record that cannot be written does not stop the take: the list the
+    /// clean stop reads still names the card (the user's choice, DEC-435).
+    #[test]
+    fn an_unwritable_pmfw_record_still_takes_the_card() {
+        let ledger = PmfwHandBack::default();
+        ledger.set_record_path(PathBuf::from("/nonexistent/ventulus/gpu-pmfw-handback"));
+
+        ledger.note_take(
+            "amd_gpu:a",
+            Path::new("/sys/x/gpu_od/fan_ctrl/fan_curve"),
+            None,
+        );
+
+        assert!(ledger.is_taken("amd_gpu:a"));
+    }
+}

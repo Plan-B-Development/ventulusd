@@ -1,0 +1,141 @@
+# Ventulus Daemon — admin-owned configuration.
+# The package installs this file as /etc/ventulus/daemon.toml and keeps your
+# edits on upgrade. All fields are optional — defaults are shown below.
+#
+# READ BEFORE EDITING: inside a section this file is strict. An unknown or
+# misspelt key, or an out-of-range value, makes the daemon exit at startup, and
+# systemd keeps restarting it — with NOTHING controlling the fans and no thermal
+# emergency — until the file is fixed. `journalctl -u ventulusd` names
+# the key. An unknown top-level SECTION is only logged and ignored, so under a
+# misspelt section name (or above its section header) that section's defaults
+# apply: check the journal for "ignoring unknown top-level section" after an edit.
+#
+# Downgrading: daemons up to 3.6.0 refuse a section they do not know. Before
+# installing an older daemon, comment out [safety] (added in 3.0.0) and
+# [shutdown] (added in 2.50.0) if that daemon predates them. A key added inside
+# a section the older daemon knows ([startup] record_startup, 2.41.0) stops it
+# starting at any version: comment those out too.
+#
+# After an edit: `sudo systemctl reload ventulusd` applies
+# [profiles] search_dirs, [shutdown] exit_floor_pct and [safety] coolant_limit_c
+# at once; every other key
+# needs `sudo systemctl restart ventulusd`.
+#
+# NOTE: several settings below are admin-owned BASE defaults that the API may
+# later OVERRIDE. When a POST /config/* call mutates one of them, the daemon
+# writes /var/lib/ventulus/runtime.toml, whose keys OVERLAY these defaults
+# (runtime wins, ADR-002). The two files coexist; this file is admin-owned and
+# is never rewritten by the daemon at runtime.
+#
+# Keys that can be shadowed this way, and by which route:
+#   [profiles] search_dirs            POST /config/profile-search-dirs
+#   [startup]  delay_secs             POST /config/startup-delay
+#   [polling]  poll_interval_ms       POST /config/poll-interval      (250-2000)
+#   [serial]   port                   POST /config/serial-port
+#   [serial]   timeout_ms             POST /config/serial-timeout     (50-1000)
+#   [detection] allow_port_probe      POST /config/allow-port-probe
+#   [detection] enable_nvidia_telemetry  POST /config/nvidia-telemetry
+#   [shutdown] exit_floor_pct         POST /config/exit-floor         (0-100, applies at once)
+#   [safety]   coolant_limit_c        POST /config/coolant-limit      (40-70, applies at once)
+#
+# The API's bounds on the two interval keys are deliberately TIGHTER than what
+# this file accepts: they bound how stale a temperature the thermal emergency
+# can act on, and the API is reachable by any local user while this file is not.
+#
+# If an edit here appears not to take effect, a runtime override is shadowing it:
+# GET /config reports source="runtime" for that key, and the daemon logs it once
+# at startup. See docs/ADRs/002-runtime-config-split.md.
+
+[serial]
+# No default port: when unset the daemon auto-detects the OpenFanController. To
+# pin it, use the stable /dev/serial/by-id/ path (survives USB re-enumeration).
+# port = "/dev/serial/by-id/usb-Karanovic_Research_OpenFan_...-if00"
+# At least 50.
+# timeout_ms = 500
+
+[polling]
+# At least 100. Slower than 6000 is clamped to 6000 with a warning: past that the
+# thermal emergency's staleness budget stops tracking the poll (DEC-270).
+# poll_interval_ms = 1000
+
+[ipc]
+# Moving the socket out of /run/ventulus also needs a ReadWritePaths= drop-in:
+# the unit runs with ProtectSystem=strict.
+# socket_path = "/run/ventulus/ventulus.sock"
+
+[state]
+# Moving it also needs a ReadWritePaths= drop-in, for the same reason.
+# state_dir = "/var/lib/ventulus"
+
+[profiles]
+# Where profiles are looked up. The default is /etc/ventulus/profiles plus
+# $XDG_CONFIG_HOME/ventulus/profiles, or $HOME/.config/ventulus/profiles
+# when that is unset — /root/.config/ventulus/profiles under the service,
+# which sets HOME=/root. Setting this replaces both. The daemon's own store,
+# {state_dir}/profiles, is always searched first, and the GUI adds its own
+# profile folder through the API.
+# search_dirs = ["/etc/ventulus/profiles", "/root/.config/ventulus/profiles"]
+
+[startup]
+# Seconds to wait before device detection at boot (0–30). The API
+# (POST /config/startup-delay) can override this at runtime.
+# delay_secs = 0
+#
+# Record a short lifecycle session automatically at daemon start, so a cooler's
+# power-on behaviour is captured without somebody sitting at the machine
+# (DEC-335). Writes no hardware, takes no lease, and never blocks you: starting
+# a session yourself takes the slot immediately and the partial recording is
+# still saved. Default: false.
+#
+# This key belongs HERE and is NOT settable in runtime.toml — that file's
+# [startup] section accepts delay_secs alone, under deny_unknown_fields, so an
+# unknown key there fails the parse and the WHOLE file falls back to defaults
+# (taking your saved header_roles pump assignments with it). There is no
+# POST /config/* route for this one.
+# record_startup = false
+
+[detection]
+# Opt-in active Super-I/O port probe (DEC-203). Default: false.
+# When true AND the CAP_SYS_RAWIO systemd drop-in is installed (see
+# /usr/share/doc/ventulusd/superio-port-probe.conf.example), the
+# daemon will, on a deliberate POST /inventory/superio/probe, probe the
+# Super-I/O config ports (0x2E/0x4E) to identify an UNBOUND motherboard chip.
+# It is not read-only: where nothing answers it writes a vendor config-mode
+# unlock and exit (see the drop-in example for exactly which). It refuses the
+# whole probe while any recognised Super-I/O driver is bound, and skips a
+# port reserved by a driver or ACPI. Leave false unless you specifically need
+# it — the passive detection covers the common cases, and CAP_SYS_RAWIO is
+# effectively root-equivalent.
+# allow_port_probe = false
+#
+# Opt-in READ-ONLY NVIDIA telemetry via NVML (DEC-204). Default: false. When
+# true AND the /dev/nvidia* systemd drop-in is installed (see
+# /usr/share/doc/ventulusd/nvidia-telemetry.conf.example), the daemon
+# reads NVIDIA GPU temperature + fan telemetry through libnvidia-ml.so.1. It
+# NEVER writes to the GPU. EXPERIMENTAL — the NVML path is unverified on
+# hardware. The open nouveau driver is read via hwmon and needs neither this
+# flag nor the drop-in.
+# enable_nvidia_telemetry = false
+
+[shutdown]
+# The exit floor (DEC-388). On a clean stop, a fan the daemon cannot hand back to
+# firmware — an OpenFan channel, or a motherboard header with no pwmN_enable — is
+# left at max(its last speed, this); one whose speed the daemon no longer knows
+# goes to 100 %. Fans the daemon never drove are left alone — except on an ARCTIC
+# Fan Controller (arctic_fan), where any write carries all ten channels: there a
+# channel reading 0 that the daemon did not choose is set to 100 % first, and is
+# left at 100 % (since 2.56.1). 0 turns it off.
+# Also settable from the GUI (Settings -> Daemon Configuration -> Exit minimum),
+# which applies at once. A crash or SIGKILL cannot run it: OpenFan channels then
+# keep their last speed.
+# exit_floor_pct = 50
+
+[safety]
+# The coolant emergency (DEC-443). When the hottest current coolant reading — an
+# AIO or custom-loop coolant sensor the daemon recognises — is at or above this,
+# every OpenFan channel and writable motherboard header is forced to 100 %, the
+# same as the CPU emergency, until a current reading is 5 C below it. Whole
+# degrees C, 40-70; there is no off switch. A machine with no coolant sensor is
+# unaffected. Also settable from the GUI (Settings -> Daemon Configuration ->
+# Coolant limit), which applies at once.
+# coolant_limit_c = 60

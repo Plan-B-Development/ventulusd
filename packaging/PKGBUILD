@@ -1,0 +1,219 @@
+# Maintainer: Plan-B-Development <https://github.com/Plan-B-Development>
+pkgname=ventulusd
+pkgver=4.3.0
+pkgrel=1
+pkgdesc="Hardware fan control daemon for Linux (OpenFan, hwmon, GPU)"
+arch=('x86_64')
+url="https://github.com/Plan-B-Development/ventulusd"
+license=('MIT')
+# curl: ventulusd-carryover asks the old socket whether anything still serves it
+# (DEC-493); pacman itself depends on it, so it is always present.
+depends=('glibc' 'systemd-libs' 'libgcc' 'hicolor-icon-theme' 'curl')
+# The Ventulus rename (DEC-493): this package is control-ofc-daemon renamed.
+# `replaces` lets `pacman -Syu` swap it in; `provides` keeps a Control-OFC 4.x
+# GUI's `control-ofc-daemon>=X` dependency satisfied until that GUI is replaced
+# too (it reaches this daemon through the compatibility socket link).
+# control-ofc-gui < 2.0.0 is the pre-sole-writer GUI, still refused.
+replaces=('control-ofc-daemon')
+provides=("control-ofc-daemon=$pkgver")
+conflicts=('control-ofc-daemon' 'control-ofc-gui<2.0.0')
+optdepends=(
+    'lm_sensors: sensors verification CLI; sensors-detect (last resort) for chips not covered by the built-in module list'
+    'nvidia-utils: NVML runtime (libnvidia-ml.so.1) for opt-in [detection] enable_nvidia_telemetry=true (DEC-204); the open nouveau driver does not need it'
+    'it87-dkms-git: out-of-tree driver for ITE 8625E/8665E/8686E/8688E/8689E/8696E/87952E (most newer Gigabyte boards; ASUS AM4 300/400-series boards)'
+    'nct6687d-dkms-git: out-of-tree driver for Nuvoton NCT6687D (most newer MSI boards; some ASRock NCT6686D boards)'
+    'dkms: required by the *-dkms-git driver packages above'
+    'linux-headers: required by DKMS to build out-of-tree drivers (must match your running kernel)'
+)
+# `rust` provides `cargo`; do not list both.
+makedepends=('rust' 'scdoc')
+backup=('etc/ventulus/daemon.toml'
+        'etc/ventulus/profiles/quiet.json'
+        'etc/modules-load.d/ventulus.conf')
+install=ventulusd.install
+options=(!lto)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
+# Self-referential by construction: the tarball GitHub generates for the tag
+# CONTAINS this file, so any sha256 written here changes the tree, the tag, and
+# therefore the hash it claims to pin. SKIP is the only honest value. Integrity
+# of the published package comes from the GPG signature + Sigstore attestation
+# on the pacman-repo asset, not from this line.
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+
+    # Render man pages from scdoc source.
+    scdoc < man/ventulusd.1.scd > ventulusd.1
+    scdoc < man/ventulus-tray.1.scd > ventulus-tray.1
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo test --frozen
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+
+    # Binary
+    install -Dm755 target/release/ventulusd "$pkgdir/usr/bin/ventulusd"
+
+    # Restore script (runs on daemon stop to give each fan back what the daemon found)
+    install -Dm755 packaging/ventulus-restore-auto.sh "$pkgdir/usr/bin/ventulus-restore-auto"
+
+    # systemd-sleep hook (DEC-396, TS-ao): widens the daemon's watchdog across a
+    # suspend/hibernate so a slow device resume cannot draw a watchdog restart.
+    install -Dm755 packaging/ventulus-sleep-hook.sh \
+        "$pkgdir/usr/lib/systemd/system-sleep/ventulusd"
+
+    # System-tray client (DEC-352). Built by the same `cargo build --release`
+    # above, which has no `-p` and so covers every workspace member.
+    #
+    # This is a desktop-session component, not a daemon one: it is a read-mostly
+    # API client and the daemon neither knows nor cares whether it is running.
+    # It ships here because it is a Rust binary and this is the package with a
+    # Rust toolchain; a headless install carries ~5.6 MB it never executes,
+    # because the autostart entry's TryExec names the GUI.
+    install -Dm755 target/release/ventulus-tray "$pkgdir/usr/bin/ventulus-tray"
+    install -Dm644 packaging/ventulus-tray.desktop \
+        "$pkgdir/etc/xdg/autostart/ventulus-tray.desktop"
+
+    # Tray panel glyph. Deliberately owned by THIS package rather than reusing
+    # the GUI's `ventulus` brand icon: the tray must render correctly on a
+    # daemon-only install where the GUI package (and therefore that icon) is
+    # absent. Monochrome and recolourable per the Breeze convention.
+    install -Dm644 packaging/ventulus-symbolic.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/ventulus-symbolic.svg"
+
+    # The Ventulus rename (DEC-493), 5.x only: the old socket path links to the
+    # new one, and a PostTransaction hook starts ventulusd in place of a
+    # control-ofc-daemon that was running when it was replaced.
+    install -Dm644 packaging/ventulusd.tmpfiles "$pkgdir/usr/lib/tmpfiles.d/ventulusd.conf"
+    install -Dm644 packaging/ventulusd-carryover.hook \
+        "$pkgdir/usr/share/libalpm/hooks/90-ventulusd-carryover.hook"
+    install -Dm755 packaging/ventulusd-carryover.sh \
+        "$pkgdir/usr/lib/ventulus/ventulusd-carryover"
+
+    # systemd service
+    install -Dm644 packaging/ventulusd.service "$pkgdir/usr/lib/systemd/system/ventulusd.service"
+
+    # Default config
+    install -Dm644 packaging/daemon.toml.example "$pkgdir/etc/ventulus/daemon.toml"
+
+    # Profile drop-in directory (admin-owned, GUI reads from here after copy).
+    # The daemon's own runtime state lives under /var/lib/ventulus/, which
+    # systemd creates via StateDirectory= in the unit file.
+    install -dm755 "$pkgdir/etc/ventulus/profiles"
+
+    # Example profile — safe to ship (empty members list, drives no fans).
+    # Gives first-run users a working schema reference. Covered by backup=()
+    # so pacman preserves user edits across upgrades (.pacnew pattern).
+    install -Dm644 packaging/profiles/quiet.json "$pkgdir/etc/ventulus/profiles/quiet.json"
+
+    # Optional udev rules example (documentation only).
+    # The daemon auto-detects the OpenFan controller on /dev/ttyACM* and
+    # /dev/ttyUSB* at startup — no udev rule is required for normal operation.
+    # Ship the rule as a reference for users who want a specific group/mode on
+    # the device node; they copy it into /etc/udev/rules.d/ and fill in their
+    # VID/PID. A stable path is /dev/serial/by-id/, which udev already provides.
+    install -Dm644 packaging/99-ventulus.rules \
+        "$pkgdir/usr/share/doc/$pkgname/99-ventulus.rules.example"
+
+    # Opt-in systemd drop-in for the ACTIVE Super-I/O port probe (DEC-203).
+    # Shipped as a doc example ONLY — NOT installed into the .service.d/ dir,
+    # so the default unit stays fully hardened. Grants CAP_SYS_RAWIO (~root),
+    # so the operator must copy it deliberately AND set allow_port_probe=true.
+    install -Dm644 packaging/superio-port-probe.conf.example \
+        "$pkgdir/usr/share/doc/$pkgname/superio-port-probe.conf.example"
+
+    # Opt-in systemd drop-in for READ-ONLY NVIDIA NVML telemetry (DEC-204).
+    # Shipped as a doc example ONLY — NOT installed into the .service.d/ dir, so
+    # the default unit stays hardened. Grants access to the NVIDIA device nodes;
+    # the operator must copy it deliberately AND set enable_nvidia_telemetry=true.
+    install -Dm644 packaging/nvidia-telemetry.conf.example \
+        "$pkgdir/usr/share/doc/$pkgname/nvidia-telemetry.conf.example"
+
+    # Opt-in systemd drop-in letting the daemon WRITE the OpenFAN firmware
+    # itself (DEC-483). Shipped as a doc example ONLY — NOT installed into the
+    # .service.d/ dir, so the default unit keeps USB devices out of reach.
+    # Grants read-write access to the USB device nodes; the operator copies it
+    # deliberately. Without it the update still works, by a copy by hand.
+    install -Dm644 packaging/openfan-firmware-write.conf.example \
+        "$pkgdir/usr/share/doc/$pkgname/openfan-firmware-write.conf.example"
+
+    # Kernel module loading — Super I/O chipset drivers that expose
+    # motherboard fan headers and sensors. See packaging/modules-load.d/
+    # for rationale. Covered by backup=() so pacman preserves user edits.
+    install -Dm644 packaging/modules-load.d/ventulus.conf \
+        "$pkgdir/etc/modules-load.d/ventulus.conf"
+
+    # Super-I/O probe guard (DEC-332). The modules-load.d file above asks for
+    # nct6775 and w83627ehf; on a Gigabyte board with an ITE Super-I/O their
+    # probe writes a config-mode unlock that can latch an eSPI-to-LPC bridge and
+    # hide the secondary chip's fan headers until a reboot, or on some boards
+    # until the machine is powered down at the wall.
+    # The guard suppresses them on every Gigabyte board (DEC-424: all use ITE
+    # Super-I/O), and on a listed board whose firmware reports no vendor; it is
+    # a no-op everywhere else.
+    #
+    # /usr/lib/modprobe.d, not /etc: this is vendor policy, and a user who wants
+    # it gone creates an empty /etc/modprobe.d/ventulus-superio.conf, which
+    # masks it (the same name matters: a differently named file does not reliably
+    # win), and edits nothing we will overwrite on upgrade. Not in backup=() for the same reason.
+    install -Dm755 packaging/ventulus-superio-guard \
+        "$pkgdir/usr/lib/ventulus/ventulus-superio-guard"
+    install -Dm644 packaging/modprobe.d-ventulus-superio.conf \
+        "$pkgdir/usr/lib/modprobe.d/ventulus-superio.conf"
+
+    # Man page (rendered in build())
+    install -Dm644 ventulusd.1 \
+        "$pkgdir/usr/share/man/man1/ventulusd.1"
+    install -Dm644 ventulus-tray.1 \
+        "$pkgdir/usr/share/man/man1/ventulus-tray.1"
+
+    # Shell completions — installed unconditionally; missing shells ignore them.
+    install -Dm644 completions/ventulusd.bash \
+        "$pkgdir/usr/share/bash-completion/completions/ventulusd"
+    install -Dm644 completions/_ventulusd \
+        "$pkgdir/usr/share/zsh/site-functions/_ventulusd"
+    install -Dm644 completions/ventulusd.fish \
+        "$pkgdir/usr/share/fish/vendor_completions.d/ventulusd.fish"
+    # The tray is a second binary in this package with its own CLI (DEC-352),
+    # so it gets its own three files rather than sharing the daemon's.
+    install -Dm644 completions/ventulus-tray.bash \
+        "$pkgdir/usr/share/bash-completion/completions/ventulus-tray"
+    install -Dm644 completions/_ventulus-tray \
+        "$pkgdir/usr/share/zsh/site-functions/_ventulus-tray"
+    install -Dm644 completions/ventulus-tray.fish \
+        "$pkgdir/usr/share/fish/vendor_completions.d/ventulus-tray.fish"
+
+    # User-facing documentation. The post_install message points users here,
+    # so they actually find a setup guide instead of just the udev example.
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+    install -Dm644 docs/USER_GUIDE.md "$pkgdir/usr/share/doc/$pkgname/USER_GUIDE.md"
+    install -Dm644 docs/ADRs/001-ipc-transport.md \
+        "$pkgdir/usr/share/doc/$pkgname/ADRs/001-ipc-transport.md"
+    install -Dm644 docs/ADRs/002-runtime-config-split.md \
+        "$pkgdir/usr/share/doc/$pkgname/ADRs/002-runtime-config-split.md"
+
+    # License
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    # DEC-260: ship NOTICE.md beside LICENSE. It records the dependencies whose
+    # licences are not permissive and what obligations they carry — a document
+    # written for recipients, which until now never reached one: it existed only
+    # in the git tree, not in the installed package.
+    install -Dm644 NOTICE.md "$pkgdir/usr/share/licenses/$pkgname/NOTICE.md"
+}

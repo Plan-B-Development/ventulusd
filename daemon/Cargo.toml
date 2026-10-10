@@ -1,0 +1,40 @@
+[package]
+name = "ventulusd"
+version = "4.3.0"
+edition = "2021"
+license = "MIT"
+description = "Hardware fan control daemon for Linux (OpenFan, hwmon, AMD GPU)"
+repository = "https://github.com/Plan-B-Development/ventulusd"
+authors = ["Plan-B-Development <https://github.com/Plan-B-Development>"]
+
+[dependencies]
+axum = "0.8"
+env_logger = "0.11"
+libc = "0.2"
+# Runtime dynamic loading of libnvidia-ml.so.1 for opt-in, read-only NVIDIA
+# telemetry (DEC-204). ISC-licensed — see deny.toml. Never a build/link-time
+# dependency on any NVIDIA library; the daemon degrades cleanly when NVML is
+# absent (the default: [detection] enable_nvidia_telemetry = false).
+libloading = "0.9"
+log = "0.4"
+# Raw USB to an RP2040 in its bootloader, to write OpenFan firmware (DEC-483).
+# Pure Rust over usbfs — no libusb, no netlink. Opening a device needs the
+# opt-in `openfan-firmware-write` drop-in (DeviceAllow=char-usb_device).
+nusb = "0.2.7"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = "4.9.0"
+# Fingerprints a staged firmware file against the published releases (DEC-483).
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "io-util", "sync", "time"] }
+toml = "0.8"
+
+[dev-dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }

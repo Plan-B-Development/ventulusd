@@ -1,0 +1,188 @@
+# ADR-002: Runtime config split — `daemon.toml` vs `runtime.toml`
+
+**Status:** Accepted (v1.1.0). The originally-planned v1.2.0 removal of legacy
+`[profiles]` / `[startup]` parsing was **superseded** — those sections are
+retained as valid admin-layer *defaults* (the base layer that `runtime.toml`
+overlays), parsed and never a parse error. See `docs/USER_GUIDE.md` § Runtime configuration for the current state.
+**Last reviewed:** 2026-09 — the runtime-mutable keys table, the loss-on-unreadable behaviour
+and the references were brought up to date (DEC-438).
+
+> **Status as of v1.6.x:** This ADR is now historical for migration
+> purposes — the v1.0 → v1.1 → v1.2 transition has been baked into the
+> codebase for years of release cycles. The split it documents (admin-owned
+> `daemon.toml` vs daemon-managed `runtime.toml`) is the current
+> architecture. The migration sections below describe what *happened* once,
+> not what an operator upgrading from v1.5 → v1.6 needs to do (nothing).
+> Pre-1.0 operators see the daemon `README.md` § Upgrade notes.
+
+## Context
+
+The daemon has two kinds of configuration:
+
+1. **Static topology** — serial port, polling interval, IPC socket
+   path, state directory, log level. Edited by the operator. Should
+   never be rewritten by the daemon.
+2. **Runtime-mutable settings** — the keys that API endpoints can
+   change at runtime, such that the change must persist across
+   restarts. At v1.1.0 these were `[profiles] search_dirs` and
+   `[startup] delay_secs`; the current set is the table under
+   § Runtime-mutable keys below.
+
+In v1.0.x both kinds lived in a single file at
+`/etc/ventulus/daemon.toml`. The daemon's `POST /config/*`
+handlers would round-trip the file: read, mutate, write. Two problems
+emerged:
+
+- **Comment loss**: any operator comments in `daemon.toml` were
+  stripped by the round-trip because the TOML serializer doesn't
+  preserve them. Operators using inline annotations (very common for
+  a config file in `/etc/`) lost them on the first API write.
+- **Permission ownership clash**: `/etc/ventulus/daemon.toml` is
+  pacman-owned (declared in `backup=()`). Pacman's `.pacnew` mechanism
+  assumes the daemon never writes the file; if the daemon does, an
+  upgrade that ships a new default surfaces a `.pacnew` against a file
+  the daemon has already mutated, producing confusing diffs.
+
+We need a clean split where `/etc/ventulus/daemon.toml` is read-only
+to the daemon and runtime mutations land somewhere else.
+
+## Decision
+
+**Two configuration files.**
+
+| File | Owner | Path | Mutated by |
+|---|---|---|---|
+| `daemon.toml` | admin | `/etc/ventulus/daemon.toml` | hand-edit only |
+| `runtime.toml` | daemon | `{state_dir}/runtime.toml` (default `/var/lib/ventulus/runtime.toml`) | `POST /config/*` |
+
+### Runtime-mutable keys
+
+Widened by **DEC-243**. The original set was `[profiles] search_dirs` and
+`[startup] delay_secs`; `[hardware]` (preferred sensors) followed in DEC-200.
+
+| `runtime.toml` section | Keys | Setter |
+|---|---|---|
+| `[profiles]` | `search_dirs` | `POST /config/profile-search-dirs` (`add` and/or `remove`; `remove` since 2.23.0, DEC-285) |
+| `[startup]` | `delay_secs` | `POST /config/startup-delay` |
+| `[hardware]` | `preferred_cpu_sensor`, `preferred_mb_sensor` | `POST /config/preferred-{cpu,mb}-sensor` |
+| `[polling]` | `poll_interval_ms` | `POST /config/poll-interval` |
+| `[serial]` | `port`, `timeout_ms` | `POST /config/serial-port`, `POST /config/serial-timeout` |
+| `[detection]` | `allow_port_probe`, `enable_nvidia_telemetry` | `POST /config/allow-port-probe`, `POST /config/nvidia-telemetry` |
+| `[shutdown]` | `exit_floor_pct` | `POST /config/exit-floor` (applies live, DEC-388) |
+| `[hardware]` | `header_roles` (header id → role) | `POST /config/header-role` (applies live, DEC-311). **A safety input:** on a board with no fan labels a `pump` assignment is the only evidence a header drives a pump, so losing the file loses that header's 30 % floor and stop exemption |
+| `[[cooling_devices]]` (top level) | one table per device | `POST /config/cooling-device`, `DELETE /config/cooling-device/{id}` (DEC-316). Metadata — no floor comes from a device |
+
+An unreadable `runtime.toml` does not stop the daemon: it boots on defaults, with no
+header roles, and reports `runtime_config_degraded` on `GET /status`. A setter that
+finds the file unreadable keeps the original as `runtime.toml.invalid-<unix-ts>` and
+writes a replacement carrying the live header roles and cooling devices (DEC-391).
+The operator-facing account is `docs/USER_GUIDE.md` § When `runtime.toml` cannot be
+read.
+
+**Never runtime-mutable:** `ipc.socket_path` (a bad value locks every client,
+including the one writing it, out of the daemon) and `state.state_dir` (moving it
+orphans `runtime.toml` itself and the daemon-owned profile store). `GET /config`
+reports both with `mutable: false` so they stay diagnosable without being
+editable.
+
+**The top-level `RuntimeConfig` must not use `deny_unknown_fields`.** `load_from`
+treats any parse failure as "malformed → defaults", so denying unknown *sections*
+would make an older daemon reading a newer `runtime.toml` discard **every**
+runtime setting, with the next write making that loss permanent. Unknown sections
+are ignored; per-section `deny_unknown_fields` still catches typos within a known
+section. Guarded by `unknown_section_is_ignored_not_fatal` and
+`unknown_key_inside_a_known_section_still_fails_loudly`.
+
+This mirrors the **NetworkManager pattern**:
+
+- `/etc/NetworkManager/NetworkManager.conf` (admin-owned) +
+- `/var/lib/NetworkManager/NetworkManager-intern.conf` (daemon-owned,
+  read last, shadows admin).
+
+### Loading and precedence
+
+On startup:
+
+1. `DaemonConfig` is loaded from `/etc/ventulus/daemon.toml`.
+2. `RuntimeConfig` is loaded from `{state_dir}/runtime.toml`.
+3. For any key present in both, the runtime value wins.
+
+`SIGHUP` re-runs the same sequence and re-applies the overlay.
+
+### Writes
+
+- `runtime.toml` is written via atomic tmp+rename with mode `0o600`.
+- The daemon never writes to `daemon.toml`. Period.
+- If `runtime.toml` write fails, the API returns
+  `503 persistence_failed` with `retryable: true` so the GUI can
+  surface the error and retry.
+
+### Migration (1.0.x → 1.1.x → 1.2.0)
+
+- **1.1.x**: `[profiles]` and `[startup]` in `daemon.toml` are parsed as the
+  base admin-layer defaults; `runtime.toml` overlays them when an API call
+  mutates a runtime-mutable key. The daemon never deletes the `daemon.toml`
+  sections and — contrary to an earlier draft of this ADR — does **not** copy
+  them into `runtime.toml`: the two files simply coexist.
+- **1.2.0+ (plan superseded)**: the original plan was to make parsing
+  `[profiles]` / `[startup]` from `daemon.toml` a hard error at startup,
+  auto-stripped by a PKGBUILD `post_upgrade`. That was **not** shipped. The
+  sections remain valid admin-layer defaults — `config.rs` still parses them
+  (guarded by the `parse_profiles_section` / `parse_startup_delay_section`
+  tests) and they never become a parse error. See `docs/USER_GUIDE.md` §
+  Runtime configuration for the current behaviour.
+
+## Consequences
+
+**Positive**
+
+- Operator comments in `daemon.toml` are preserved across the daemon's
+  lifetime — the daemon never touches the file.
+- Pacman's `.pacnew` workflow stays clean. `daemon.toml` is in
+  `backup=()` and the upstream-shipped defaults can change without
+  confusing the operator's edits.
+- `/var/lib/ventulus/` is already declared as the daemon's state
+  directory (`StateDirectory=ventulus` in the unit), so the runtime
+  file lives in a path systemd guarantees exists and is writable.
+- The split is invisible to API consumers — endpoints continue to read
+  `merged.profiles.search_dirs` etc.
+
+**Negative**
+
+- Two files instead of one. An operator now has to understand which
+  file holds which key. Mitigated by a comment in the shipped
+  `daemon.toml.example` and by `man ventulusd`.
+- A backup/restore script that previously copied `daemon.toml` alone
+  now also has to copy `runtime.toml` to fully preserve daemon state —
+  and since DEC-311 that includes the fan header roles, which are a
+  safety input. `docs/USER_GUIDE.md` § Runtime configuration says so.
+- *(Historical.)* This ADR planned a 1.1.x → 1.2.0 `post_upgrade`
+  strip of the legacy sections. It never shipped (see § Migration), so
+  there is no migration window.
+
+## Alternatives considered
+
+- **Single file, comment-preserving serializer** (`toml_edit`):
+  technically possible but the round-trip still risks subtle reorders
+  and whitespace changes, and it doesn't solve the
+  pacman-`.pacnew`-ownership problem. Rejected.
+- **Runtime values in `daemon_state.json`**: `daemon_state.json`
+  already exists for active-profile persistence. Bundling
+  configuration in there confuses two concerns ("what was the user's
+  selection?" vs "what knobs has the user dialed?") and forces a
+  schema migration when settings change. Rejected.
+- **Drop runtime persistence entirely; require a daemon restart for
+  every settings change**: would break a UX requirement
+  (`POST /config/profile-search-dirs` takes effect immediately).
+  Rejected.
+- **Per-section files** (`runtime/profiles.toml`,
+  `runtime/startup.toml`): more files for negligible benefit. Rejected.
+
+## References
+
+- `daemon/src/runtime_config.rs` — type and serde model.
+- `daemon/src/api/handlers/config.rs` — write path with atomic
+  tmp+rename and `503 persistence_failed` envelope.
+- `daemon/src/main.rs` — `apply_runtime_overlay()`, applied at startup and on
+  every `SIGHUP` reload (`apply_config_reload`).
+- `docs/USER_GUIDE.md` § Runtime configuration — operator-facing.

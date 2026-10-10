@@ -1,0 +1,41 @@
+# Rust
+/target/
+**/*.rs.bk
+# Cargo.lock is COMMITTED (DEC-143): cargo audit must scan the exact dependency
+# set CI builds and ships (PKGBUILD: cargo fetch --locked, build/test --frozen).
+
+# cargo-mutants output (regenerable mutation-testing artifacts, never committed)
+mutants.out/
+mutants.out.old/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/
+CLAUDE.md
+DECISIONS.md
+
+# Local-only admin files (never push to GitHub)
+scripts/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# makepkg build artifacts
+packaging/src/
+packaging/pkg/
+packaging/*.pkg.tar*
+packaging/*.tar.gz
+# .SRCINFO is regenerated in-CI for the AUR clone (.github/workflows/release.yml);
+# never tracked here.
+packaging/.SRCINFO
+
+# Design specs, architecture notes and the pre-5.0 Control-OFC changelog — local
+# working material, kept out of the public tree (DEC-494).
+/design/

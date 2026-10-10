@@ -1,0 +1,607 @@
+//! Hwmon sysfs discovery, sensor reading, and PWM control.
+//!
+//! - Discovery of temperature sensors with stable IDs
+//! - Reading temperatures from hwmon sysfs
+//! - Discovery of controllable PWM outputs with stable IDs
+//! - Lease-protected PWM writes with safety floors
+
+pub mod aio;
+pub mod bound_driver;
+pub mod chip_db;
+pub mod chip_name;
+pub mod classify;
+pub mod cooling_device;
+pub mod device_policy;
+pub mod discovery;
+pub mod gigabyte_siv;
+pub mod gpu_detect;
+pub mod gpu_fan;
+pub mod handback;
+pub mod header_caps;
+pub mod intel_gpu_detect;
+pub mod inventory;
+pub mod kernel_warnings;
+pub mod lease;
+pub mod memory_id;
+pub mod nouveau_detect;
+pub mod nvidia;
+pub mod nvml;
+pub mod nvml_sys;
+pub mod plausibility;
+pub mod power;
+pub mod pwm_control;
+pub mod pwm_discovery;
+pub mod reader;
+pub mod readiness;
+pub mod roles;
+pub mod superio;
+pub mod superio_probe;
+pub mod types;
+pub mod util;
+pub mod voltage_catalogue;
+mod voltage_catalogue_data;
+pub mod voltages;
+
+use types::{SensorDescriptor, SensorReading};
+
+/// Default sysfs hwmon root.
+pub const HWMON_SYSFS_ROOT: &str = "/sys/class/hwmon";
+
+/// Outcome of reading a descriptor set: successful readings plus the per-sensor
+/// failures (DEC-193).
+///
+/// [`read_sensor_values`] deliberately does **not** log failures — that policy
+/// (throttling, quarantine, and surfacing as "unavailable") belongs to the poll
+/// loop's `SensorFailureTracker`, so a sensor that is present but unreadable
+/// (e.g. an `ath12k` WiFi temp returning `ENETDOWN` while the radio is
+/// soft-blocked) can no longer spam the journal at 1 Hz.
+#[derive(Debug, Default)]
+pub struct SensorReadOutcome {
+    /// Sensors that read successfully this pass.
+    pub readings: Vec<SensorReading>,
+    /// Sensors whose `temp*_input` read failed this pass.
+    pub failures: Vec<SensorReadFailure>,
+}
+
+/// A single sensor that failed to read. Carries enough to surface it as an
+/// "unavailable" sensor on `/status` + `/poll` without re-reading sysfs.
+#[derive(Debug, Clone)]
+pub struct SensorReadFailure {
+    /// Stable sensor ID.
+    pub id: String,
+    /// Human-friendly label from discovery.
+    pub label: String,
+    /// Human-readable cause — the [`HwmonError`] display (e.g.
+    /// "read error: /sys/.../temp1_input: Network is down (os error 100)").
+    pub reason: String,
+}
+
+/// Read current values for an already-discovered descriptor set.
+///
+/// The per-tick hot path (DEC-133): touches only each sensor's
+/// `temp*_input` file — no directory enumeration, no label/type reads, no
+/// threshold/alarm snapshot — plus, for a chip that ignores its own enable bit,
+/// the cached `temp*_enable` (DEC-491, `reader::read_temp`). Returns the
+/// successful readings *and* the per-sensor failures; the caller owns all
+/// logging/quarantine policy (DEC-193) so this function is silent.
+pub fn read_sensor_values(descriptors: &[SensorDescriptor]) -> SensorReadOutcome {
+    let mut outcome = SensorReadOutcome::default();
+    for d in descriptors {
+        match reader::read_temp(d) {
+            Ok(r) => outcome.readings.push(r),
+            Err(e) => outcome.failures.push(SensorReadFailure {
+                id: d.id.clone(),
+                label: d.label.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+    outcome
+}
+
+/// True when an hwmon chip is a wireless-radio PHY temperature sensor — e.g.
+/// Qualcomm Atheros `ath1{0,1,2}k_hwmon` or Intel `iwlwifi` (DEC-193).
+///
+/// Such a sensor reads `ENETDOWN` whenever the radio is down (rfkill, interface
+/// down, firmware not started — kernel-by-design, shared across ath10k/11k/12k),
+/// so it must never be offered as a fan-curve source: a WiFi temperature would
+/// strand a curve the moment WiFi is switched off. The API marks these
+/// `control_eligible = false`; display is unaffected (they still appear on
+/// `/sensors` when readable). The list is intentionally conservative — extend it
+/// as other wireless thermal-hwmon drivers are confirmed.
+pub fn is_wireless_phy_chip(chip_name: &str) -> bool {
+    (chip_name.starts_with("ath") && chip_name.ends_with("_hwmon"))
+        || chip_name.starts_with("iwlwifi")
+        || chip_name.starts_with("iwlmvm")
+}
+
+/// True when an hwmon chip's fans/PWMs are owned by a GPU subsystem rather than
+/// by hwmon, so they must be excluded from hwmon PWM-header discovery
+/// ([`pwm_discovery`]) and monitor-only-fan discovery ([`inventory`]).
+///
+/// - `amdgpu` — DEC-102: RDNA4 exposes `pwm1` read-only (no `pwm1_enable`), so
+///   binding it as an hwmon header produces a 1 Hz EACCES storm; RDNA3 exposes
+///   both at 0644 but a write can silently no-op (DEC-430).
+/// - `nouveau` — DEC-204: the open NVIDIA driver exposes a **writable**
+///   `pwm1`/`pwm1_enable`; leaking it as an hwmon header would let the profile
+///   engine drive a GPU fan, violating the read-only-telemetry contract.
+///
+/// GPU fan RPM is surfaced exclusively via the `amd_gpu:` / `nvidia_gpu:` id
+/// prefixes and the GPU endpoints — never as an hwmon header. Single source of
+/// truth for the exclusion list so the two discovery sites cannot drift.
+pub fn is_gpu_owned_hwmon_chip(chip_name: &str) -> bool {
+    chip_name == "amdgpu" || chip_name == "nouveau"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hwmon::types::SensorKind;
+    use std::fs;
+
+    /// DEC-193: `read_sensor_values` surfaces failures instead of logging, so a
+    /// present-but-unreadable sensor (bad data here) is reported as a failure
+    /// carrying its id/label/reason — the input the quarantine tracker needs.
+    #[test]
+    fn read_sensor_values_reports_failures_without_dropping_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon0 = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon0).unwrap();
+        fs::write(hwmon0.join("name"), "k10temp\n").unwrap();
+        fs::write(hwmon0.join("temp1_input"), "55000\n").unwrap();
+        fs::write(hwmon0.join("temp1_label"), "Tctl\n").unwrap();
+        fs::write(hwmon0.join("temp2_input"), "garbage\n").unwrap();
+        fs::write(hwmon0.join("temp2_label"), "Bad\n").unwrap();
+
+        let descriptors = discovery::discover_sensors(tmp.path()).unwrap();
+        let outcome = read_sensor_values(&descriptors);
+
+        assert_eq!(outcome.readings.len(), 1);
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].label, "Bad");
+        assert!(outcome.failures[0].reason.contains("invalid temperature"));
+    }
+
+    /// DEC-491/492 (end-to-end): a DDR5 SPD hub on piix4 port 0. Discovery names
+    /// it by its controller, port and SPD address (DEC-492) — not the dynamic
+    /// bus number — keeps it `MbTemp` so it still counts as board evidence for
+    /// the CPU plausibility check, and once its sensor is switched off it reads
+    /// as a failure the DEC-193 tracker quarantines.
+    #[test]
+    fn spd5118_dimm_is_board_evidence_and_quarantines_when_disabled() {
+        use crate::health::sensor_failure::SensorFailureTracker;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let adapter = tmp.path().join("devices/pci0000:00/0000:00:14.0/i2c-21");
+        let i2c_dev = adapter.join("21-0051");
+        fs::create_dir_all(&i2c_dev).unwrap();
+        fs::write(adapter.join("name"), "SMBus PIIX4 adapter port 0 at 0b00\n").unwrap();
+        let root = tmp.path().join("class");
+        let cpu = root.join("hwmon0");
+        let dimm = root.join("hwmon9");
+        fs::create_dir_all(&cpu).unwrap();
+        fs::create_dir_all(&dimm).unwrap();
+        fs::write(cpu.join("name"), "k10temp\n").unwrap();
+        fs::write(cpu.join("temp1_input"), "0\n").unwrap(); // a broken channel
+        fs::write(cpu.join("temp1_label"), "Tctl\n").unwrap();
+        fs::write(dimm.join("name"), "spd5118\n").unwrap();
+        fs::write(dimm.join("temp1_input"), "40000\n").unwrap();
+        fs::write(dimm.join("temp1_enable"), "1\n").unwrap();
+        std::os::unix::fs::symlink(&i2c_dev, dimm.join("device")).unwrap();
+
+        let descriptors = discovery::discover_sensors(&root).unwrap();
+        let d = descriptors
+            .iter()
+            .find(|d| d.chip_name == "spd5118")
+            .expect("the DIMM is discovered");
+        assert_eq!(d.id, "hwmon:spd5118:0000:00:14.0-p0-0051:temp1");
+        assert_eq!(d.kind, SensorKind::MbTemp);
+
+        // Enabled: the DIMM is the board evidence that rejects a 0 °C CPU.
+        let outcome = read_sensor_values(&descriptors);
+        assert!(outcome.failures.is_empty());
+        let rejected = plausibility::implausibly_low_cpu_readings(&outcome.readings);
+        assert_eq!(rejected.len(), 1, "the DIMM must count as board evidence");
+        assert!(rejected[0].id.contains("k10temp"));
+
+        // Disabled: a failure, then quarantined like any unreadable sensor.
+        fs::write(dimm.join("temp1_enable"), "0\n").unwrap();
+        let threshold = 3;
+        let mut tracker = SensorFailureTracker::new(threshold);
+        let now = std::time::Instant::now();
+        for _ in 0..=threshold {
+            let outcome = read_sensor_values(&descriptors);
+            assert!(outcome.readings.iter().all(|r| r.chip_name != "spd5118"));
+            tracker.record_tick(&descriptors, &outcome.failures, now);
+        }
+        let unavailable = tracker.unavailable();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].id, d.id);
+        assert!(unavailable[0].reason.contains("disabled"));
+    }
+
+    /// DEC-288 (end-to-end, sysfs bytes -> the thermal ladder's verdict).
+    ///
+    /// This is the test that pins the actual defect. `read_temp` used to CLAMP an
+    /// implausible reading to 250.0°C; `hottest_cpu_reading` max-reduces across
+    /// CpuTemp sensors, so that one broken sensor outranked every healthy one, and
+    /// `ThermalSafetyRule` latches at the trip point while releasing only well
+    /// below it —
+    /// which 250 never reaches. The result was every fan forced to 100% until
+    /// reboot. Unit-testing `read_temp` alone would NOT have caught that, because
+    /// the damage is done by what the call site does with the value.
+    #[test]
+    fn an_implausible_cpu_reading_never_reaches_the_thermal_ladder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon0 = tmp.path().join("hwmon0");
+        fs::create_dir_all(&hwmon0).unwrap();
+        fs::write(hwmon0.join("name"), "k10temp\n").unwrap();
+        // Healthy CPU sensor, comfortably below the trip point.
+        fs::write(hwmon0.join("temp1_input"), "45000\n").unwrap();
+        fs::write(hwmon0.join("temp1_label"), "Tctl\n").unwrap();
+        // Broken one: i32::MAX millidegrees, the canonical misprobed-chip value.
+        fs::write(hwmon0.join("temp2_input"), "2147483647\n").unwrap();
+        fs::write(hwmon0.join("temp2_label"), "Tccd1\n").unwrap();
+
+        let descriptors = discovery::discover_sensors(tmp.path()).unwrap();
+        // Both are discovered: discovery never reads the value, so the fault can
+        // only be caught at read time. If this fails, the fixture is wrong.
+        assert_eq!(descriptors.len(), 2, "both sensors should be discovered");
+        assert!(
+            descriptors
+                .iter()
+                .all(|d| d.kind == crate::hwmon::types::SensorKind::CpuTemp),
+            "fixture must classify as CpuTemp for this test to mean anything"
+        );
+
+        let outcome = read_sensor_values(&descriptors);
+
+        // The broken sensor is a *failure*, which is what lets DEC-193 quarantine
+        // it, surface it as `unavailable_sensors[]`, and recover it later.
+        assert_eq!(
+            outcome.failures.len(),
+            1,
+            "the garbage sensor must fail to read"
+        );
+        assert_eq!(outcome.failures[0].label, "Tccd1");
+        // Pin the EXACT reason string: it is what ships to clients as
+        // `unavailable_sensors[].reason` and what `docs/08` documents.
+        let reason = &outcome.failures[0].reason;
+        assert!(
+            reason.ends_with("implausible temperature 2147483.6\u{b0}C outside [-50, 250]\u{b0}C"),
+            "reason not as documented: {reason:?}"
+        );
+        assert!(
+            reason.contains("temp2_input"),
+            "reason must name the path: {reason:?}"
+        );
+
+        // It must not appear as a reading at all — and specifically never as
+        // 250.0, the exact value the old clamp produced.
+        assert!(
+            outcome.readings.iter().all(|r| r.value_c != 250.0),
+            "a clamped 250.0°C reading leaked through: {:?}",
+            outcome
+                .readings
+                .iter()
+                .map(|r| r.value_c)
+                .collect::<Vec<_>>()
+        );
+
+        // Drive the REAL reduction — `profile_engine::hottest_cpu_reading` — not a
+        // local reimplementation of it. Re-deriving the filter/max here would leave
+        // this test green if that function lost its `CpuTemp` filter, which is the
+        // very trap this test's name claims to avoid.
+        let now = std::time::Instant::now();
+        let sensors: std::collections::HashMap<String, crate::health::state::CachedSensorReading> =
+            outcome
+                .readings
+                .iter()
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        crate::health::state::CachedSensorReading {
+                            id: r.id.clone(),
+                            kind: r.kind,
+                            label: r.label.clone(),
+                            value_c: r.value_c,
+                            source: crate::health::state::DeviceLabel::Hwmon,
+                            updated_at: now,
+                            rate_c_per_s: None,
+                            session_min_c: None,
+                            session_max_c: None,
+                            chip_name: r.chip_name.clone(),
+                            temp_type: r.temp_type,
+                            thresholds: r.thresholds.clone(),
+                        },
+                    )
+                })
+                .collect();
+
+        let reading = crate::profile_engine::hottest_cpu_reading(
+            &sensors,
+            now,
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(
+            reading,
+            crate::profile_engine::CpuReading::Fresh(45.0),
+            "the healthy sensor must be what the ladder sees"
+        );
+
+        // The ladder sees 45°C and stays quiet. Before the fix it saw 250°C and
+        // latched a 100% force with no path back below 80°C.
+        let mut rule = crate::safety::ThermalSafetyRule::new();
+        assert_eq!(
+            rule.evaluate(45.0),
+            None,
+            "no emergency may fire from a healthy 45°C system"
+        );
+    }
+
+    /// DEC-294 (end-to-end, sysfs bytes -> the thermal ladder's verdict).
+    ///
+    /// The companion to the test above, for the fault that one *cannot* catch.
+    /// 115°C is perfectly plausible, so `read_temp` accepts it, the read
+    /// SUCCEEDS, and the DEC-193 quarantine — which only ever sees read
+    /// failures — never gets a chance. The kernel documents this exact pin as
+    /// frequently unconnected on ASUS NCT6776F boards, reporting a near-constant
+    /// unreasonable value. Classified `CpuTemp` it max-reduces over every
+    /// healthy CPU sensor and latches the emergency, which releases only at
+    /// `THERMAL_EMERGENCY_RELEASE_C`: every fan at 100% on a cold machine, until
+    /// reboot.
+    ///
+    /// **The non-ASUS half is not decoration.** It proves the fixture is
+    /// genuinely capable of latching the ladder, so the ASUS half asserts a real
+    /// absence rather than passing vacuously — the project rulebook § Hard-won lessons,
+    /// "a test asserting an absence must first assert the presence".
+    ///
+    /// Run for `nct6776`, DEC-294's chip, and for `nct6798`, an `AUD-x` sibling.
+    /// Until `DOC-w` (DEC-397) the sibling's `PECI Agent 0` was classified
+    /// `MbTemp`, so the ASUS half found no CPU reading at all.
+    #[test]
+    fn a_bogus_asus_cputin_never_reaches_the_thermal_ladder() {
+        fn ladder_verdict(chip: &str, vendor: &str) -> (Vec<SensorDescriptor>, Option<u8>) {
+            let tmp = tempfile::tempdir().unwrap();
+            let hwmon0 = tmp.path().join("hwmon0");
+            fs::create_dir_all(&hwmon0).unwrap();
+            fs::write(hwmon0.join("name"), format!("{chip}\n")).unwrap();
+            // The documented-bogus pin: a constant, plausible, wrong 115°C.
+            fs::write(hwmon0.join("temp1_input"), "115000\n").unwrap();
+            fs::write(hwmon0.join("temp1_label"), "CPUTIN\n").unwrap();
+            // The pin the kernel docs tell you to prefer, reading correctly.
+            fs::write(hwmon0.join("temp2_input"), "45000\n").unwrap();
+            fs::write(hwmon0.join("temp2_label"), "PECI Agent 0\n").unwrap();
+
+            let descriptors = discovery::discover_sensors_with_vendor(tmp.path(), vendor).unwrap();
+            let outcome = read_sensor_values(&descriptors);
+            // Both read fine — that is the whole point: nothing upstream of
+            // classification can tell these two apart.
+            assert_eq!(outcome.failures.len(), 0, "both reads must succeed");
+            assert_eq!(outcome.readings.len(), 2);
+
+            let now = std::time::Instant::now();
+            let sensors: std::collections::HashMap<
+                String,
+                crate::health::state::CachedSensorReading,
+            > = outcome
+                .readings
+                .iter()
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        crate::health::state::CachedSensorReading {
+                            id: r.id.clone(),
+                            kind: r.kind,
+                            label: r.label.clone(),
+                            value_c: r.value_c,
+                            source: crate::health::state::DeviceLabel::Hwmon,
+                            updated_at: now,
+                            rate_c_per_s: None,
+                            session_min_c: None,
+                            session_max_c: None,
+                            chip_name: r.chip_name.clone(),
+                            temp_type: r.temp_type,
+                            thresholds: r.thresholds.clone(),
+                        },
+                    )
+                })
+                .collect();
+
+            // Drive the REAL reduction and the REAL rule, never a local copy of
+            // either — re-deriving them here would leave this green if
+            // `hottest_cpu_reading` lost its `CpuTemp` filter.
+            let reading = crate::profile_engine::hottest_cpu_reading(
+                &sensors,
+                now,
+                std::time::Duration::from_secs(5),
+            );
+            let tctl = match reading {
+                crate::profile_engine::CpuReading::Fresh(c) => c,
+                other => panic!("{chip}/{vendor}: expected a fresh CPU reading, got {other:?}"),
+            };
+            let mut rule = crate::safety::ThermalSafetyRule::new();
+            (descriptors, rule.evaluate(tctl))
+        }
+
+        for chip in ["nct6776", "nct6798"] {
+            // ── Presence: the fixture CAN latch the ladder. ──
+            // Same bytes, non-ASUS board, where the pin is wired normally. CPUTIN is
+            // a CpuTemp, outranks the healthy 45°C by `max`, and trips the emergency.
+            let (descs, verdict) = ladder_verdict(chip, "Gigabyte Technology Co., Ltd.");
+            assert!(
+            descs
+                .iter()
+                .any(|d| d.label == "CPUTIN" && d.kind == SensorKind::CpuTemp),
+            "fixture must classify CPUTIN as CpuTemp off-ASUS, or the absence below proves nothing"
+        );
+            assert_eq!(
+                verdict,
+                Some(100),
+                "the fixture must be capable of latching a 100% emergency"
+            );
+
+            // ── Absence: on the documented-bogus board it does not. ──
+            let (descs, verdict) = ladder_verdict(chip, "ASUSTeK COMPUTER INC.");
+            assert!(
+                descs
+                    .iter()
+                    .any(|d| d.label == "CPUTIN" && d.kind == SensorKind::MbTemp),
+                "the bogus pin must be demoted out of CpuTemp"
+            );
+            assert!(
+                descs
+                    .iter()
+                    .any(|d| d.label == "PECI Agent 0" && d.kind == SensorKind::CpuTemp),
+                "the preferred pin must still BE a CPU sensor — demoting the bogus one \
+             is worthless if it leaves the board with no CPU temperature at all"
+            );
+            assert_eq!(
+                verdict, None,
+                "a cold CPU reading 45°C on its good sensor must not latch an emergency"
+            );
+        }
+    }
+
+    #[test]
+    fn is_wireless_phy_chip_recognises_radio_thermals() {
+        // Qualcomm Atheros WiFi (the reported case) + Intel.
+        assert!(is_wireless_phy_chip("ath12k_hwmon"));
+        assert!(is_wireless_phy_chip("ath11k_hwmon"));
+        assert!(is_wireless_phy_chip("ath10k_hwmon"));
+        assert!(is_wireless_phy_chip("iwlwifi_1"));
+        // Real fan-control-eligible sensors are not wireless.
+        assert!(!is_wireless_phy_chip("k10temp"));
+        assert!(!is_wireless_phy_chip("nct6798"));
+        assert!(!is_wireless_phy_chip("amdgpu"));
+        assert!(!is_wireless_phy_chip("z53")); // NZXT Kraken coolant
+    }
+
+    #[test]
+    fn is_gpu_owned_hwmon_chip_recognises_gpu_chips() {
+        // Single source of truth for the PWM-header + monitor-only-fan exclusion.
+        assert!(is_gpu_owned_hwmon_chip("amdgpu")); // DEC-102 (read-only pwm1, EACCES storm)
+        assert!(is_gpu_owned_hwmon_chip("nouveau")); // DEC-204 (writable pwm1 — must not be driven)
+                                                     // Motherboard / CPU chips are hwmon-owned. Intel Arc (`xe`/`i915`) exposes
+                                                     // NO pwm attribute at all, so it needs no exclusion here — its temps flow
+                                                     // through the sensor pipeline and it has no fan header to leak.
+        assert!(!is_gpu_owned_hwmon_chip("k10temp"));
+        assert!(!is_gpu_owned_hwmon_chip("nct6798"));
+        assert!(!is_gpu_owned_hwmon_chip("it8696"));
+        assert!(!is_gpu_owned_hwmon_chip("xe"));
+        assert!(!is_gpu_owned_hwmon_chip("i915"));
+    }
+
+    /// [SAFETY] `DC-f` (end-to-end, sysfs bytes -> the ladder's CPU reading).
+    ///
+    /// nct6683 reads memory temperatures over PECI and labels them `PECI DIMM
+    /// 0`..`3`, with `temp_type` 6 like the CPU's own PECI channels. Classified
+    /// `CpuTemp`, a DIMM joined `hottest_cpu_reading`'s max-reduce, and on a
+    /// board with no k10temp/coretemp it stood in for the CPU — a fresh "CPU"
+    /// reading that kept the no-sensor floor from ever engaging.
+    ///
+    /// Two halves, and each runs the REAL discovery, read and reduction:
+    /// beside a real PECI CPU channel the ladder sees the CPU (the DIMM is set
+    /// hotter, so a `max` over it would show); with the DIMM alone the ladder
+    /// sees no CPU at all, which is what arms the floor.
+    #[test]
+    fn a_peci_dimm_reading_never_reaches_the_thermal_ladder() {
+        fn ladder_reading(
+            channels: &[(&str, &str, &str)],
+        ) -> (Vec<SensorDescriptor>, crate::profile_engine::CpuReading) {
+            let tmp = tempfile::tempdir().unwrap();
+            let hwmon0 = tmp.path().join("hwmon0");
+            fs::create_dir_all(&hwmon0).unwrap();
+            fs::write(hwmon0.join("name"), "nct6683\n").unwrap();
+            for (i, (label, millideg, temp_type)) in channels.iter().enumerate() {
+                let n = i + 1;
+                fs::write(
+                    hwmon0.join(format!("temp{n}_input")),
+                    format!("{millideg}\n"),
+                )
+                .unwrap();
+                fs::write(hwmon0.join(format!("temp{n}_label")), format!("{label}\n")).unwrap();
+                fs::write(
+                    hwmon0.join(format!("temp{n}_type")),
+                    format!("{temp_type}\n"),
+                )
+                .unwrap();
+            }
+            let descriptors = discovery::discover_sensors(tmp.path()).unwrap();
+            let outcome = read_sensor_values(&descriptors);
+            assert_eq!(outcome.failures.len(), 0, "every channel must read");
+            assert_eq!(outcome.readings.len(), channels.len());
+
+            let now = std::time::Instant::now();
+            let sensors: std::collections::HashMap<
+                String,
+                crate::health::state::CachedSensorReading,
+            > = outcome
+                .readings
+                .iter()
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        crate::health::state::CachedSensorReading {
+                            id: r.id.clone(),
+                            kind: r.kind,
+                            label: r.label.clone(),
+                            value_c: r.value_c,
+                            source: crate::health::state::DeviceLabel::Hwmon,
+                            updated_at: now,
+                            rate_c_per_s: None,
+                            session_min_c: None,
+                            session_max_c: None,
+                            chip_name: r.chip_name.clone(),
+                            temp_type: r.temp_type,
+                            thresholds: r.thresholds.clone(),
+                        },
+                    )
+                })
+                .collect();
+            let reading = crate::profile_engine::hottest_cpu_reading(
+                &sensors,
+                now,
+                std::time::Duration::from_secs(5),
+            );
+            (descriptors, reading)
+        }
+
+        // ── Beside a real CPU channel: the ladder sees the CPU, not the DIMM. ──
+        let (descs, reading) = ladder_reading(&[
+            ("PECI 0.0", "55000", "6"),
+            ("PECI DIMM 0", "70000", "6"),
+            ("Thermistor 0", "40000", "4"),
+        ]);
+        assert_eq!(
+            reading,
+            crate::profile_engine::CpuReading::Fresh(55.0),
+            "the ladder must see the CPU's 55\u{b0}C, never the DIMM's 70\u{b0}C"
+        );
+        // Presence: the CPU channel is still promoted, so the exclusion is not
+        // a blanket demotion of PECI.
+        assert!(
+            descs
+                .iter()
+                .any(|d| d.label == "PECI 0.0" && d.kind == SensorKind::CpuTemp),
+            "the PECI CPU channel must stay a CPU source"
+        );
+        assert!(
+            descs
+                .iter()
+                .any(|d| d.label == "PECI DIMM 0" && d.kind == SensorKind::MbTemp),
+            "a PECI DIMM must classify as a board sensor"
+        );
+
+        // ── The DIMM alone: no CPU reading, so the no-sensor floor can arm. ──
+        let (_, reading) = ladder_reading(&[
+            ("PECI DIMM 1", "48000", "6"),
+            ("Thermistor 0", "40000", "4"),
+        ]);
+        assert_eq!(
+            reading,
+            crate::profile_engine::CpuReading::Absent,
+            "a memory reading must not stand in for a missing CPU sensor"
+        );
+    }
+}

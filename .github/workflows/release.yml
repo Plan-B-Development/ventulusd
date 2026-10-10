@@ -1,0 +1,610 @@
+name: Release
+
+# Fires when a release tag (vX.Y.Z) is pushed. A tag push runs four jobs:
+# ci-green and build-test in parallel, then github-release, then notify-repo.
+#
+#   ci-green       — DEC-263: assert that ci.yml passed on the tagged commit.
+#                    build-test below runs the suite via the PKGBUILD's check(),
+#                    but only for this crate in a clean container — ci-green is
+#                    what pins the *repository's* CI result to the tag, and it
+#                    fails closed when no run exists for the commit.
+#
+#   build-test     — verify the version metadata matches the tag, then build the
+#                    Arch package in a clean container (a full `cargo build
+#                    --release` + `cargo test` via the PKGBUILD's check()).
+#                    Gates the Release: a PKGBUILD that does not build, whose
+#                    tests fail, or whose version bump was forgotten is never
+#                    published. Uploads the built package as a workflow artifact
+#                    for github-release to attach.
+#   github-release — create the GitHub Release: body extracted from CHANGELOG.md
+#                    so every release has consistent, version-matched notes, plus
+#                    the clean-room .pkg.tar.zst attached as an asset and a
+#                    keyless Sigstore provenance attestation over it. Runs after
+#                    build-test, so the asset is always the exact artifact CI
+#                    verified and an unbuildable PKGBUILD yields no Release.
+#   notify-repo    — repository_dispatch to Plan-B-Development/pacman-repo so it
+#                    reassembles the signed [ventulus] database against this
+#                    new Release. This is what makes `pacman -Syu` see the
+#                    version (DEC-241); a green build-test + github-release with
+#                    a red notify-repo is a release users cannot upgrade to.
+#                    Needs the PACMAN_REPO_TOKEN secret — the only cross-repo
+#                    credential in this workflow, and the only job here that can
+#                    fail for a reason unrelated to the code being released.
+#
+# Release flow:
+#   1. bump packaging/PKGBUILD pkgver (+ pkgrel=1) and Cargo.toml version
+#   2. add a "## [X.Y.Z]" section to CHANGELOG.md
+#   3. commit on main
+#   4. git tag vX.Y.Z && git push origin main vX.Y.Z
+# The tag push does the rest.
+#
+# The AUR is NOT part of a tag push (DEC-240). The fourth job below, aur-publish,
+# runs on a manual `workflow_dispatch` only. The AUR is offline indefinitely as a
+# publishing target for this project, and a leg that depends on a third party
+# being up is a leg that reddens releases which are otherwise complete — the
+# 2026-08-02 freeze that stranded the GUI's v2.34.0 took the *entire* AUR down
+# to 2 accepted pushes in a day. GitHub alone now carries a release: DEC-239
+# already made the attached clean-room package a complete `pacman -U` install
+# path, so nothing is lost by dropping the AUR from the automatic path.
+#
+# The job is kept rather than deleted so that publishing can resume with one
+# `gh workflow run release.yml -f tag=vX.Y.Z` if the AUR ever becomes viable
+# again — no workflow archaeology, and the clean-room build still gates it. Its
+# credentials (the `AUR_SSH_PRIVATE_KEY` repository secret, whose public half is
+# on the AUR account) are left in place for the same reason.
+#
+# There is no local break-glass script. `scripts/release-aur.sh` was deleted: it
+# unconditionally grepped a 64-hex digest out of `sha256sums=` and died when it
+# found none, so DEC-242 making that field permanently `SKIP` left it unable to
+# run at all. This job supersedes it.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Already-tagged release to publish to the AUR, e.g. v2.14.0. The AUR leg is manual-only (DEC-240); this is the only way to run it.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # DEC-263. The GUI's v2.41.0 published with every CI test leg red: `build-test`
+  # below is a clean-room *package* build and version check, and nothing in this
+  # workflow had ever looked at ci.yml. The correctness gate and the publish gate
+  # were simply unrelated, so a red suite could not stop a Release. This repo has
+  # the identical structure and is fixed identically, rather than waiting for it
+  # to be this repo's turn.
+  #
+  # It cannot be a `needs:` — ci.yml triggers on branch pushes and this workflow
+  # on tags, so there is no run of ci.yml *in this workflow* to depend on. The
+  # tagged commit's CI run is the one from when that commit was pushed to main,
+  # so we ask the Checks API for it.
+  #
+  # Fails CLOSED. No run found for the SHA is not "nothing to worry about" — it
+  # is what tagging a commit that was never pushed to main looks like, which is
+  # precisely the case where nothing has been verified.
+  ci-green:
+    name: CI green on the tagged commit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      actions: read # read ci.yml's conclusion for this commit
+    steps:
+      - name: Require a successful CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          # Generous: the tag is often pushed seconds after main, so CI is
+          # usually still running. Waiting is the normal path, not the sad one.
+          WAIT_SECONDS: '2700'
+          POLL_SECONDS: '30'
+        run: |
+          set -euo pipefail
+
+          deadline=$(( SECONDS + WAIT_SECONDS ))
+          while :; do
+            # Newest run last, so `.[-1]` survives a re-run of a previously red
+            # run (`gh run rerun` updates the run in place, but an explicit
+            # re-dispatch creates a second one).
+            #
+            # [RELEASE] `schedule` runs are excluded, and the exclusion is
+            # load-bearing. The nightly runs a WIDER matrix than the push path —
+            # it adds the py3.14 leg and restores the canary's full loop count —
+            # and neither is `continue-on-error`. Without this filter the newest
+            # run for the tagged SHA can be last night's cron rather than the
+            # push that actually gated the commit, so a py3.14-only failure would
+            # veto a release whose real CI was green.
+            #
+            # Filtered on `.event != "schedule"` rather than `event=push`: an
+            # operator re-dispatching ci.yml on a SHA produces a
+            # `workflow_dispatch` run, and that escape hatch is documented at the
+            # top of ci.yml for tagging a docs-only commit. `event=push` would
+            # silently break it.
+            run=$(gh api \
+              "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+              --jq '[.workflow_runs[] | select(.event != "schedule")]
+                    | sort_by(.created_at) | last // empty')
+
+            if [ -n "$run" ]; then
+              status=$(printf '%s' "$run" | jq -r '.status')
+              conclusion=$(printf '%s' "$run" | jq -r '.conclusion // ""')
+              url=$(printf '%s' "$run" | jq -r '.html_url')
+
+              if [ "$status" = 'completed' ]; then
+                if [ "$conclusion" = 'success' ]; then
+                  echo "CI is green for $SHA — $url"
+                  exit 0
+                fi
+                echo "::error::CI concluded '$conclusion' for the tagged commit $SHA. Refusing to publish a release from a commit whose test suite did not pass. See $url"
+                exit 1
+              fi
+              echo "CI is '$status' for $SHA; waiting ($(( deadline - SECONDS ))s left) — $url"
+            else
+              echo "no ci.yml run found for $SHA yet; waiting ($(( deadline - SECONDS ))s left)"
+            fi
+
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::No successful ci.yml run for the tagged commit $SHA within ${WAIT_SECONDS}s. If this commit was never pushed to main it has never been tested — push the branch, let CI pass, then re-tag."
+              exit 1
+            fi
+            sleep "$POLL_SECONDS"
+          done
+
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    # Tag pushes only. A manual run publishes an already-tagged version to the
+    # AUR, and that Release object already exists.
+    if: github.event_name == 'push'
+    # Gate on the clean-room build: the attached asset must be the artifact CI
+    # actually verified, and an unbuildable PKGBUILD must not yield a Release.
+    # This costs the Release the build's wall-clock, which is the right trade.
+    # `ci-green` (DEC-263) is the correctness half of the same bargain: the build
+    # proves the package assembles, ci.yml proves the code in it works.
+    needs: [build-test, ci-green]
+    permissions:
+      contents: write # create the Release and upload its assets
+      id-token: write # keyless Sigstore signing for the attestation
+      attestations: write # record the provenance statement
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout repository at tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          # Body of the "## [X.Y.Z]" section, up to (not including) the next
+          # "## [" heading. The version header line itself is dropped — the
+          # GitHub Release title already carries the version.
+          awk -v ver="$version" '
+            $0 ~ "^## \\[" ver "\\]" { flag=1; next }
+            /^## \[/ { flag=0 }
+            flag { print }
+          ' CHANGELOG.md > release-notes.md
+          # Drop leading blank lines.
+          sed -i -e '/./,$!d' release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error file=CHANGELOG.md::No '## [${version}]' section found in CHANGELOG.md. Add it before tagging."
+            exit 1
+          fi
+          echo "Release notes for ${version}:"
+          cat release-notes.md
+
+      - name: Download the clean-room package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: arch-package
+          path: dist
+
+      # Provenance is generated here rather than in build-test purely to keep
+      # the attestation permissions on one job; the statement still names this
+      # workflow run as the builder, which is what `gh attestation verify`
+      # checks. Keyless Sigstore — no key material to manage or rotate.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.pkg.tar.zst
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          body_path: release-notes.md
+          files: dist/*.pkg.tar.zst
+
+  build-test:
+    name: Build package (clean room)
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Install build prerequisites
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel git scdoc namcap rust
+
+      - name: Checkout repository at tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      # These two guards used to live in aur-publish. They moved here when the
+      # AUR left the automatic path (DEC-240): aur-publish no longer runs on a
+      # tag push, so leaving them there would have let a forgotten version bump
+      # produce a Release whose asset disagrees with its own tag. In build-test
+      # they run on both paths and, because build-test gates github-release,
+      # they now block the Release itself rather than only the AUR push.
+      - name: Verify PKGBUILD pkgver matches tag
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          pkgbuild_ver="$(grep -E '^pkgver=' packaging/PKGBUILD | cut -d= -f2)"
+          if [[ "$pkgbuild_ver" != "$version" ]]; then
+            echo "::error file=packaging/PKGBUILD::pkgver is '$pkgbuild_ver' but tag is 'v${version}'. Bump packaging/PKGBUILD before tagging."
+            exit 1
+          fi
+          echo "PKGBUILD pkgver matches tag: $pkgbuild_ver"
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          cargo_ver="$(grep '^version' daemon/Cargo.toml | cut -d'"' -f2)"
+          if [[ "$cargo_ver" != "$version" ]]; then
+            echo "::error file=daemon/Cargo.toml::version is '$cargo_ver' but tag is 'v${version}'. Bump daemon/Cargo.toml before tagging."
+            exit 1
+          fi
+          echo "Cargo.toml version matches tag: $cargo_ver"
+
+      - name: Build package as unprivileged user
+        run: |
+          set -euo pipefail
+          # makepkg refuses to run as root; build as a throwaway user.
+          useradd -m builder
+          install -d -o builder -g builder /home/builder/build
+          cp packaging/PKGBUILD /home/builder/build/PKGBUILD
+          # The PKGBUILD's `install=` file is read by makepkg at parse time and
+          # must sit next to the PKGBUILD — it is NOT pulled from the source
+          # tarball. package()-referenced files (.service, .conf, scripts) DO
+          # come from the extracted tarball, so only *.install needs copying.
+          cp packaging/*.install /home/builder/build/ 2>/dev/null || true
+          chown -R builder:builder /home/builder/build
+          # --nodeps:        makedepends (rust, scdoc) are pre-installed above;
+          #                  runtime deps (glibc, systemd-libs, libgcc) are in
+          #                  the base image. This runs prepare()/build()/check()
+          #                  /package() — i.e. a real release build + cargo test.
+          # --skipchecksums: the in-repo sha256sums is permanently SKIP by
+          #                  construction (DEC-242) — the tag archive contains
+          #                  the PKGBUILD, so no sum can pin it. Nothing on the
+          #                  tag path runs updpkgsums; here we only prove it builds.
+          runuser -u builder -- bash -lc '
+            set -euo pipefail
+            cd /home/builder/build
+            makepkg --nodeps --skipchecksums --cleanbuild --noconfirm
+            echo "::group::namcap PKGBUILD"; namcap PKGBUILD || true; echo "::endgroup::"
+            echo "::group::namcap package"; namcap ./*.pkg.tar.zst || true; echo "::endgroup::"
+          '
+
+      # The package built above is what gets attached to the Release, so a
+      # user installing by URL runs the same bytes CI verified. A -debug-
+      # package (produced when makepkg.conf carries OPTIONS=(debug), which a
+      # Rust build readily does) is build scaffolding, not something to
+      # install, so it is filtered out rather than silently shipped alongside
+      # the real one.
+      - name: Collect the built package
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          install -d dist
+          found=0
+          for pkg in /home/builder/build/*.pkg.tar.zst; do
+            case "${pkg##*/}" in
+              *-debug-*) echo "skipping debug package: ${pkg##*/}"; continue ;;
+            esac
+            cp "$pkg" dist/
+            found=$((found + 1))
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::makepkg reported success but produced no installable .pkg.tar.zst"
+            exit 1
+          fi
+          ls -l dist/
+
+      - name: Upload the built package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arch-package
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+  # Tells the pacman repository to rebuild itself from the release just
+  # published (DEC-241). That repository is what makes `pacman -Syu` upgrade
+  # this package, so without this job a release reaches GitHub and stops there.
+  #
+  # `needs: github-release` is load-bearing, not cosmetic ordering: the
+  # assembler downloads `*.pkg.tar.zst` from this repo's LATEST release. Firing
+  # before that Release exists would rebuild the repository around the PREVIOUS
+  # version and silently publish a stale package as if it were current.
+  #
+  # Gated to tag pushes so the manual AUR path (workflow_dispatch) does not also
+  # trigger a rebuild. Uses PACMAN_REPO_TOKEN — a fine-grained PAT scoped to
+  # pacman-repo — because the ambient GITHUB_TOKEN cannot dispatch cross-repo.
+  notify-repo:
+    name: Notify pacman repository
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: github-release
+    steps:
+      # Settle window before dispatching (DEC-248, made adaptive after the
+      # 2026-08-17 mismatched-pair incident).
+      #
+      # pacman-repo's publish is DECLARATIVE: it assembles from whatever is the
+      # latest Release of each source project at the moment it runs. In a
+      # coordinated GUI + daemon release the two release.yml runs finish at
+      # different times, so dispatching the instant this one finishes can trigger
+      # a publish that pairs THIS new package with the OTHER project's previous
+      # one, and serve that pair as current until the second publish lands.
+      #
+      # This used to be a blind `sleep 180`, and it did not work. On 2026-08-17
+      # this job fired at 01:57:35 and the GUI's at 02:07:03 — 9m29s later, because
+      # the GUI's CI wall clock is dominated by its canary job, which ci-green then
+      # waits on. Publish #1 therefore assembled daemon 2.18.0 with GUI 2.41.0 and
+      # verify.yml reported that pair GREEN, since the GUI Release object did not
+      # exist yet. Three minutes was never going to cover a nine-minute skew, and
+      # on a solo release it was three idle minutes bought for nothing.
+      #
+      # So poll for the actual condition rather than guessing at it: has the peer
+      # published its Release object yet? Nothing pending -> dispatch immediately.
+      #                                   Pending         -> wait for it, bounded.
+      #
+      # "Pending" is measured on the peer's `GitHub Release` job, never on its run
+      # status — see the step body for why run status deadlocks.
+      #
+      # Fails OPEN. Any API problem falls back to the old fixed wait instead of
+      # failing the job: this step must never become a new way for an otherwise
+      # complete release to go red. Worst case we are back to the old behaviour,
+      # and the second publish corrects the pair as it always did.
+      - name: Wait for a paired release, if one is in flight
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PEER: Plan-B-Development/ventulus
+        run: |
+          set -uo pipefail
+          deadline=$(( SECONDS + 1500 ))   # 25 min ceiling
+
+          fallback() {
+            echo "::warning::peer poll unavailable ($1) — falling back to a fixed 180s settle"
+            sleep 180
+            exit 0
+          }
+
+          # How many in-flight peer release runs have NOT yet published their
+          # Release object.
+          #
+          # The condition is the peer's `GitHub Release` JOB, not its run status.
+          # Waiting on run completion DEADLOCKED: this step lives in `notify-repo`,
+          # which is itself part of the run the peer would be waiting on, so in a
+          # coordinated release each side blocked the other until both hit the
+          # ceiling — 25 idle minutes per repo, in precisely the case the wait was
+          # written for, and the "solo release, dispatch immediately" fast path was
+          # unreachable whenever it mattered. The Release object is what pacman-repo
+          # assembles from, and `needs: github-release` puts that job well before
+          # either side's `notify-repo`, so this terminates from both directions.
+          #
+          # `event=push` scopes it to tag releases: a manual workflow_dispatch (the
+          # AUR path, DEC-240) publishes no Release and must not gate the dispatch.
+          peer_pending() {
+            local ids id jobs_done pending=0
+            ids="$(gh api \
+              "repos/${PEER}/actions/workflows/release.yml/runs?event=push&per_page=20" \
+              --jq '.workflow_runs[] | select(.status != "completed") | .id' 2>/dev/null)" \
+              || return 1
+            for id in $ids; do
+              # Any terminal status counts as settled: a peer release that FAILED
+              # will never publish a Release, so blocking on it buys nothing.
+              jobs_done="$(gh api "repos/${PEER}/actions/runs/${id}/jobs" \
+                --jq '[.jobs[] | select(.name == "GitHub Release" and .status == "completed")] | length' \
+                2>/dev/null)" || return 1
+              if [ "$jobs_done" -eq 0 ]; then
+                pending=$(( pending + 1 ))
+              fi
+            done
+            echo "$pending"
+          }
+
+          n="$(peer_pending)" || fallback "api error"
+          case "$n" in ''|*[!0-9]*) fallback "unexpected response '${n}'" ;; esac
+
+          if [ "$n" -eq 0 ]; then
+            echo "No peer Release pending — dispatching now."
+            exit 0
+          fi
+
+          echo "Peer release has not published its Release yet; waiting (max 25m)."
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            sleep 20
+            n="$(peer_pending)" || fallback "api error mid-poll"
+            case "$n" in ''|*[!0-9]*) fallback "unexpected response '${n}'" ;; esac
+            if [ "$n" -eq 0 ]; then
+              echo "Peer Release published; letting it settle."
+              sleep 30
+              exit 0
+            fi
+          done
+          echo "::warning::peer Release still not published after 25m — dispatching anyway; the second publish will correct the pair."
+
+      - name: Trigger a repository rebuild
+        env:
+          GH_TOKEN: ${{ secrets.PACMAN_REPO_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -uo pipefail
+          # 277-p: build the payload with jq, not a heredoc. The previous form
+          # used an UNQUOTED delimiter (`<<EOF`), so the shell expanded the tag
+          # before `gh api` ever saw it — a tag containing `$(...)` or backticks
+          # would have executed here, in a job holding PACMAN_REPO_TOKEN (the
+          # cross-repo PAT that drives signed publication). Pushing a tag already
+          # implies write access to this repo, so this is not privilege
+          # escalation; it is a shell-injection sink sitting next to a
+          # credential, which is not a shape to leave lying around. `--arg` also
+          # JSON-escapes the value, which the heredoc never did.
+          jq -n --arg tag "$RELEASE_TAG" \
+            '{event_type: "package-released",
+              client_payload: {package: "ventulusd", tag: $tag}}' \
+            > /tmp/dispatch.json
+
+          if err=$(gh api --method POST \
+                     repos/Plan-B-Development/pacman-repo/dispatches \
+                     --input /tmp/dispatch.json 2>&1); then
+            echo "Requested a pacman-repo rebuild for ${RELEASE_TAG}."
+            exit 0
+          fi
+          echo "$err"
+
+          # OPEN-07b. `set -e` used to let this die on gh's generic HTTP error,
+          # which reads like a typo in the URL. It is usually the token — and the
+          # consequence is silent: the Release exists and looks complete, the
+          # pacman repository keeps serving the PREVIOUS version, and the next
+          # verify.yml calls that "repo is stale", which is the wrong diagnosis.
+          # DEC-242 records a notify-repo 401 hiding across two releases. Naming
+          # the failure is the whole fix.
+          case "$err" in
+            *"HTTP 401"*|*"Bad credentials"*)
+              echo "::error::PACMAN_REPO_TOKEN was REJECTED (HTTP 401). It has expired or"
+              echo "::error::been revoked. The release itself is FINE — the GitHub Release"
+              echo "::error::exists with its package attached. What failed is publication."
+              echo "::error::Until it is fixed, pacman -Syu keeps serving the previous"
+              echo "::error::version and verify.yml will misreport it as staleness."
+              echo "::error::Fix: mint a PAT that can dispatch to pacman-repo, update the"
+              echo "::error::PACMAN_REPO_TOKEN secret, then RE-RUN THIS JOB. No new tag and"
+              echo "::error::no new release are needed."
+              ;;
+            *"HTTP 403"*)
+              echo "::error::PACMAN_REPO_TOKEN was FORBIDDEN (HTTP 403) — it authenticated"
+              echo "::error::but may not dispatch to pacman-repo. Grant it repository"
+              echo "::error::dispatch permission, then re-run this job. See the 401 note:"
+              echo "::error::the release is complete, only publication is blocked."
+              ;;
+            *"HTTP 404"*|*"Not Found"*)
+              echo "::error::The dispatch endpoint returned 404. For repository_dispatch"
+              echo "::error::that almost always means the TOKEN CANNOT SEE pacman-repo, not"
+              echo "::error::that the URL is wrong — GitHub answers 404 rather than 403 so"
+              echo "::error::as not to confirm a private repository exists. Check"
+              echo "::error::PACMAN_REPO_TOKEN's scope and expiry BEFORE suspecting a typo."
+              echo "::error::The release is complete; only publication is blocked."
+              ;;
+            *)
+              echo "::error::Dispatch to pacman-repo failed for the reason above. The"
+              echo "::error::release is complete; the repository will keep serving the"
+              echo "::error::previous version until this job succeeds. Re-run this job once"
+              echo "::error::the cause is addressed — no new tag is needed."
+              ;;
+          esac
+          exit 1
+
+  # Manual-only since DEC-240 — the AUR is offline indefinitely as a publishing
+  # target for this project, so it no longer runs on a tag push and can no
+  # longer redden an otherwise-complete release. Kept, not deleted, so that
+  # `gh workflow run release.yml -f tag=vX.Y.Z` can resume publishing if that
+  # ever changes. The version guards this job used to own now live in
+  # build-test, which still gates it.
+  aur-publish:
+    name: Publish to AUR (manual only)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    needs: build-test
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout repository at tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      # Upstream-outage guard. Added after the GUI's v2.34.0, where four
+      # consecutive attempts died on `The AUR is down due to maintenance` —
+      # every step the repo owns had passed and only the final push was
+      # rejected, but a red job looks identical whether the cause is ours or
+      # Arch's. This absorbs short blips (~10 min of backoff) and, when the
+      # outage outlasts that, fails with an annotation that names the cause
+      # instead of leaving the next person to diff a workflow that was never
+      # broken.
+      #
+      # The probe must SUCCEED to count as healthy. Testing for *absence* of the
+      # maintenance banner is the tempting shape and it is wrong: any transient
+      # ssh error — timeout, reset, DNS — also lacks the banner, so a blip reads
+      # as recovery. That exact inversion produced a false "AUR is back" during
+      # the v2.34.0 incident.
+      #
+      # Note the outage gates SSH only; aur.archlinux.org over HTTPS stays up
+      # and returns 200 throughout, so an HTTP health check proves nothing.
+      - name: Wait for the AUR SSH endpoint
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -uo pipefail
+          pkg=ventulusd
+          ssh_dir="$(mktemp -d)"
+          chmod 700 "$ssh_dir"
+          printf '%s\n' "$AUR_KEY" > "$ssh_dir/id"
+          chmod 600 "$ssh_dir/id"
+          ssh-keyscan -t rsa,ecdsa,ed25519 aur.archlinux.org > "$ssh_dir/known_hosts" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/id -o UserKnownHostsFile=$ssh_dir/known_hosts -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15"
+
+          last=""
+          n=0
+          for delay in 0 30 60 120 180 240; do
+            [ "$delay" -gt 0 ] && sleep "$delay"
+            n=$((n + 1))
+            if out=$(git ls-remote "ssh://aur@aur.archlinux.org/${pkg}.git" 2>&1); then
+              echo "AUR SSH endpoint healthy (probe ${n}); proceeding to publish."
+              rm -rf "$ssh_dir"
+              exit 0
+            fi
+            echo "probe ${n} failed:"
+            printf '%s\n' "$out" | head -3
+            last="$out"
+          done
+          rm -rf "$ssh_dir"
+
+          if printf '%s' "$last" | grep -q "down due to maintenance"; then
+            echo "::error::Upstream AUR maintenance, not a fault in this repo. This job is manual-only (DEC-240) and the release ${RELEASE_TAG} itself is already complete — its GitHub Release and clean-room package are published and unaffected. Nothing here needs changing: no retag, no checksum edit. Re-run this workflow with tag=${RELEASE_TAG} once the AUR is back (check: git ls-remote ssh://aur@aur.archlinux.org/${pkg}.git)."
+          else
+            echo "::error::AUR SSH endpoint unreachable after ${n} probes, and the failure is NOT the maintenance banner. Check the AUR_SSH_PRIVATE_KEY secret and the host keys before re-running."
+          fi
+          exit 1
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: ventulusd
+          pkgbuild: packaging/PKGBUILD
+          # install= files live next to the PKGBUILD in the AUR repo; without
+          # shipping them here, .install text changes never reach the AUR (the
+          # action otherwise pushes only PKGBUILD + .SRCINFO). DEC-145.
+          # The .gitignore is load-bearing: with assets set, the action stages
+          # `git add --all`, which would otherwise commit the source tarball
+          # updpkgsums downloads — aurweb rejects blobs > ~488 KiB.
+          assets: |
+            packaging/*.install
+            packaging/aur/.gitignore
+          updpkgsums: true
+          commit_username: github-actions[bot]
+          commit_email: 41898282+github-actions[bot]@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ inputs.tag || github.ref_name }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519

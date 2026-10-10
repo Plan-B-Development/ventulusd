@@ -1,0 +1,232 @@
+#!/bin/sh
+# ventulus-superio-guard — refuse a Nuvoton/Winbond Super-I/O probe on a
+# Gigabyte board, whose Super-I/O is ITE.
+#
+# WHY THIS EXISTS (measured 2026-09-05, X870E AORUS MASTER, DEC-332)
+# ------------------------------------------------------------------
+# nct6775 and w83627ehf share one `superio_enter()`:
+#
+#     outb(0x87, ioreg); outb(0x87, ioreg);      /* UNCONDITIONAL */
+#
+# and only then read the device ID, on both 0x2E and 0x4E. On a Gigabyte board
+# whose secondary Super-I/O sits behind an ITE eSPI-to-LPC bridge, that write
+# puts the BRIDGE into configuration mode. The bridge then answers 0x8883 in
+# place of the chip behind it, so it87 cannot find the secondary at all.
+#
+# Measured cost on this board: 3 of 8 fan headers and 3 of 9 temperatures
+# disappear. The probe FAILS ("could not insert 'nct6775': No such device") and
+# does the damage anyway -- the write happens before the -ENODEV.
+#
+# On that board the latch survived a warm reboot and a soft power-off, and only
+# a full power cut cleared it: the bridge stays on standby power. The recovery,
+# as the Hardware Troubleshooting guide gives it, is a ladder -- stop whatever
+# writes the unlock, reboot, and if the chip is still missing, power down at the
+# wall.
+#
+# WHY SUPPRESSION IS FREE HERE (DEC-424)
+# --------------------------------------
+# Gigabyte boards use ITE Super-I/O chips: 131 of 131 Gigabyte models sampled on
+# linux-hardware.org, and no Gigabyte board with a Nuvoton or Winbond Super-I/O is
+# known (DEC-421, register row BRD-n). nct6775 and w83627ehf drive Nuvoton and
+# Winbond silicon, so on a Gigabyte board they can only ever fail -- there is no
+# functionality to lose, only a destructive probe to avoid. So the guard
+# suppresses them on EVERY board whose DMI vendor is Gigabyte. Until DEC-424 it
+# did so only on the boards listed below, which left every unlisted Gigabyte
+# board (an AM5 board behind the same bridge, say) probed at every boot.
+#
+# The list stays, for two jobs: it names a known board in the journal line, and
+# it is the ONLY evidence used when the firmware reports no board vendor at all
+# -- a listed board name is Gigabyte's, so that board is suppressed too. On
+# every OTHER vendor the real modprobe runs untouched, because nct6775 is
+# genuinely required on most Nuvoton boards. Gigabyte's server brand reports
+# "Giga Computing", which does not match, and is left alone.
+#
+# WHY `install` AND NOT `blacklist`
+# ---------------------------------
+# systemd-modules-load issues an explicit `modprobe <name>`, which IGNORES
+# blacklist and HONOURS install. blacklist would silently do nothing here.
+#
+# To override, create a file with the SAME NAME in /etc/modprobe.d/:
+#     /etc/modprobe.d/ventulus-superio.conf
+# A same-named file in a higher-priority directory masks this one entirely, which
+# is the ONLY override modprobe.d(5) guarantees. A DIFFERENTLY-named file in
+# /etc/modprobe.d does NOT reliably win: all config files across all directories
+# are parsed in lexicographic order by basename, and for a duplicated `install`
+# the FIRST one parsed takes effect. Measured with kmod 34.2 -- `10-a.conf` beat
+# `90-b.conf` in both orderings -- so an override named e.g. `zz-nct6775.conf`
+# would sort after this file and be silently ignored.
+#
+# FAIL-OPEN BY DESIGN
+# -------------------
+# Anything unexpected -- an unreadable board name, missing modprobe, no
+# arguments -- falls through to loading the module. A guard that breaks must not
+# cost a user their fan control on hardware this was never about. (A missing
+# VENDOR with a readable, listed board name is not "unexpected": the name alone
+# identifies the board. That is the one case DEC-424 decided the other way, by
+# the user's choice.)
+
+set -u
+
+# Never inherit PATH from the caller: this runs as root, early, from modprobe.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Pin the locale too: the board match case-folds with `tr`, and a locale where
+# that fold does not map ASCII identically would make the match MISS -- which
+# fails open, i.e. it loads the module on an affected board. That is the
+# destructive direction, so it is worth one line to remove.
+LC_ALL=C
+export LC_ALL
+
+# Two test seams, neither of which can widen what this script is able to do:
+#   VENTULUS_DMI_DIR   -- where to read DMI from (default: the real sysfs)
+#   VENTULUS_GUARD_DRY_RUN -- print the decision instead of exec'ing modprobe
+# Setting either requires already being able to control this root process's
+# environment, and the worst either can produce is the fail-open behaviour that
+# is already the default. They exist so the decision table is actually tested.
+DMI_DIR="${VENTULUS_DMI_DIR:-/sys/class/dmi/id}"
+DRY_RUN="${VENTULUS_GUARD_DRY_RUN:-}"
+
+MODULE="${1-}"
+
+# No module named: nothing to decide. Fail open by doing nothing rather than
+# exec'ing modprobe with no arguments.
+[ -n "$MODULE" ] || exit 0
+
+# `--ignore-install` is what stops this rule re-entering itself.
+load_it() {
+    if [ -n "$DRY_RUN" ]; then
+        printf 'LOAD %s\n' "$MODULE"
+        exit 0
+    fi
+    exec modprobe --ignore-install "$@"
+    # Only reached if exec ITSELF failed (no modprobe on PATH). That is not
+    # "fail open" -- the module does not get loaded -- so say so rather than
+    # exiting 0 in silence and leaving a Nuvoton board mysteriously without
+    # sensors. Still exit 0: a non-zero exit here would fail the boot-time
+    # modprobe for a condition the user cannot act on mid-boot.
+    if command -v logger >/dev/null 2>&1; then
+        logger -t ventulus-superio-guard -p daemon.err \
+            "could not exec modprobe to load $MODULE; the module has NOT been loaded"
+    fi
+    exit 0
+}
+
+board_name=$(cat "$DMI_DIR/board_name" 2>/dev/null) || board_name=''
+board_vendor=$(cat "$DMI_DIR/board_vendor" 2>/dev/null) || board_vendor=''
+
+# Unreadable DMI (container, exotic firmware) -> we cannot judge -> load.
+[ -n "$board_name" ] || load_it "$@"
+
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+board_uc=$(upper "$board_name")
+vendor_uc=$(upper "$board_vendor")
+
+# ── BEGIN GENERATED BOARD LIST ──
+# Parity-pinned against `GIGABYTE_DUAL_CHIP_BOARDS` in daemon/src/hwmon/chip_db.rs
+# by `superio_guard_board_list_matches_chip_db` -- edit the Rust table, then this,
+# and the test will tell you if they diverge. Matched case-insensitively as
+# SUBSTRINGS, exactly as chip_db.rs matches them. Since DEC-424 this list only
+# names a board and decides the no-vendor case; a Gigabyte vendor alone suppresses.
+DUAL_CHIP_ITE_BOARDS='X870E AORUS MASTER
+X870E AORUS PRO
+X870E AORUS ELITE X3D
+X870E AORUS ELITE WIFI7
+X870E AORUS XTREME AI TOP
+X870 AORUS ELITE WIFI7
+X870 AORUS ELITE WIFI7 ICE
+X670E AORUS MASTER
+X670E AORUS PRO X
+X670 AORUS ELITE AX
+Z690 AORUS PRO
+Z690 AORUS MASTER
+Z790 AORUS ELITE AX
+Z790 AORUS MASTER
+Z790 AORUS XTREME
+Z790 AORUS PRO X
+Z890 AORUS MASTER
+Z890 AORUS ELITE X ICE
+Z890 AORUS PRO ICE
+Z890 AORUS TACHYON ICE
+Z890 AORUS TACHYON DUO X ICE
+Z890 AORUS XTREME AI TOP
+Z890 AI TOP
+Z890 AERO D
+W880 AI TOP
+Z390 AORUS MASTER
+Z390 AORUS PRO
+Z390 AORUS ULTRA
+Z490 AORUS MASTER
+Z390 AORUS XTREME
+Z490 AORUS PRO AX
+Z490 VISION D
+Z490 AORUS ULTRA
+Z490 AORUS XTREME
+W480 VISION D
+X570 AORUS MASTER
+X570 AORUS PRO
+X570 AORUS PRO WIFI
+X570 AORUS ULTRA
+X570 AORUS XTREME
+X570S AERO G
+X570S AORUS MASTER
+B550 AORUS MASTER
+B550 AORUS PRO
+TRX40 AORUS XTREME
+TRX40 AORUS MASTER
+TRX40 AORUS PRO WIFI
+TRX40 DESIGNARE
+X470 AORUS ULTRA GAMING
+X470 AORUS GAMING 7 WIFI
+X470 AORUS GAMING 5 WIFI
+B450 AORUS PRO
+B450 AORUS PRO-CF
+X399 DESIGNARE EX
+X399 AORUS PRO
+X399 AORUS XTREME
+X399 AORUS GAMING 7
+B550 VISION D
+B850 AI TOP
+X870 AORUS STEALTH ICE'
+# ── END GENERATED BOARD LIST ──
+
+matched=''
+# Field-split the list on newlines only, so board names keep their spaces.
+IFS='
+'
+for entry in $DUAL_CHIP_ITE_BOARDS; do
+    [ -n "$entry" ] || continue
+    case "$board_uc" in
+        *"$entry"*) matched="$entry"; break ;;
+    esac
+done
+unset IFS
+
+# The decision (DEC-424):
+#   a Gigabyte vendor               -> suppress (every Gigabyte board is ITE)
+#   no vendor, and a listed board   -> suppress (the name alone is Gigabyte's)
+#   anything else                   -> load
+case "$vendor_uc" in
+    *GIGABYTE*)
+        why="$board_name is a Gigabyte board, and Gigabyte boards use ITE Super-I/O chips${matched:+ (known board: $matched)}" ;;
+    '')
+        [ -n "$matched" ] || load_it "$@"
+        why="the firmware reports no board vendor, but $board_name is a listed Gigabyte board ($matched), whose Super-I/O is ITE" ;;
+    *)
+        load_it "$@" ;;
+esac
+
+# Suppressed. Say so in the journal: an absence from `lsmod` cannot distinguish
+# "we suppressed it" from "it failed to load", and those need different advice.
+if [ -n "$DRY_RUN" ]; then
+    # The same reason the journal line gives, so a dry-run exercises `why`
+    # (DEC-424 review: under `set -u` a bad expansion there would abort a boot
+    # modprobe after deciding to suppress, and no test would have run it).
+    printf 'SUPPRESS %s (%s)\n' "$MODULE" "$why"
+    exit 0
+fi
+if command -v logger >/dev/null 2>&1; then
+    logger -t ventulus-superio-guard -p daemon.notice \
+        "not loading $MODULE: $why. A Nuvoton/Winbond probe writes a config-mode unlock to 0x2E/0x4E, which can latch an ITE eSPI-to-LPC bridge and hide a chip's fan headers (recovery: stop the trigger, reboot, then power down at the wall if still missing). Nothing is lost: this module cannot drive ITE silicon. To load it anyway, create an EMPTY /etc/modprobe.d/ventulus-superio.conf (a copy of this package's file would keep the guard)."
+fi
+exit 0

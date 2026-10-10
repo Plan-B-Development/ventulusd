@@ -1,0 +1,2241 @@
+{
+  "description": "The single declaration of the daemon's serialised wire surface, shared byte-identically by both repos (P8-cb). Every field is classified: must_be_read (a production read site must exist), inert (nothing reads it, with the reason), not_assertable (the name is too common for a name-based check to prove anything), or unmodelled (no GUI slot, with the reason). The classification is exhaustive by test, so adding a field forces the choice (AU-d).",
+  "min_daemon_version": "2.35.4",
+  "structs": [
+    {
+      "daemon": "SensorEntry",
+      "gui": "SensorReading",
+      "endpoints": [
+        "GET /sensors",
+        "GET /poll"
+      ],
+      "fields": [
+        "id",
+        "kind",
+        "label",
+        "value_c",
+        "source",
+        "age_ms",
+        "rate_c_per_s",
+        "session_min_c",
+        "session_max_c",
+        "chip_name",
+        "temp_type",
+        "thresholds",
+        "control_eligible"
+      ],
+      "must_be_read": [
+        "value_c",
+        "age_ms",
+        "rate_c_per_s",
+        "session_min_c",
+        "session_max_c",
+        "chip_name",
+        "temp_type",
+        "thresholds",
+        "control_eligible"
+      ],
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "kind": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "source": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      }
+    },
+    {
+      "daemon": "FanEntry",
+      "gui": "FanReading",
+      "endpoints": [
+        "GET /fans",
+        "GET /poll"
+      ],
+      "fields": [
+        "id",
+        "source",
+        "rpm",
+        "last_commanded_pwm",
+        "duty_pct",
+        "age_ms",
+        "stall_detected",
+        "pwm_enable_mode",
+        "fan_alarm",
+        "pwm_readback_pct",
+        "pwm_commanded_pct",
+        "duty_corrections",
+        "duty_not_holding"
+      ],
+      "must_be_read": [
+        "rpm",
+        "last_commanded_pwm",
+        "duty_pct",
+        "age_ms",
+        "stall_detected",
+        "pwm_enable_mode",
+        "fan_alarm",
+        "pwm_readback_pct",
+        "pwm_commanded_pct",
+        "duty_corrections",
+        "duty_not_holding"
+      ],
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "source": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      }
+    },
+    {
+      "daemon": "PwmHeaderEntry",
+      "gui": "HwmonHeader",
+      "endpoints": [
+        "GET /hwmon/headers"
+      ],
+      "fields": [
+        "id",
+        "label",
+        "chip_name",
+        "sysfs_chip_name",
+        "device_id",
+        "pwm_index",
+        "supports_enable",
+        "rpm_available",
+        "min_pwm_percent",
+        "max_pwm_percent",
+        "is_writable",
+        "pwm_mode",
+        "is_aio",
+        "role",
+        "role_source",
+        "effective_min_pwm_pct",
+        "stop_permitted",
+        "cooling_device_id",
+        "pwm_freq_hz",
+        "supported_pwm_enable_modes",
+        "rpm_min_threshold",
+        "rpm_max_threshold",
+        "tach_pulses_per_rev",
+        "pwm_verification"
+      ],
+      "must_be_read": [
+        "chip_name",
+        "sysfs_chip_name",
+        "device_id",
+        "pwm_index",
+        "supports_enable",
+        "rpm_available",
+        "is_writable",
+        "pwm_mode",
+        "is_aio",
+        "role",
+        "role_source",
+        "effective_min_pwm_pct",
+        "stop_permitted",
+        "cooling_device_id",
+        "pwm_freq_hz",
+        "supported_pwm_enable_modes",
+        "rpm_min_threshold",
+        "rpm_max_threshold",
+        "tach_pulses_per_rev",
+        "pwm_verification"
+      ],
+      "inert": {
+        "min_pwm_percent": "parsed and never read; adjudicated in register row WIRE-ak",
+        "max_pwm_percent": "parsed and never read; adjudicated in register row WIRE-ak"
+      },
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      }
+    },
+    {
+      "daemon": "PwmVerificationRecord",
+      "gui": "PwmVerification",
+      "endpoints": [
+        "GET /hwmon/headers .headers[].pwm_verification"
+      ],
+      "fields": [
+        "header_id",
+        "state",
+        "method",
+        "result",
+        "run_id",
+        "verified_unix_ms"
+      ],
+      "not_assertable": {
+        "state": "the name is too common to prove a read site; pinned at its call site instead (test_pwm_verification_records.py)"
+      },
+      "unmodelled": {
+        "header_id": "DEC-456: the record sits on the header it describes, so the GUI reads the header's own id",
+        "method": "DEC-456: the reference GUI derives only the verified/failed tri-state; the verify evidence panel (G6) is where how and when would be shown",
+        "result": "DEC-456: as `method` \u2014 the tri-state needs only `state`",
+        "run_id": "DEC-456: as `method` \u2014 the tri-state needs only `state`",
+        "verified_unix_ms": "DEC-456: as `method` \u2014 the tri-state needs only `state`"
+      },
+      "note": "DEC-456 (capability control.pwm_verification_records): the header's latest conclusive PWM-control verdict. Absent = not yet verified, never failed."
+    },
+    {
+      "daemon": "PwmHeaderEntry",
+      "gui": "InventoryPwmControl",
+      "endpoints": [
+        "GET /inventory/hwmon .pwm_controls"
+      ],
+      "fields": [
+        "id",
+        "label",
+        "chip_name",
+        "sysfs_chip_name",
+        "device_id",
+        "pwm_index",
+        "supports_enable",
+        "rpm_available",
+        "min_pwm_percent",
+        "max_pwm_percent",
+        "is_writable",
+        "pwm_mode",
+        "is_aio",
+        "role",
+        "role_source",
+        "effective_min_pwm_pct",
+        "stop_permitted",
+        "cooling_device_id",
+        "pwm_freq_hz",
+        "supported_pwm_enable_modes",
+        "rpm_min_threshold",
+        "rpm_max_threshold",
+        "tach_pulses_per_rev",
+        "pwm_verification"
+      ],
+      "must_be_read": [
+        "chip_name",
+        "sysfs_chip_name",
+        "device_id",
+        "pwm_index",
+        "supports_enable",
+        "rpm_available",
+        "is_writable",
+        "pwm_mode",
+        "is_aio",
+        "role",
+        "role_source",
+        "effective_min_pwm_pct",
+        "stop_permitted",
+        "cooling_device_id",
+        "pwm_freq_hz",
+        "supported_pwm_enable_modes",
+        "rpm_min_threshold",
+        "rpm_max_threshold",
+        "tach_pulses_per_rev",
+        "pwm_verification"
+      ],
+      "inert": {
+        "min_pwm_percent": "parsed and never read; adjudicated in register row WIRE-ak",
+        "max_pwm_percent": "parsed and never read; adjudicated in register row WIRE-ak"
+      },
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "The SAME daemon struct as GET /hwmon/headers. Two GUI names for one wire shape is how WIRE-h stayed invisible: HwmonHeader was kept current and InventoryPwmControl was not, while its docstring claimed a field-for-field mirror."
+    },
+    {
+      "daemon": "InventoryTempSensor",
+      "gui": "InventoryTempSensor",
+      "endpoints": [
+        "GET /inventory/hwmon .temp_sensors"
+      ],
+      "fields": [
+        "id",
+        "kind",
+        "label",
+        "value_c",
+        "source",
+        "age_ms",
+        "rate_c_per_s",
+        "session_min_c",
+        "session_max_c",
+        "chip_name",
+        "temp_type",
+        "thresholds",
+        "control_eligible",
+        "classification",
+        "confidence",
+        "rationale"
+      ],
+      "must_be_read": [
+        "value_c",
+        "age_ms",
+        "rate_c_per_s",
+        "session_min_c",
+        "session_max_c",
+        "chip_name",
+        "temp_type",
+        "thresholds",
+        "control_eligible",
+        "classification",
+        "confidence",
+        "rationale"
+      ],
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "kind": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "source": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "serde(flatten) over SensorEntry, so every SensorEntry key rides here too"
+    },
+    {
+      "daemon": "FanInputEntry",
+      "gui": "InventoryFanInput",
+      "endpoints": [
+        "GET /inventory/hwmon .monitor_only_fans"
+      ],
+      "fields": [
+        "id",
+        "source",
+        "chip_name",
+        "label",
+        "fan_index"
+      ],
+      "must_be_read": [
+        "chip_name"
+      ],
+      "inert": {
+        "fan_index": "no production read site (measured 2026-09-16, AU-d)"
+      },
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "source": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      }
+    },
+    {
+      "daemon": "DefaultCpuEntry",
+      "gui": "DefaultCpuSensor",
+      "endpoints": [
+        "GET /inventory/hwmon .default_cpu"
+      ],
+      "fields": [
+        "sensor_id",
+        "confidence",
+        "rationale",
+        "source"
+      ],
+      "must_be_read": [
+        "sensor_id",
+        "confidence",
+        "rationale"
+      ],
+      "not_assertable": {
+        "source": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      }
+    },
+    {
+      "daemon": "HwmonInventoryResponse",
+      "gui": "HwmonInventory",
+      "endpoints": [
+        "GET /inventory/hwmon"
+      ],
+      "fields": [
+        "api_version",
+        "temp_sensors",
+        "pwm_controls",
+        "monitor_only_fans",
+        "default_cpu",
+        "preferences"
+      ],
+      "must_be_read": [
+        "api_version",
+        "temp_sensors",
+        "default_cpu",
+        "preferences"
+      ],
+      "inert": {
+        "pwm_controls": "parsed and never read: the endpoint's two callers (the Overview sensor-detail dialog and the Settings preferred-sensor picker) read temp_sensors, default_cpu and preferences only; parse_hwmon_inventory's own pwm_controls= keyword is the one mention (AU-k, correcting AU-g's refuted 'no caller')",
+        "monitor_only_fans": "parsed and never read: the endpoint's two callers read temp_sensors, default_cpu and preferences only; surfacing these fans is WIRE-m's GUI half (AU-k, correcting AU-g's refuted 'no caller')"
+      }
+    },
+    {
+      "daemon": "DevicePolicySummary",
+      "gui": "DevicePolicySummary",
+      "endpoints": [
+        "GET /inventory/cooling-devices"
+      ],
+      "fields": [
+        "id",
+        "display_name",
+        "minimum_safe_pwm_pct",
+        "supports_stop",
+        "startup_override_seconds",
+        "expected_rpm_min",
+        "expected_rpm_max",
+        "internal_control_possible"
+      ],
+      "must_be_read": [
+        "display_name"
+      ],
+      "inert": {
+        "minimum_safe_pwm_pct": "parsed and never read; adjudicated in register row WIRE-e",
+        "supports_stop": "parsed and never read; adjudicated in register row WIRE-e",
+        "startup_override_seconds": "parsed and never read; adjudicated in register row WIRE-e",
+        "expected_rpm_min": "parsed and never read; adjudicated in register row WIRE-e",
+        "expected_rpm_max": "parsed and never read; adjudicated in register row WIRE-e",
+        "internal_control_possible": "parsed and never read; adjudicated in register row WIRE-e"
+      },
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      }
+    },
+    {
+      "daemon": "CoolingDeviceEntry",
+      "gui": "CoolingDevice",
+      "endpoints": [
+        "GET /inventory/cooling-devices .cooling_devices"
+      ],
+      "fields": [
+        "id",
+        "name",
+        "kind",
+        "pump_member",
+        "radiator_members",
+        "auxiliary_members",
+        "preferred_sensor",
+        "fallback_sensor",
+        "coolant_sensor",
+        "coolant_telemetry",
+        "device_policy"
+      ],
+      "must_be_read": [
+        "pump_member",
+        "radiator_members",
+        "auxiliary_members",
+        "preferred_sensor",
+        "fallback_sensor",
+        "coolant_sensor",
+        "coolant_telemetry",
+        "device_policy"
+      ],
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "name": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "kind": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      }
+    },
+    {
+      "daemon": "CoolingDevicesResponse",
+      "gui": "CoolingDeviceInventory",
+      "endpoints": [
+        "GET /inventory/cooling-devices"
+      ],
+      "fields": [
+        "api_version",
+        "cooling_devices",
+        "available_policies"
+      ],
+      "must_be_read": [
+        "cooling_devices"
+      ],
+      "inert": {
+        "available_policies": "parsed and never read; adjudicated in register row WIRE-e"
+      },
+      "unmodelled": {
+        "api_version": "Sub-envelope api_version, recorded inert in register row WIRE-ak: the GUI gates on GET /capabilities, never on a per-response version."
+      }
+    },
+    {
+      "daemon": "Limits",
+      "gui": "Limits",
+      "endpoints": [
+        "GET /capabilities"
+      ],
+      "fields": [
+        "pwm_percent_min",
+        "pwm_percent_max",
+        "openfan_stop_timeout_s",
+        "diagnostic_max_temp_c"
+      ],
+      "must_be_read": [
+        "diagnostic_max_temp_c"
+      ],
+      "unmodelled": {
+        "pwm_percent_min": "Inert: the daemon clamps authoritatively (DEC-163) and ships 0 on every build. The P3 capability cleanup deleted the GUI mirror for exactly this reason and set the bar for re-adding at 'find a consumer first'; this field still has none.",
+        "pwm_percent_max": "Inert: as pwm_percent_min. Ships 100 on every build.",
+        "openfan_stop_timeout_s": "No consumer since DEC-426 (DC-b): it capped the Fan Wizard spin-down on the belief that the daemon restarts a 0% OpenFan fan after that long. It does not; a repeated 0% coalesces before the timeout is checked, so the field bounds only a defence-in-depth refusal no normal command sequence reaches."
+      }
+    },
+    {
+      "daemon": "VoltageEntry",
+      "gui": "VoltageRail",
+      "endpoints": [
+        "GET /diagnostics/hardware .voltages"
+      ],
+      "fields": [
+        "id",
+        "chip_name",
+        "channel",
+        "label",
+        "value_v",
+        "identified",
+        "board_label",
+        "board_multiplier",
+        "board_unmapped"
+      ],
+      "must_be_read": [
+        "chip_name",
+        "channel",
+        "value_v",
+        "identified",
+        "board_label",
+        "board_multiplier",
+        "board_unmapped"
+      ],
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "WIRE-ag / DEC-331. Pinned from the first release that publishes it rather than after a divergence: WIRE-h is what an unpinned new struct costs. `label` is genuinely read (it is the Rail column) but is excluded from must_be_read by test_must_be_read_names_are_distinctive \u2014 the name is too common to prove a read site; tests/test_wire_ag_voltages.py asserts it at the call site instead. `id` has no GUI consumer yet, and the wire identity is modelled anyway because the model mirrors the wire; `channel` is read only as a display sort key. VOLT-b / DEC-464 added `board_label`, `board_multiplier` and `board_unmapped` (the board voltage catalogue), all omitted when the catalogue says nothing."
+    },
+    {
+      "daemon": "HwmonChipInfo",
+      "gui": "HwmonChipInfo",
+      "endpoints": [
+        "GET /diagnostics/hardware .hwmon.chips_detected"
+      ],
+      "fields": [
+        "chip_name",
+        "sysfs_chip_name",
+        "device_id",
+        "expected_driver",
+        "bound_driver",
+        "in_mainline_kernel",
+        "header_count"
+      ],
+      "must_be_read": [
+        "chip_name",
+        "sysfs_chip_name",
+        "device_id",
+        "expected_driver",
+        "bound_driver",
+        "in_mainline_kernel",
+        "header_count"
+      ],
+      "note": "BRD-x / DEC-473. Enrolled when the support bundle began reading sysfs_chip_name (DEC-442's field), so a daemon rename of any chip field reds both repos. chip_name, sysfs_chip_name and device_id are shared with PwmHeaderEntry, so the name-based read check cannot attribute their reads to this struct; tests/test_diagnostics_service.py asserts the bundle's chip objects at the call site instead. bound_driver is omitted when no driver link was read."
+    },
+    {
+      "daemon": "PreflightReport",
+      "gui": "PreflightReport",
+      "endpoints": [
+        "GET /diagnostics/preflight"
+      ],
+      "fields": [
+        "header_id",
+        "diagnostic",
+        "verdict",
+        "checks",
+        "blocking"
+      ],
+      "must_be_read": [
+        "header_id",
+        "diagnostic",
+        "verdict",
+        "checks",
+        "blocking"
+      ],
+      "note": "DEC-333 \u00a77. `verdict` and `blocking` together decide whether Start is offered \u2014 `preflight_view` reads BOTH, deliberately, so an unknown verdict token still fails safe on the field that gates a hardware-perturbing action. `header_id`/`diagnostic` are echoed identity."
+    },
+    {
+      "daemon": "PreflightCheck",
+      "gui": "PreflightCheck",
+      "endpoints": [
+        "GET /diagnostics/preflight"
+      ],
+      "fields": [
+        "check_id",
+        "state",
+        "detail"
+      ],
+      "must_be_read": [
+        "check_id",
+        "detail"
+      ],
+      "not_assertable": {
+        "state": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "DEC-333 \u00a77. `state` IS load-bearing (it picks the row tone) but is excluded by test_must_be_read_names_are_distinctive as too common; tests/test_aio_mb_phase8_batch1.py::TestPreflightView asserts the tone at its call site instead."
+    },
+    {
+      "daemon": "ControlPathRun",
+      "gui": "ControlPathRun",
+      "endpoints": [
+        "GET /diagnostics/control-path",
+        "POST /hwmon/{header_id}/discover-control-path (202 snapshot)"
+      ],
+      "fields": [
+        "run_id",
+        "header_id",
+        "state",
+        "delta_pct",
+        "requested_cycles",
+        "window_seconds",
+        "baseline_pct",
+        "perturbed_pct",
+        "direction",
+        "channels",
+        "cycles",
+        "summary",
+        "original_pct",
+        "restore_failed",
+        "restore_outcome",
+        "detail",
+        "completed_unix_ms",
+        "current_step"
+      ],
+      "must_be_read": [
+        "run_id",
+        "header_id",
+        "delta_pct",
+        "requested_cycles",
+        "window_seconds",
+        "baseline_pct",
+        "perturbed_pct",
+        "direction",
+        "channels",
+        "cycles",
+        "summary",
+        "original_pct",
+        "restore_failed",
+        "restore_outcome",
+        "detail",
+        "completed_unix_ms",
+        "current_step"
+      ],
+      "not_assertable": {
+        "state": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "DEC-333. `run_id` is the poll fence \u2014 a snapshot for another run must not be rendered as this one. `restore_failed`/`restore_outcome` are the honesty pair: the dialog must never claim a header was restored when it was not. `state` is read but too common to pin here."
+    },
+    {
+      "daemon": "RunStep",
+      "gui": "RunStep",
+      "endpoints": [
+        "GET /diagnostics/control-path .current_step",
+        "GET /diagnostics/characterization .current_step"
+      ],
+      "fields": [
+        "phase",
+        "index",
+        "duty_pct",
+        "started_unix_ms",
+        "max_ms"
+      ],
+      "must_be_read": [
+        "phase",
+        "duty_pct",
+        "started_unix_ms",
+        "max_ms"
+      ],
+      "not_assertable": {
+        "index": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous). Read by both progress views, and pinned there by their own tests."
+      },
+      "note": "P8-bg (daemon >= 2.55.0). What a running diagnostic is holding right now, so a client can say so between results. `phase` is an opaque token and must be rendered when unrecognised (273-i)."
+    },
+    {
+      "daemon": "TachChannel",
+      "gui": "TachChannel",
+      "endpoints": [
+        "GET /diagnostics/control-path"
+      ],
+      "fields": [
+        "tach_id",
+        "label",
+        "monitor_only",
+        "is_target_header"
+      ],
+      "must_be_read": [
+        "tach_id",
+        "monitor_only"
+      ],
+      "inert": {
+        "is_target_header": "parsed and never read; adjudicated in register row P8-bz"
+      },
+      "not_assertable": {
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "DEC-333. `label` is read but too common to prove a read site. `is_target_header` is parsed and NOT read by the GUI \u2014 the daemon uses it to keep the target's channel inside its observation bound (P8-an); no GUI surface distinguishes it. Recorded in P8-bz."
+    },
+    {
+      "daemon": "TachObservation",
+      "gui": "TachObservation",
+      "endpoints": [
+        "GET /diagnostics/control-path"
+      ],
+      "fields": [
+        "tach_id",
+        "baseline_rpm",
+        "perturbed_rpm",
+        "delta_rpm",
+        "noise_floor_rpm",
+        "responded",
+        "noise_floor_from_cycle_1"
+      ],
+      "must_be_read": [
+        "tach_id",
+        "baseline_rpm",
+        "perturbed_rpm",
+        "responded",
+        "noise_floor_from_cycle_1"
+      ],
+      "inert": {
+        "delta_rpm": "only a key in the provenance table, which describes the field rather than reading it; was declared must_be_read on that evidence until AU-d tightened the read definition",
+        "noise_floor_rpm": "only a key in the provenance table, which describes the field rather than reading it (AU-d)"
+      },
+      "note": "DEC-333. `responded` is the per-cycle verdict the candidate table is built from; the three RPM terms are what the user checks it against."
+    },
+    {
+      "daemon": "DiscoveryCycle",
+      "gui": "DiscoveryCycle",
+      "endpoints": [
+        "GET /diagnostics/control-path"
+      ],
+      "fields": [
+        "cycle",
+        "baseline_pct",
+        "perturbed_pct",
+        "direction",
+        "observations",
+        "baseline_settled",
+        "settle_wait_ms"
+      ],
+      "must_be_read": [
+        "baseline_pct",
+        "perturbed_pct",
+        "direction",
+        "observations",
+        "baseline_settled",
+        "settle_wait_ms"
+      ],
+      "inert": {
+        "cycle": "only reached by models.py's own from_dict keyword, which is a parse site and not a read"
+      },
+      "note": "DEC-333. One perturbation cycle. `direction` matters because a down-perturbation inverts what a positive delta means."
+    },
+    {
+      "daemon": "ControlPathCandidate",
+      "gui": "ControlPathCandidate",
+      "endpoints": [
+        "GET /diagnostics/control-path"
+      ],
+      "fields": [
+        "tach_id",
+        "label",
+        "monitor_only",
+        "confidence",
+        "direction",
+        "baseline_rpm",
+        "perturbed_rpm",
+        "change_pct",
+        "cycles_responded",
+        "cycles_total"
+      ],
+      "must_be_read": [
+        "tach_id",
+        "monitor_only",
+        "confidence",
+        "direction",
+        "baseline_rpm",
+        "perturbed_rpm",
+        "change_pct",
+        "cycles_responded",
+        "cycles_total"
+      ],
+      "not_assertable": {
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "DEC-333. `cycles_responded`/`cycles_total` are rendered as a ratio \u2014 a candidate that responded once in five is not the same claim as one that responded five times, and collapsing them would lose that. `label` is read but too common."
+    },
+    {
+      "daemon": "DiscoverySummary",
+      "gui": "DiscoverySummary",
+      "endpoints": [
+        "GET /diagnostics/control-path"
+      ],
+      "fields": [
+        "relationship",
+        "confidence",
+        "candidates",
+        "measurement_resolution_ms",
+        "sample_interval_ms",
+        "sample_count",
+        "confidence_notes"
+      ],
+      "must_be_read": [
+        "relationship",
+        "confidence",
+        "candidates",
+        "measurement_resolution_ms",
+        "sample_interval_ms",
+        "sample_count",
+        "confidence_notes"
+      ],
+      "note": "DEC-333. `confidence_notes` is the daemon's own explanation of a low confidence; rendering the verdict without it would state a conclusion and withhold its reason."
+    },
+    {
+      "daemon": "ControlPathRecord",
+      "gui": "ControlPathRecord",
+      "endpoints": [
+        "GET /diagnostics/control-path .records[]"
+      ],
+      "fields": [
+        "header_id",
+        "relationship",
+        "confidence",
+        "tach_ids",
+        "tach_labels",
+        "direction",
+        "baseline_rpm",
+        "perturbed_rpm",
+        "change_pct",
+        "run_id",
+        "validated_unix_ms"
+      ],
+      "must_be_read": [
+        "header_id",
+        "relationship",
+        "confidence",
+        "tach_labels",
+        "direction",
+        "baseline_rpm",
+        "perturbed_rpm",
+        "change_pct",
+        "run_id",
+        "validated_unix_ms"
+      ],
+      "inert": {
+        "tach_ids": "parsed and never read; adjudicated in register row P8-bz"
+      },
+      "note": "DEC-333, the persisted result of an earlier run. `validated_unix_ms` is what makes a stored claim ageable rather than timeless. `tach_ids` is parsed and NOT read \u2014 the GUI renders `tach_labels`; recorded in P8-bz."
+    },
+    {
+      "daemon": "CharPoint",
+      "gui": "CharPoint",
+      "endpoints": [
+        "GET /diagnostics/characterization"
+      ],
+      "fields": [
+        "requested_pct",
+        "command_accepted",
+        "readback_pct",
+        "readback_raw",
+        "pwm_enable",
+        "rpm_before",
+        "rpm_after",
+        "settle_ms",
+        "first_change_ms",
+        "readback_verdict",
+        "rpm_verdict",
+        "direction",
+        "step_index",
+        "settled_ms",
+        "stability",
+        "estimated_physical_rpm"
+      ],
+      "must_be_read": [
+        "requested_pct",
+        "command_accepted",
+        "readback_pct",
+        "pwm_enable",
+        "rpm_after",
+        "settle_ms",
+        "first_change_ms",
+        "readback_verdict",
+        "rpm_verdict",
+        "direction",
+        "settled_ms",
+        "stability",
+        "estimated_physical_rpm"
+      ],
+      "inert": {
+        "readback_raw": "only a key in the provenance table, which describes the field rather than reading it (AU-d)"
+      },
+      "not_assertable": {
+        "rpm_before": "Shared with another declared struct (VerifyEvidence, whose rpm_before services/validation_view.py reads), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. CharPoint's own is still unread (was inert: only a key in the provenance table).",
+        "step_index": "Shared with ProbePoint (DEC-404 Stage 4), whose step_index the PWM Test Report reads to order its probe table, so a name-based check cannot tell whose read it sees (DEC-405's shared-name rule); no read claim is made. CharPoint's own copy is still parsed and never read (register row P8-bz)."
+      },
+      "note": "DEC-313/334. The two verdicts are deliberately independent and docs/08 forbids collapsing them into one pass/fail; both are pinned so neither can quietly stop being read. `step_index` is parsed and NOT read \u2014 the GUI orders by list position; recorded in P8-bz."
+    },
+    {
+      "daemon": "CharSummary",
+      "gui": "CharSummary",
+      "endpoints": [
+        "GET /diagnostics/characterization"
+      ],
+      "fields": [
+        "command_acceptance",
+        "pwm_readback",
+        "rpm_response",
+        "min_tested_pct",
+        "max_tested_pct",
+        "min_rpm",
+        "max_rpm",
+        "monotonic",
+        "dead_zone_upper_pct",
+        "clamp_pct",
+        "possible_device_override",
+        "interference_detected",
+        "hysteresis_pct",
+        "hysteresis_verdict",
+        "hysteresis_worst_duty_pct",
+        "hysteresis_worst_delta_rpm",
+        "hysteresis_compared_points",
+        "min_responsive_pct",
+        "max_responsive_pct",
+        "low_plateau_to_pct",
+        "saturation_from_pct",
+        "plateaus",
+        "stability_verdict",
+        "worst_cv_pct",
+        "total_dropouts",
+        "total_outliers",
+        "measurement_resolution_ms",
+        "typical_response_ms",
+        "typical_settling_ms",
+        "outside_learned_range",
+        "learned_range_note",
+        "interpretation_states",
+        "monotonic_falling",
+        "monotonic_rising"
+      ],
+      "must_be_read": [
+        "command_acceptance",
+        "pwm_readback",
+        "rpm_response",
+        "min_tested_pct",
+        "max_tested_pct",
+        "min_rpm",
+        "max_rpm",
+        "monotonic",
+        "dead_zone_upper_pct",
+        "clamp_pct",
+        "possible_device_override",
+        "interference_detected",
+        "hysteresis_pct",
+        "hysteresis_verdict",
+        "hysteresis_compared_points",
+        "min_responsive_pct",
+        "max_responsive_pct",
+        "low_plateau_to_pct",
+        "saturation_from_pct",
+        "plateaus",
+        "stability_verdict",
+        "worst_cv_pct",
+        "total_dropouts",
+        "total_outliers",
+        "measurement_resolution_ms",
+        "typical_response_ms",
+        "typical_settling_ms",
+        "outside_learned_range",
+        "interpretation_states",
+        "monotonic_falling",
+        "monotonic_rising",
+        "hysteresis_worst_delta_rpm",
+        "hysteresis_worst_duty_pct"
+      ],
+      "inert": {
+        "learned_range_note": "parsed and never read; adjudicated in register row P8-bz"
+      },
+      "note": "DEC-313/334. The three top verdicts must stay independent (docs/08). `typical_response_ms`/`typical_settling_ms` are pinned because G29 made them the ONLY producer of those timings \u2014 the client recomputation is now just the pre-2.40.0 fallback, so if these stopped being read the dialog would silently show nothing. Three fields are parsed and NOT read: `hysteresis_worst_duty_pct`, `hysteresis_worst_delta_rpm` and `learned_range_note` \u2014 recorded in P8-bz."
+    },
+    {
+      "daemon": "PointStability",
+      "gui": "PointStability",
+      "endpoints": [
+        "GET /diagnostics/characterization .points[].stability"
+      ],
+      "fields": [
+        "samples",
+        "usable",
+        "dropouts",
+        "outliers",
+        "mean_rpm",
+        "median_rpm",
+        "min_rpm",
+        "max_rpm",
+        "stddev_rpm",
+        "cv_pct",
+        "verdict",
+        "sample_interval_ms",
+        "dwell_ms",
+        "window_start_ms",
+        "update_interval_ms"
+      ],
+      "must_be_read": [
+        "samples",
+        "usable",
+        "mean_rpm",
+        "median_rpm",
+        "min_rpm",
+        "max_rpm",
+        "stddev_rpm",
+        "cv_pct",
+        "verdict",
+        "sample_interval_ms",
+        "window_start_ms",
+        "update_interval_ms"
+      ],
+      "inert": {
+        "dropouts": "only a key in the provenance table; CharSummary.total_dropouts is the figure the UI actually renders (AU-d)",
+        "outliers": "only a key in the provenance table; CharSummary.total_outliers is the figure the UI actually renders (AU-d)"
+      },
+      "note": "DEC-334 \u00a75. `usable` against `samples` is the absence-is-not-zero pair: a step that sampled nothing must not read as a clean tach. `median_rpm` is read by the PWM Test Report's comparison as each sweep point's settled value (DEC-409); `dwell_ms` is parsed and NOT read \u2014 recorded in P8-bz.",
+      "not_assertable": {
+        "dwell_ms": "Shared with StallProbeRun (DEC-404 Stage 4), whose dwell_ms the PWM Test Report reads for the probe's timing facts, so a name-based check cannot tell whose read it sees (DEC-405's shared-name rule); no read claim is made. PointStability's own copy is still parsed and never read (register row P8-bz)."
+      }
+    },
+    {
+      "daemon": "EstimatedRpm",
+      "gui": "EstimatedRpm",
+      "endpoints": [
+        "GET /diagnostics/characterization .points[].estimated_physical_rpm"
+      ],
+      "fields": [
+        "value",
+        "provenance",
+        "correction_factor",
+        "correction_source"
+      ],
+      "must_be_read": [
+        "provenance",
+        "correction_factor",
+        "correction_source"
+      ],
+      "not_assertable": {
+        "value": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "DEC-334. `provenance` is what stops a corrected reading being presented as a raw measurement. `value` is read but too common to pin here."
+    },
+    {
+      "daemon": "PlateauSpan",
+      "gui": "PlateauSpan",
+      "endpoints": [
+        "GET /diagnostics/characterization .summary.plateaus[]"
+      ],
+      "fields": [
+        "from_pct",
+        "to_pct",
+        "rpm_min",
+        "rpm_max"
+      ],
+      "must_be_read": [
+        "from_pct",
+        "to_pct",
+        "rpm_min",
+        "rpm_max"
+      ],
+      "note": "DEC-334 \u00a78.3. All four are drawn: the span bounds become a chart region and the RPM pair is the plateau's own claim. tests/test_aio_mb_phase8_batch2.py asserts the realised region against these."
+    },
+    {
+      "daemon": "SteadyState",
+      "gui": "ValidationSteadyState",
+      "endpoints": [
+        "GET /validation/session .steady_state"
+      ],
+      "fields": [
+        "verdict",
+        "start_ms",
+        "warmup_ms",
+        "slope_c_per_min",
+        "stddev_c",
+        "mean_c",
+        "peak_c",
+        "confidence",
+        "criterion"
+      ],
+      "must_be_read": [
+        "verdict",
+        "start_ms",
+        "warmup_ms",
+        "slope_c_per_min",
+        "stddev_c",
+        "mean_c",
+        "peak_c",
+        "confidence",
+        "criterion"
+      ],
+      "note": "DEC-335 \u00a79.2. `criterion` is the daemon's statement of WHICH test it applied; a verdict rendered without it is unfalsifiable to the reader."
+    },
+    {
+      "daemon": "StartupFingerprint",
+      "gui": "ValidationStartupFingerprint",
+      "endpoints": [
+        "GET /validation/session .startup_fingerprints[]"
+      ],
+      "fields": [
+        "member_id",
+        "role",
+        "override_observed",
+        "override_duration_ms",
+        "peak_rpm",
+        "requested_pct_during",
+        "readback_pct_during",
+        "post_override_rpm",
+        "transition_ms",
+        "interpretation"
+      ],
+      "must_be_read": [
+        "member_id",
+        "role",
+        "override_duration_ms",
+        "peak_rpm",
+        "requested_pct_during",
+        "readback_pct_during",
+        "post_override_rpm",
+        "transition_ms",
+        "interpretation"
+      ],
+      "inert": {
+        "override_observed": "parsed and never read; adjudicated in register row P8-bz"
+      },
+      "note": "DEC-335 \u00a79.1. `interpretation` is the daemon's own reading of the fingerprint and the GUI must render it rather than re-deriving one. `override_observed` is parsed and NOT read \u2014 the GUI infers from `override_duration_ms`; recorded in P8-bz."
+    },
+    {
+      "daemon": "VerifyEvidence",
+      "gui": "ValidationVerifyEvidence",
+      "endpoints": [
+        "GET /validation/session .evidence[].verify",
+        "GET /validation/sessions/{session_id} .evidence[].verify"
+      ],
+      "fields": [
+        "header_id",
+        "write_ok",
+        "readback_pct",
+        "requested_pct",
+        "rpm_before",
+        "rpm_after",
+        "detail",
+        "result",
+        "restore_failed"
+      ],
+      "must_be_read": [
+        "rpm_before",
+        "result",
+        "restore_failed"
+      ],
+      "inert": {
+        "write_ok": "parsed and never read: the evidence row's daemon-mapped `outcome` carries the same fact, and is what the GUI renders (DEC-405)"
+      },
+      "not_assertable": {
+        "header_id": "Shared with another declared struct (PreflightReport, ControlPathRun, ControlPathRecord), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made.",
+        "detail": "Shared with another declared struct (PreflightCheck, ControlPathRun), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made.",
+        "readback_pct": "Shared with another declared struct (CharPoint, whose own reads satisfy the name), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. services/validation_view.py::verify_evidence_detail does read it; tests/test_aio_mb_phase5.py::test_session_verify_evidence_is_worded_by_the_one_verify_vocabulary pins that read at the call site.",
+        "requested_pct": "Shared with another declared struct (CharPoint, whose own reads satisfy the name), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. services/validation_view.py::verify_evidence_detail does read it; tests/test_aio_mb_phase5.py::test_session_verify_evidence_is_worded_by_the_one_verify_vocabulary pins that read at the call site.",
+        "rpm_after": "Shared with another declared struct (CharPoint, whose own reads satisfy the name), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. services/validation_view.py::verify_evidence_detail does read it; tests/test_aio_mb_phase5.py::test_session_verify_evidence_is_worded_by_the_one_verify_vocabulary pins that read at the call site."
+      },
+      "note": "DEC-405 (`PTR-e`). Until daemon 2.52.0 the three readings were always null (read from the wrong JSON paths) and `result` was never stored; `services/validation_view.py::verify_evidence_detail` renders the token through `verify_view.outcome_for`. Only `result`, `restore_failed` and `rpm_before` are claimed read here: the other readings share their names with `CharPoint` (whose `rpm_before` alone is unread), so the name check cannot prove them for this struct."
+    },
+    {
+      "daemon": "HardwareDiagnosticsResponse",
+      "gui": "HardwareDiagnosticsResult",
+      "endpoints": [
+        "GET /diagnostics/hardware"
+      ],
+      "fields": [
+        "api_version",
+        "hwmon",
+        "gpu",
+        "intel_gpu",
+        "nvidia_gpu",
+        "thermal_safety",
+        "kernel_modules",
+        "acpi_conflicts",
+        "board",
+        "kernel_release",
+        "expected_chips",
+        "expected_fanless_chips",
+        "board_firmware_counts",
+        "kernel_detected_chips",
+        "module_collisions",
+        "cpu_vendor",
+        "amd_pci_devices",
+        "amdgpu_module_loaded",
+        "voltages"
+      ],
+      "must_be_read": [
+        "hwmon",
+        "gpu",
+        "intel_gpu",
+        "nvidia_gpu",
+        "thermal_safety",
+        "kernel_modules",
+        "acpi_conflicts",
+        "board",
+        "kernel_release",
+        "expected_chips",
+        "expected_fanless_chips",
+        "board_firmware_counts",
+        "module_collisions",
+        "cpu_vendor",
+        "amd_pci_devices",
+        "amdgpu_module_loaded",
+        "voltages"
+      ],
+      "inert": {
+        "kernel_detected_chips": "parsed (DEC-101's kmsg chip detection) and read by no GUI surface today; the support bundle carries the raw payload instead."
+      },
+      "not_assertable": {
+        "api_version": "Shared with another declared struct (CoolingDevicesResponse, HwmonInventoryResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made."
+      },
+      "note": "Enrolled by DEC-404 Stage 4 (PTR-r): the PWM Test Report is the first reader of DEC-405's kernel_release and records the environment from this response."
+    },
+    {
+      "daemon": "BoardInfo",
+      "gui": "BoardInfo",
+      "endpoints": [
+        "GET /diagnostics/hardware .board"
+      ],
+      "fields": [
+        "vendor",
+        "name",
+        "bios_version",
+        "bios_date"
+      ],
+      "must_be_read": [
+        "vendor",
+        "bios_version",
+        "bios_date"
+      ],
+      "not_assertable": {
+        "name": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "Enrolled by DEC-404 Stage 4 (PTR-r). bios_date (DEC-405) is read by the PWM Test Report's environment section."
+    },
+    {
+      "daemon": "KernelModuleInfo",
+      "gui": "KernelModuleInfo",
+      "endpoints": [
+        "GET /diagnostics/hardware .kernel_modules[]"
+      ],
+      "fields": [
+        "name",
+        "loaded",
+        "in_mainline",
+        "version",
+        "srcversion",
+        "out_of_tree"
+      ],
+      "must_be_read": [
+        "loaded",
+        "in_mainline",
+        "version",
+        "srcversion",
+        "out_of_tree"
+      ],
+      "not_assertable": {
+        "name": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "Enrolled by DEC-404 Stage 4 (PTR-r). version, srcversion and out_of_tree (DEC-405) are read by the PWM Test Report's environment section."
+    },
+    {
+      "daemon": "StallProbeRun",
+      "gui": "StallProbeRun",
+      "endpoints": [
+        "POST /hwmon/{header_id}/stall-probe",
+        "GET /diagnostics/stall-probe",
+        "DELETE /diagnostics/stall-probe"
+      ],
+      "fields": [
+        "run_id",
+        "header_id",
+        "state",
+        "outcome",
+        "abort_reason",
+        "detail",
+        "stall_duty_pct",
+        "restart_duty_pct",
+        "hysteresis_pct",
+        "lowest_commanded_pct",
+        "time_below_floor_ms",
+        "baseline_rpm",
+        "baseline_settled",
+        "refresh_ms",
+        "refresh_source",
+        "dwell_ms",
+        "confirm_ms",
+        "budget_ms",
+        "start_cpu_temp_c",
+        "max_cpu_temp_c",
+        "rise_limit_c",
+        "restart_failed_at_full",
+        "points",
+        "original_pct",
+        "restore_failed",
+        "restore_outcome",
+        "completed_unix_ms",
+        "provenance"
+      ],
+      "must_be_read": [
+        "run_id",
+        "outcome",
+        "abort_reason",
+        "detail",
+        "stall_duty_pct",
+        "restart_duty_pct",
+        "hysteresis_pct",
+        "lowest_commanded_pct",
+        "time_below_floor_ms",
+        "baseline_rpm",
+        "baseline_settled",
+        "refresh_ms",
+        "refresh_source",
+        "dwell_ms",
+        "confirm_ms",
+        "budget_ms",
+        "start_cpu_temp_c",
+        "max_cpu_temp_c",
+        "rise_limit_c",
+        "restart_failed_at_full",
+        "points",
+        "original_pct",
+        "restore_failed",
+        "restore_outcome"
+      ],
+      "not_assertable": {
+        "header_id": "Shared with another declared struct (PreflightReport, ControlPathRun, ControlPathRecord, VerifyEvidence), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The report keys a probe by the header it asked for, never by this echo.",
+        "state": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "completed_unix_ms": "Shared with another declared struct (ControlPathRun), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The report times its own steps.",
+        "provenance": "Shared with another declared struct (EstimatedRpm), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The report carries its own provenance legend; the probe's sidecar stays in the evidence."
+      },
+      "note": "Enrolled by DEC-404 Stage 4 (PTR-u): the PWM Test Report models and reads the DEC-407 probe."
+    },
+    {
+      "daemon": "ProbePoint",
+      "gui": "ProbePoint",
+      "endpoints": [
+        "GET /diagnostics/stall-probe .points[]"
+      ],
+      "fields": [
+        "phase",
+        "step_index",
+        "commanded_pct",
+        "command_accepted",
+        "readback_pct",
+        "pwm_enable",
+        "rpm_before",
+        "rpm_after",
+        "held_ms",
+        "confirmed_at_ms",
+        "samples",
+        "zero_samples",
+        "observation"
+      ],
+      "must_be_read": [
+        "phase",
+        "step_index",
+        "commanded_pct",
+        "command_accepted",
+        "readback_pct",
+        "pwm_enable",
+        "rpm_before",
+        "rpm_after",
+        "held_ms",
+        "confirmed_at_ms",
+        "samples",
+        "zero_samples",
+        "observation"
+      ],
+      "note": "Enrolled by DEC-404 Stage 4 (PTR-u). Every field is a column of the report's probe table (services/pwm_report/view.py::probe_rows)."
+    },
+    {
+      "daemon": "PumpStallEntry",
+      "gui": "PumpStall",
+      "endpoints": [
+        "GET /status .pump_stalls[]",
+        "GET /poll .status.pump_stalls[]"
+      ],
+      "fields": [
+        "header_id",
+        "state",
+        "since_ms",
+        "stall_count"
+      ],
+      "not_assertable": {
+        "header_id": "Shared with another declared struct (StallProbeRun, PreflightReport, ControlPathRun, ControlPathRecord, VerifyEvidence), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The alert resolves the pump's display name from it (services/app_state.py::_current_conditions).",
+        "state": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "inert": {
+        "since_ms": "parsed and never read: the alert ledger timestamps its own occurrence (DEC-282), so a second clock would only disagree with it",
+        "stall_count": "parsed and never read: the state token already distinguishes a second stall (`held`), which is the only count that changes what the daemon does"
+      },
+      "note": "Enrolled by DEC-443 (W-SAFE): the pump stall response. The GUI raises an error-level alert per entry (services/cooling_watch.py::pump_stall_alert); the tray renders the state too."
+    },
+    {
+      "daemon": "CoolingAdvisoryEntry",
+      "gui": "CoolingAdvisory",
+      "endpoints": [
+        "GET /status .advisories[]",
+        "GET /poll .status.advisories[]"
+      ],
+      "fields": [
+        "code",
+        "since_ms",
+        "cpu_temp_c",
+        "ceiling_c",
+        "max_duty_pct"
+      ],
+      "must_be_read": [
+        "code",
+        "cpu_temp_c",
+        "ceiling_c",
+        "max_duty_pct"
+      ],
+      "inert": {
+        "since_ms": "parsed and never read: the alert ledger timestamps its own occurrence (DEC-282), so a second clock would only disagree with it"
+      },
+      "note": "Enrolled by DEC-443 (W-SAFE, TS-m): the cooling advisory. The GUI raises a warning-level alert from its figures (services/cooling_watch.py::advisory_alert)."
+    },
+    {
+      "daemon": "OpenFanCalibrationRun",
+      "gui": "OpenFanCalibrationRun",
+      "endpoints": [
+        "POST /fans/openfan/{ch}/calibration",
+        "GET /diagnostics/openfan-calibration",
+        "DELETE /diagnostics/openfan-calibration"
+      ],
+      "fields": [
+        "run_id",
+        "fan_id",
+        "channel",
+        "state",
+        "phase",
+        "current_pct",
+        "hold_ms",
+        "outcome",
+        "abort_reason",
+        "detail",
+        "stall_duty_pct",
+        "restart_duty_pct",
+        "hysteresis_pct",
+        "min_rpm",
+        "max_rpm",
+        "restart_failed_at_full",
+        "start_cpu_temp_c",
+        "max_cpu_temp_c",
+        "rise_limit_c",
+        "points",
+        "original_pct",
+        "restore_outcome",
+        "restore_failed",
+        "started_unix_ms",
+        "completed_unix_ms"
+      ],
+      "must_be_read": [
+        "run_id",
+        "fan_id",
+        "channel",
+        "phase",
+        "current_pct",
+        "hold_ms",
+        "outcome",
+        "abort_reason",
+        "detail",
+        "stall_duty_pct",
+        "restart_duty_pct",
+        "hysteresis_pct",
+        "min_rpm",
+        "max_rpm",
+        "restart_failed_at_full",
+        "start_cpu_temp_c",
+        "max_cpu_temp_c",
+        "rise_limit_c",
+        "points",
+        "original_pct",
+        "restore_outcome",
+        "restore_failed",
+        "completed_unix_ms"
+      ],
+      "not_assertable": {
+        "state": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "started_unix_ms": "Shared with another declared struct (RunStep), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The dialog reports progress by phase and duty, never by elapsed time."
+      },
+      "note": "Enrolled by DEC-453 (W-OFAN Run 2, WIRE-l): the OpenFan calibration dialog renders the run (services/openfan_calibration_view.py) and keys its end on completed_unix_ms, which the daemon sets only in the terminal publish."
+    },
+    {
+      "daemon": "OpenFanRoleEntry",
+      "gui": "OpenFanRole",
+      "endpoints": [
+        "GET /fans/openfan/roles"
+      ],
+      "fields": [
+        "fan_id",
+        "channel",
+        "role",
+        "role_source",
+        "stop_permitted",
+        "effective_min_pwm_pct"
+      ],
+      "not_assertable": {
+        "fan_id": "Shared with another declared struct (OpenFanCalibrationRun), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. services/openfan_role_view.py keys the Hardware page's rows on it.",
+        "channel": "Shared with another declared struct (OpenFanCalibrationRun), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The rows are ordered by it.",
+        "role": "Shared with another declared struct (PwmHeaderEntry), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The row's pill shows it.",
+        "role_source": "Shared with another declared struct (PwmHeaderEntry), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. A not-reporting channel is listed only when it is user_assigned.",
+        "stop_permitted": "Shared with another declared struct (PwmHeaderEntry), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. services/pump_protection.py::openfan_channel_is_pump_protected decides on it.",
+        "effective_min_pwm_pct": "Shared with another declared struct (PwmHeaderEntry), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The GUI shows protection, not the floor figure, for an OpenFan channel."
+      },
+      "note": "Enrolled by DEC-475 (ROLE-f): the Hardware page's OpenFan Channels list, the Fan Wizard's identify wording and the calibration dialog's pump refusal read it."
+    },
+    {
+      "daemon": "CalPoint",
+      "gui": "CalPoint",
+      "endpoints": [
+        "GET /diagnostics/openfan-calibration .points[]"
+      ],
+      "fields": [
+        "pwm_percent",
+        "rpm",
+        "phase",
+        "observation"
+      ],
+      "must_be_read": [
+        "pwm_percent",
+        "rpm",
+        "phase",
+        "observation"
+      ],
+      "note": "Enrolled by DEC-453 (W-OFAN Run 2). Every field is a column of the calibration dialog's points table or a point of its chart (services/openfan_calibration_view.py)."
+    },
+    {
+      "daemon": "CharacterizationRun",
+      "gui": "CharacterizationRun",
+      "endpoints": [
+        "POST /hwmon/{header_id}/characterize (202 snapshot)",
+        "GET /diagnostics/characterization",
+        "DELETE /diagnostics/characterization"
+      ],
+      "fields": [
+        "run_id",
+        "header_id",
+        "state",
+        "requested_points_pct",
+        "settle_seconds",
+        "points",
+        "summary",
+        "original_pct",
+        "restore_failed",
+        "restore_outcome",
+        "detail",
+        "bidirectional",
+        "stability_seconds",
+        "completed_unix_ms",
+        "provenance",
+        "current_step"
+      ],
+      "must_be_read": [
+        "run_id",
+        "header_id",
+        "requested_points_pct",
+        "settle_seconds",
+        "points",
+        "summary",
+        "original_pct",
+        "restore_failed",
+        "restore_outcome",
+        "detail",
+        "bidirectional",
+        "stability_seconds",
+        "provenance",
+        "current_step"
+      ],
+      "not_assertable": {
+        "state": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "completed_unix_ms": "Shared with other declared structs (ControlPathRun, StallProbeRun, OpenFanCalibrationRun), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The sweep dialog and the PWM Test Report key a run's end on state, never on this timestamp."
+      },
+      "note": "Enrolled by PTR-aa (W-DIAGD, G123): the characterisation run's own fields. Its children (CharPoint, CharSummary, PointStability) were enrolled first, which is how this was missed. The dialog renders it (services/characterization_view.py) and fences a snapshot on header_id (ui/widgets/pwm_characterization_dialog.py); the PWM Test Report reads it too (services/pwm_report/)."
+    },
+    {
+      "daemon": "OpenFanMaintenanceSummary",
+      "gui": "OpenFanMaintenanceSummary",
+      "endpoints": [
+        "GET /status .openfan_maintenance",
+        "GET /poll .status.openfan_maintenance"
+      ],
+      "fields": [
+        "run_id",
+        "stage",
+        "state",
+        "outcome"
+      ],
+      "not_assertable": {
+        "run_id": "Shared with another declared struct (MaintenanceRecord and the diagnostic runs), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The update window matches a needs-recovery summary to the run it shows.",
+        "stage": "Shared with another declared struct (MaintenanceRecord, StageTiming), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The DEC-482 update alert names the stage.",
+        "state": "The name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous). OpenFanMaintenanceSummary.needs_recovery reads it, and the update window attaches to a needs-recovery run on it.",
+        "outcome": "Shared with another declared struct (MaintenanceRecord and the diagnostic runs), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The needs-recovery alert names the outcome."
+      },
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. Its presence alone drives the DEC-482 alert consolidation in services/app_state.py."
+    },
+    {
+      "daemon": "OpenFanDeviceResponse",
+      "gui": "OpenFanDevice",
+      "endpoints": [
+        "GET /fans/openfan/device"
+      ],
+      "fields": [
+        "api_version",
+        "present",
+        "link",
+        "port",
+        "usb",
+        "interface_number",
+        "hw_info",
+        "fw_info",
+        "update_available",
+        "update_refusals",
+        "daemon_write",
+        "silent_board"
+      ],
+      "must_be_read": [
+        "present",
+        "link",
+        "update_available",
+        "update_refusals",
+        "daemon_write",
+        "silent_board"
+      ],
+      "not_assertable": {
+        "port": "Shared with another declared struct (UsbDevice), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The Controller section shows the serial device.",
+        "usb": "Shared with another declared struct (BoardSnapshot), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The Controller section shows its serial number and port, and the start sends usb.serial as expected_usb_serial.",
+        "hw_info": "Shared with another declared struct (BoardSnapshot), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The Controller section shows it; the file findings compare HW_REV with the file's.",
+        "fw_info": "Shared with another declared struct (BoardSnapshot), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The Controller section shows it; the file findings compare PROTOCOL_VERSION with the file's."
+      },
+      "inert": {
+        "interface_number": "Not shown: the daemon reopens the interface it used by itself, and nothing in the window depends on which one it is."
+      },
+      "unmodelled": {
+        "api_version": "The envelope's version. Compatibility is the capability handshake (control.openfan_firmware_maintenance), never a matched version number."
+      },
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. DEC-483 added daemon_write: whether the daemon may write the firmware itself. DEC-484 added silent_board: an OpenFAN board on USB that does not answer, and whether its update could start."
+    },
+    {
+      "daemon": "UsbDevice",
+      "gui": "OpenFanUsbDevice",
+      "endpoints": [
+        "GET /fans/openfan/device .usb",
+        "GET /fans/openfan/device .silent_board.usb",
+        "GET /fans/openfan/maintenance .before.usb, .after.usb"
+      ],
+      "fields": [
+        "port",
+        "vendor_id",
+        "product_id",
+        "manufacturer",
+        "product",
+        "serial",
+        "bcd_device",
+        "config_descriptor_hex"
+      ],
+      "must_be_read": [
+        "serial",
+        "config_descriptor_hex"
+      ],
+      "not_assertable": {
+        "port": "Shared with another declared struct (OpenFanDeviceResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The Controller section shows the USB port."
+      },
+      "inert": {
+        "vendor_id": "The daemon identifies the board by its serial number on its USB port; the window shows only those.",
+        "product_id": "The daemon identifies the board by its serial number on its USB port; the window shows only those.",
+        "manufacturer": "The daemon identifies the board by its serial number on its USB port; the window shows only those.",
+        "product": "The daemon identifies the board by its serial number on its USB port; the window shows only those.",
+        "bcd_device": "Not shown: the evidence the window reports is the configuration descriptor and the firmware's own reports."
+      },
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it."
+    },
+    {
+      "daemon": "OpenFanUpdateRefusal",
+      "gui": "OpenFanUpdateRefusal",
+      "endpoints": [
+        "GET /fans/openfan/device .update_refusals[]"
+      ],
+      "fields": [
+        "reason",
+        "message"
+      ],
+      "must_be_read": [
+        "reason",
+        "message"
+      ],
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. The start gate shows the daemon's message, or the token when there is none."
+    },
+    {
+      "daemon": "OpenFanDaemonWrite",
+      "gui": "OpenFanDaemonWrite",
+      "endpoints": [
+        "GET /fans/openfan/device .daemon_write"
+      ],
+      "fields": [
+        "available",
+        "reason",
+        "message"
+      ],
+      "must_be_read": [
+        "available"
+      ],
+      "not_assertable": {
+        "reason": "Shared with another declared struct (OpenFanUpdateRefusal, OpenFanFirmwareStagedResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The file step names the missing drop-in on it.",
+        "message": "Shared with another declared struct (OpenFanUpdateRefusal, OpenFanFirmwareStagedResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The file step shows it."
+      },
+      "note": "Enrolled by DEC-483 (the daemon writes the OpenFAN firmware itself): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. Absent from a daemon without control.openfan_firmware_write."
+    },
+    {
+      "daemon": "OpenFanSilentBoard",
+      "gui": "OpenFanSilentBoard",
+      "endpoints": [
+        "GET /fans/openfan/device .silent_board"
+      ],
+      "fields": [
+        "usb",
+        "interface_number",
+        "tty",
+        "update_available",
+        "update_refusals"
+      ],
+      "must_be_read": [
+        "update_available",
+        "update_refusals"
+      ],
+      "not_assertable": {
+        "usb": "Shared with another declared struct (OpenFanDeviceResponse, BoardSnapshot), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The Controller section shows the silent board's serial number and port, and the start sends usb.serial as expected_usb_serial."
+      },
+      "inert": {
+        "interface_number": "Not shown: the daemon signals and reopens that interface by itself.",
+        "tty": "Not shown: the window names the USB port instead."
+      },
+      "note": "Enrolled by DEC-484 (updating a silent OpenFAN board): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. Absent from a daemon without control.openfan_firmware_silent_update."
+    },
+    {
+      "daemon": "OpenFanSilentBoardEntry",
+      "gui": "OpenFanSilentBoardEntry",
+      "endpoints": [
+        "GET /status .openfan_silent_board",
+        "GET /poll .status.openfan_silent_board"
+      ],
+      "fields": [
+        "usb_serial",
+        "usb_port"
+      ],
+      "must_be_read": [
+        "usb_serial",
+        "usb_port"
+      ],
+      "note": "Enrolled by DEC-484 (updating a silent OpenFAN board): services/app_state.py raises the silent-board alert on it, and the Hardware page offers the update. Absent from a daemon without control.openfan_firmware_silent_update."
+    },
+    {
+      "daemon": "OpenFanFirmwareStagedResponse",
+      "gui": "OpenFanFirmwareStaged",
+      "endpoints": [
+        "PUT /fans/openfan/firmware"
+      ],
+      "fields": [
+        "api_version",
+        "sha256",
+        "size",
+        "release",
+        "verdict",
+        "reason",
+        "message"
+      ],
+      "not_assertable": {
+        "sha256": "Shared with another declared struct (FirmwareClaim), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The window asks the daemon to write only when it matches the file it prepared.",
+        "size": "Shared with another declared struct (FirmwareClaim), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The file step shows the size of the file itself.",
+        "release": "Shared with another declared struct (FirmwareWrite), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The file step names the release the daemon recognised.",
+        "verdict": "Shared with another declared struct (Evidence, PointStability, PreflightReport, SteadyState), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The file step and the start choose who writes the file on it.",
+        "reason": "Shared with another declared struct (OpenFanUpdateRefusal, OpenFanDaemonWrite), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The file step words a file the daemon will not write on it.",
+        "message": "Shared with another declared struct (OpenFanUpdateRefusal, OpenFanDaemonWrite), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The file step shows it."
+      },
+      "unmodelled": {
+        "api_version": "The envelope's version. Compatibility is the capability handshake (control.openfan_firmware_write), never a matched version number."
+      },
+      "note": "Enrolled by DEC-483 (the daemon writes the OpenFAN firmware itself): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. The answer to an upload; the daemon keeps the file only when verdict is daemon_write."
+    },
+    {
+      "daemon": "MaintenanceRecord",
+      "gui": "OpenFanMaintenanceRecord",
+      "endpoints": [
+        "GET /fans/openfan/maintenance (flattened beside api_version)"
+      ],
+      "fields": [
+        "run_id",
+        "state",
+        "stage",
+        "stage_started_unix_ms",
+        "stage_deadline_unix_ms",
+        "cancellable",
+        "started_unix_ms",
+        "finished_unix_ms",
+        "outcome",
+        "outcome_detail",
+        "interrupted",
+        "cancelled",
+        "bootloader_requested",
+        "bootloader_seen",
+        "board_answered",
+        "bootloader_trigger",
+        "bootloader_drive",
+        "other_bootloader_drives",
+        "notes",
+        "stages",
+        "expected_usb_serial",
+        "usb_port",
+        "interface_number",
+        "tty",
+        "firmware",
+        "before",
+        "after",
+        "evidence",
+        "firmware_write",
+        "board"
+      ],
+      "must_be_read": [
+        "stage_deadline_unix_ms",
+        "cancellable",
+        "finished_unix_ms",
+        "outcome_detail",
+        "interrupted",
+        "cancelled",
+        "board_answered",
+        "bootloader_trigger",
+        "bootloader_drive",
+        "other_bootloader_drives",
+        "notes",
+        "stages",
+        "expected_usb_serial",
+        "usb_port",
+        "firmware",
+        "before",
+        "after",
+        "evidence",
+        "firmware_write"
+      ],
+      "not_assertable": {
+        "run_id": "Shared with another declared struct (OpenFanMaintenanceSummary and the diagnostic runs), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The window follows one run by it.",
+        "state": "The name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous). OpenFanMaintenanceRecord.is_running reads it.",
+        "stage": "Shared with another declared struct (OpenFanMaintenanceSummary, StageTiming), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The stage rows and the current instruction are built from it.",
+        "started_unix_ms": "Shared with another declared struct (StageTiming and the diagnostic runs), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. A window that has just clicked Start ignores any run that began before the click.",
+        "outcome": "Shared with another declared struct (OpenFanMaintenanceSummary and the diagnostic runs), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The result's title, tone and steps are chosen on it.",
+        "board": "Shared with another declared struct (HardwareDiagnosticsResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The window words a silent board's run on it (DEC-484)."
+      },
+      "inert": {
+        "stage_started_unix_ms": "The stage rows time each stage from stages[]; the countdown uses the deadline.",
+        "bootloader_requested": "The daemon decides what an interrupted run means from it; the window shows how far a run got from stages[].",
+        "bootloader_seen": "The window shows how far a run got from stages[] and the outcome.",
+        "interface_number": "Not shown: the daemon reopens the interface it used by itself.",
+        "tty": "The window names the USB port and the drive instead; the support bundle keeps the record whole."
+      },
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. expected_usb_serial is read by the support bundle's redaction (openfan_firmware_view.bundle_record). DEC-483 added firmware_write: the daemon's own write, null when the file is copied by hand. DEC-484 added board: connected or silent."
+    },
+    {
+      "daemon": "FirmwareWrite",
+      "gui": "OpenFanFirmwareWrite",
+      "endpoints": [
+        "GET /fans/openfan/maintenance .firmware_write"
+      ],
+      "fields": [
+        "release",
+        "phase",
+        "done_bytes",
+        "total_bytes",
+        "flash_id",
+        "flash_changed",
+        "verified",
+        "fallback_reason",
+        "fallback_detail"
+      ],
+      "must_be_read": [
+        "done_bytes",
+        "total_bytes",
+        "flash_id",
+        "flash_changed",
+        "verified",
+        "fallback_reason",
+        "fallback_detail"
+      ],
+      "not_assertable": {
+        "release": "Shared with another declared struct (OpenFanFirmwareStagedResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The write's progress names it.",
+        "phase": "Shared with another declared struct (RunStep, ProbePoint, OpenFanCalibrationRun, CalPoint), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The progress line and its bar are chosen on it."
+      },
+      "note": "Enrolled by DEC-483 (the daemon writes the OpenFAN firmware itself): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. The progress bar counts done_bytes of total_bytes; a fallback is explained from fallback_reason, flash_changed and fallback_detail."
+    },
+    {
+      "daemon": "BoardSnapshot",
+      "gui": "OpenFanBoardSnapshot",
+      "endpoints": [
+        "GET /fans/openfan/maintenance .before, .after"
+      ],
+      "fields": [
+        "usb",
+        "hw_info",
+        "fw_info"
+      ],
+      "not_assertable": {
+        "usb": "Shared with another declared struct (OpenFanDeviceResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. Kept whole for the support bundle.",
+        "hw_info": "Shared with another declared struct (OpenFanDeviceResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The result's reports table shows it before and after.",
+        "fw_info": "Shared with another declared struct (OpenFanDeviceResponse), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The result's reports table shows it before and after."
+      },
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it."
+    },
+    {
+      "daemon": "Evidence",
+      "gui": "OpenFanUpdateEvidence",
+      "endpoints": [
+        "GET /fans/openfan/maintenance .evidence"
+      ],
+      "fields": [
+        "descriptor_changed",
+        "descriptor_matches_file",
+        "info_matches_file",
+        "info_changed",
+        "verdict"
+      ],
+      "must_be_read": [
+        "descriptor_changed",
+        "descriptor_matches_file",
+        "info_matches_file",
+        "info_changed"
+      ],
+      "not_assertable": {
+        "verdict": "Shared with another declared struct (PointStability, PreflightReport, SteadyState), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. The result's tone and its Verdict row are chosen on it."
+      },
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. Each Option is shown as Unknown, never as No."
+    },
+    {
+      "daemon": "StageTiming",
+      "gui": "OpenFanStageTiming",
+      "endpoints": [
+        "GET /fans/openfan/maintenance .stages[]"
+      ],
+      "fields": [
+        "stage",
+        "started_unix_ms",
+        "ended_unix_ms"
+      ],
+      "must_be_read": [
+        "ended_unix_ms"
+      ],
+      "not_assertable": {
+        "stage": "Shared with another declared struct (OpenFanMaintenanceSummary, MaintenanceRecord), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. Each stage row finds its timings by it.",
+        "started_unix_ms": "Shared with another declared struct (MaintenanceRecord and the diagnostic runs), so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule); no read claim is made. Each stage row's duration is measured from it."
+      },
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it."
+    },
+    {
+      "daemon": "FirmwareClaim",
+      "gui": "OpenFanFirmwareClaim",
+      "endpoints": [
+        "GET /fans/openfan/maintenance .firmware"
+      ],
+      "fields": [
+        "sha256",
+        "size",
+        "usb_config_descriptor_hex",
+        "info"
+      ],
+      "must_be_read": [
+        "sha256",
+        "size",
+        "usb_config_descriptor_hex",
+        "info"
+      ],
+      "note": "Enrolled by DEC-481 (the OpenFAN firmware update): services/openfan_firmware_view.py and ui/widgets/openfan_firmware_dialog.py read it. What the GUI sent with the start (services/uf2.py::Uf2Inspection.claim); a reopened window finds the prepared copy by sha256."
+    },
+    {
+      "daemon": "StatusResponse",
+      "gui": "DaemonStatus",
+      "endpoints": [
+        "GET /status",
+        "GET /poll .status"
+      ],
+      "fields": [
+        "api_version",
+        "daemon_version",
+        "overall_status",
+        "subsystems",
+        "uptime_seconds",
+        "thermal_state",
+        "overrides",
+        "fan_identify",
+        "unavailable_sensors",
+        "skipped_controls",
+        "control_outputs",
+        "runtime_config_degraded",
+        "validation_session",
+        "active_profile_id",
+        "active_profile_name",
+        "has_active_profile",
+        "readiness",
+        "verify_active",
+        "emergency_causes",
+        "pump_stalls",
+        "advisories",
+        "openfan_link",
+        "openfan_maintenance",
+        "openfan_silent_board"
+      ],
+      "must_be_read": [
+        "daemon_version",
+        "overall_status",
+        "subsystems",
+        "uptime_seconds",
+        "thermal_state",
+        "overrides",
+        "fan_identify",
+        "unavailable_sensors",
+        "skipped_controls",
+        "control_outputs",
+        "runtime_config_degraded",
+        "validation_session",
+        "active_profile_id",
+        "active_profile_name",
+        "has_active_profile",
+        "readiness",
+        "verify_active",
+        "emergency_causes",
+        "pump_stalls",
+        "advisories",
+        "openfan_link",
+        "openfan_maintenance",
+        "openfan_silent_board"
+      ],
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin.",
+      "not_assertable": {
+        "api_version": "Shared with other declared structs, so a name-based check cannot tell which one a read belongs to (DEC-405's shared-name rule). No GUI code reads DaemonStatus.api_version; every read is Capabilities.api_version."
+      }
+    },
+    {
+      "daemon": "SubsystemStatus",
+      "gui": "SubsystemStatus",
+      "endpoints": [
+        "GET /status .subsystems[]",
+        "GET /poll .status.subsystems[]"
+      ],
+      "fields": [
+        "name",
+        "status",
+        "age_ms",
+        "reason"
+      ],
+      "must_be_read": [
+        "status",
+        "age_ms",
+        "reason"
+      ],
+      "not_assertable": {
+        "name": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin."
+    },
+    {
+      "daemon": "OverrideStatusEntry",
+      "gui": "OverrideStatusEntry",
+      "endpoints": [
+        "GET /status .overrides[]",
+        "GET /poll .status.overrides[]"
+      ],
+      "fields": [
+        "control_id",
+        "pwm_percent",
+        "expires_in_secs"
+      ],
+      "must_be_read": [
+        "control_id",
+        "pwm_percent",
+        "expires_in_secs"
+      ],
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin."
+    },
+    {
+      "daemon": "UnavailableSensorEntry",
+      "gui": "UnavailableSensor",
+      "endpoints": [
+        "GET /status .unavailable_sensors[]",
+        "GET /poll .status.unavailable_sensors[]"
+      ],
+      "fields": [
+        "id",
+        "label",
+        "reason",
+        "unavailable_for_ms"
+      ],
+      "must_be_read": [
+        "reason",
+        "unavailable_for_ms"
+      ],
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin."
+    },
+    {
+      "daemon": "SkippedControlEntry",
+      "gui": "SkippedControl",
+      "endpoints": [
+        "GET /status .skipped_controls[]",
+        "GET /poll .status.skipped_controls[]"
+      ],
+      "fields": [
+        "control_id",
+        "control_name",
+        "reason",
+        "skipped_for_ms"
+      ],
+      "must_be_read": [
+        "control_id",
+        "control_name",
+        "reason",
+        "skipped_for_ms"
+      ],
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin."
+    },
+    {
+      "daemon": "ControlOutputEntry",
+      "gui": "ControlOutput",
+      "endpoints": [
+        "GET /status .control_outputs[]",
+        "GET /poll .status.control_outputs[]"
+      ],
+      "fields": [
+        "control_id",
+        "output_pct"
+      ],
+      "must_be_read": [
+        "control_id",
+        "output_pct"
+      ],
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin."
+    },
+    {
+      "daemon": "ThermalSafetyInfo",
+      "gui": "ThermalSafetyInfo",
+      "endpoints": [
+        "GET /diagnostics/hardware .thermal_safety"
+      ],
+      "fields": [
+        "state",
+        "cpu_sensor_found",
+        "emergency_threshold_c",
+        "release_threshold_c",
+        "coolant_limit_c",
+        "coolant_release_c"
+      ],
+      "must_be_read": [
+        "cpu_sensor_found",
+        "emergency_threshold_c",
+        "release_threshold_c",
+        "coolant_limit_c",
+        "coolant_release_c"
+      ],
+      "not_assertable": {
+        "state": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin."
+    },
+    {
+      "daemon": "FeatureFlags",
+      "gui": "FeatureFlags",
+      "endpoints": [
+        "GET /capabilities .features"
+      ],
+      "fields": [
+        "openfan_write_supported",
+        "hwmon_write_supported"
+      ],
+      "must_be_read": [
+        "openfan_write_supported",
+        "hwmon_write_supported"
+      ],
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin."
+    },
+    {
+      "daemon": "ControlCapability",
+      "gui": "ControlCapability",
+      "endpoints": [
+        "GET /capabilities .control"
+      ],
+      "fields": [
+        "profile_storage",
+        "curve_evaluation",
+        "manual_override",
+        "fan_identify",
+        "autonomous_control",
+        "min_supported_gui",
+        "openfan_rescan",
+        "profile_search_dir_remove",
+        "header_roles",
+        "pwm_characterization",
+        "pwm_behaviour_characterization",
+        "cooling_devices",
+        "validation_sessions",
+        "control_path_discovery",
+        "thermal_observation",
+        "validation_auto_stop",
+        "exit_floor",
+        "diagnostic_preflight",
+        "gpu_fan_verify",
+        "hardware_readiness",
+        "superio_port_probe",
+        "preferred_sensors",
+        "daemon_config_report",
+        "duty_reconciliation",
+        "stall_probe",
+        "openfan_calibration",
+        "canonical_chip_names",
+        "cooling_failure_detection",
+        "pwm_verification_records",
+        "header_role_no_fan",
+        "openfan_header_roles",
+        "cpu_fan_role_floor",
+        "openfan_firmware_maintenance",
+        "openfan_firmware_write",
+        "openfan_firmware_silent_update",
+        "curve_hysteresis"
+      ],
+      "must_be_read": [
+        "profile_storage",
+        "manual_override",
+        "fan_identify",
+        "autonomous_control",
+        "min_supported_gui",
+        "openfan_rescan",
+        "cooling_devices"
+      ],
+      "inert": {
+        "curve_evaluation": "advertised since daemon 1.19.0 and never gated on: control.autonomous_control is the GUI's control gate (DEC-165)",
+        "duty_reconciliation": "in the daemon_supports registry, but no GUI feature asks for it: the duty_corrections / duty_not_holding header fields it announces are optional and rendered by presence",
+        "diagnostic_preflight": "in the daemon_supports registry, but the GUI probes GET /diagnostics/preflight instead of gating on the flag (deliberate, justified at DaemonClient.diagnostic_preflight; P8-as) and names the feature only in its 404 wording"
+      },
+      "via_capability_registry": {
+        "profile_search_dir_remove": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "header_roles": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "pwm_characterization": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "pwm_behaviour_characterization": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "validation_sessions": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "control_path_discovery": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "thermal_observation": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "validation_auto_stop": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "exit_floor": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "gpu_fan_verify": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "hardware_readiness": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "superio_port_probe": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "preferred_sensors": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "daemon_config_report": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "stall_probe": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "openfan_calibration": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "canonical_chip_names": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "cooling_failure_detection": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "pwm_verification_records": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "header_role_no_fan": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "openfan_header_roles": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "cpu_fan_role_floor": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "openfan_firmware_maintenance": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "openfan_firmware_write": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "openfan_firmware_silent_update": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)",
+        "curve_hysteresis": "read through services/daemon_features.py::daemon_supports, keyed by the feature id DAEMON_FEATURE_CAPABILITY_FLAGS maps to this flag (checked by test_registry_flags_are_really_gated)"
+      },
+      "note": "Enrolled by the 2026-10-08 GUI-daemon interop audit, batch 7: the status half of /poll had no shared pin. This entry is also the cross-repo pin on capability flag names: every value in the GUI's DAEMON_FEATURE_CAPABILITY_FLAGS must be one of these fields (test_every_registry_flag_is_a_control_capability_field)."
+    }
+  ]
+}

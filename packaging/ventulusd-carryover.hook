@@ -1,0 +1,16 @@
+# Installed as /usr/share/libalpm/hooks/90-ventulusd-carryover.hook.
+#
+# The Ventulus rename: finish carrying a running Control-OFC daemon over to
+# ventulusd. ventulusd's post_install only records that the old daemon was in
+# use; this runs at the end of the transaction, after systemd has loaded the
+# new unit (the 30-systemd-* hooks sort first), and enables and starts it.
+# It does nothing on a machine that never ran control-ofc-daemon.
+[Trigger]
+Type = Package
+Operation = Install
+Target = ventulusd
+
+[Action]
+Description = Carrying the Control-OFC fan control service over to ventulusd...
+When = PostTransaction
+Exec = /usr/lib/ventulus/ventulusd-carryover

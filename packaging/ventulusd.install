@@ -1,0 +1,248 @@
+# The Ventulus rename (DEC-493). ventulusd replaces control-ofc-daemon 4.x; by
+# the time this runs, pacman has removed the old package -- its pre_remove
+# stopped and disabled control-ofc-daemon.service, and every config file the
+# user had edited was kept as *.pacsave. Bring those across, and note whether
+# the old daemon was in use so 90-ventulusd-carryover.hook can start ventulusd
+# once systemd has loaded its unit. /var/lib/control-ofc (header roles, the
+# active profile) is imported by ventulusd itself at its first start.
+
+# Point old directory names in a carried-over file at their new homes. Only
+# names the rename moved: a user's own udev link (/dev/control-ofc-controller)
+# still exists under its old name, so it is not touched.
+_ventulus_rewrite() {
+    sed -e 's#/usr/bin/control-ofc-daemon#/usr/bin/ventulusd#g' \
+        -e 's#/usr/bin/control-ofc-restore-auto#/usr/bin/ventulus-restore-auto#g' \
+        -e 's#/run/control-ofc/control-ofc\.sock#/run/ventulus/ventulus.sock#g' \
+        -e 's#/etc/control-ofc/#/etc/ventulus/#g' \
+        -e 's#/var/lib/control-ofc#/var/lib/ventulus#g' \
+        -e 's#/\.config/control-ofc/#/.config/ventulus/#g' \
+        -- "$1" > "$2"
+}
+
+# Copy $1 to $2. With $3 = replace, an edited file wins over the packaged
+# default, which is kept beside it as .pacnew; with keep, an existing $2 wins.
+_ventulus_carry_file() {
+    local src=$1 dst=$2 mode=$3
+    [[ -f $src ]] || return 0
+    if [[ -e $dst ]]; then
+        [[ $mode == replace ]] || return 0
+        mv -f -- "$dst" "$dst.pacnew"
+    fi
+    install -d -- "${dst%/*}"
+    if _ventulus_rewrite "$src" "$dst"; then
+        chmod --reference="$src" -- "$dst" 2>/dev/null
+        echo "   $src -> $dst"
+    else
+        echo "   could not copy $src -> $dst"
+    fi
+}
+
+# Was control-ofc-daemon running, or set to run, when this upgrade began?
+_ventulus_old_daemon_in_use() {
+    local unit=control-ofc-daemon.service
+    # Still running, or still enabled: the old pre_remove did not run.
+    systemctl is-active --quiet "$unit" 2>/dev/null && return 0
+    [[ -e /etc/systemd/system/multi-user.target.wants/$unit ]] && return 0
+    # The usual case: the old pre_remove stopped it moments ago.
+    journalctl --quiet --no-pager -o cat -u "$unit" --since=-10min 2>/dev/null |
+        grep -qE '^(Stopp|Deactivated)|: Deactivated successfully'
+}
+
+_ventulus_carry_over() {
+    local f name mode
+    # Anything Control-OFC could have left: a daemon never started has no
+    # /var/lib/control-ofc, and pacman removes /etc/control-ofc when nothing in
+    # it was edited, so the loose files are checked too.
+    [[ -d /etc/control-ofc || -d /var/lib/control-ofc ||
+       -d /etc/systemd/system/control-ofc-daemon.service.d ||
+       -f /etc/modules-load.d/control-ofc.conf.pacsave ||
+       -f /etc/modules-load.d/control-ofc.conf ||
+       -f /etc/modprobe.d/control-ofc-superio.conf ]] || return 0
+    echo ":: Carrying Control-OFC settings over to Ventulus:"
+    for f in /etc/control-ofc/daemon.toml.pacsave /etc/control-ofc/daemon.toml; do
+        if [[ -f $f ]]; then _ventulus_carry_file "$f" /etc/ventulus/daemon.toml replace; break; fi
+    done
+    for f in /etc/modules-load.d/control-ofc.conf.pacsave /etc/modules-load.d/control-ofc.conf; do
+        if [[ -f $f ]]; then _ventulus_carry_file "$f" /etc/modules-load.d/ventulus.conf replace; break; fi
+    done
+    for f in /etc/control-ofc/profiles/*.json /etc/control-ofc/profiles/*.json.pacsave; do
+        [[ -f $f ]] || continue
+        name=${f##*/}
+        mode=keep
+        if [[ $name == *.pacsave ]]; then name=${name%.pacsave}; mode=replace; fi
+        _ventulus_carry_file "$f" "/etc/ventulus/profiles/$name" "$mode"
+    done
+    # The Super-I/O guard's off switch is an empty file the user created.
+    _ventulus_carry_file /etc/modprobe.d/control-ofc-superio.conf \
+        /etc/modprobe.d/ventulus-superio.conf keep
+    for f in /etc/systemd/system/control-ofc-daemon.service.d/*.conf; do
+        _ventulus_carry_file "$f" "/etc/systemd/system/ventulusd.service.d/${f##*/}" keep
+    done
+    echo "   Header roles and the active profile come across from /var/lib/control-ofc"
+    echo "   when ventulusd first starts. The old files are left in place; remove"
+    echo "   /etc/control-ofc and /var/lib/control-ofc once you are satisfied."
+    if _ventulus_old_daemon_in_use; then
+        : > /run/ventulusd-carryover
+        echo "   The Control-OFC daemon was running: ventulusd is enabled and started"
+        echo "   at the end of this transaction."
+    fi
+}
+
+post_install() {
+    cat <<'EOF'
+:: ventulusd installed.
+
+   Start now:        sudo systemctl enable --now ventulusd
+   Load modules:     sudo systemctl restart systemd-modules-load   (or reboot)
+   Setup guide:      /usr/share/doc/ventulusd/USER_GUIDE.md
+   Command, files:   man ventulusd
+   Hardware check:   open the GUI -> Hardware page
+
+   System tray:      this package also installs ventulus-tray, a small
+                     StatusNotifierItem client for KDE Plasma. It starts at
+                     your next login and gives you profile switching and the
+                     running daemon version from the panel. It only starts
+                     where ventulus is installed, and it is purely a
+                     convenience -- fan control never depends on it.
+                     Disable it in System Settings -> Autostart.
+                     Details: man ventulus-tray
+
+   Fan-control prerequisites — if a motherboard header or GPU fan is
+   discovered but never responds, one of these is usually missing:
+     * Super I/O driver: motherboard headers need the matching chip driver
+                         (e.g. it87-dkms-git / nct6687d-dkms-git — see the
+                         package optdepends and USER_GUIDE.md, "Hardware
+                         sensor modules").
+     * ACPI conflict:    an it87 chip (Gigabyte; ASUS AM4) may need
+                         'options it87 ignore_resource_conflict=1' in
+                         /etc/modprobe.d/it87.conf to bind. The Nuvoton
+                         drivers have no such option: they need
+                         'acpi_enforce_resources=lax' on the kernel command
+                         line, which affects every driver, so use it only then.
+     * Gigabyte:         the package keeps nct6775/w83627ehf from probing
+                         (journalctl -b -t ventulus-superio-guard); an empty
+                         /etc/modprobe.d/ventulus-superio.conf turns that off.
+     * AMD RDNA3+ GPU:   PMFW fan curves need 'amdgpu.ppfeaturemask=0xffffffff'
+                         on the kernel command line.
+   The GUI's Hardware page (readiness + Super-I/O detection) detects each of
+   these and shows the exact driver + fix for your machine.
+
+   Advanced (optional): an OPT-IN active Super-I/O port probe can identify an
+   unbound chip whose driver you don't yet know. It is OFF by default and needs
+   CAP_SYS_RAWIO (~root-equivalent) — do not enable it unless you need it. See
+   /usr/share/doc/ventulusd/superio-port-probe.conf.example.
+
+   Advanced (optional): read-only NVIDIA telemetry via NVML is OFF by default
+   and EXPERIMENTAL (unverified on hardware). To try it, set
+   [detection] enable_nvidia_telemetry = true and copy the opt-in drop-in from
+   /usr/share/doc/ventulusd/nvidia-telemetry.conf.example to
+   /etc/systemd/system/ventulusd.service.d/nvidia-telemetry.conf (that
+   file lists the exact command). The open nouveau driver needs neither — its
+   GPU is read via hwmon automatically.
+
+   Optional: the OpenFAN firmware update works without any setup — you copy
+   the file onto the board's drive. To let the daemon write a published
+   OpenFAN release itself, and verify it, copy the opt-in drop-in from
+   /usr/share/doc/ventulusd/openfan-firmware-write.conf.example (that
+   file lists the exact command and what it grants).
+EOF
+    _ventulus_carry_over
+}
+
+post_upgrade() {
+    echo ":: Restart to apply changes:"
+    echo "   sudo systemctl restart ventulusd"
+    # DEC-387: the first upgrade onto the systemd watchdog. pacman reloads systemd
+    # at the END of the transaction, after this runs; from then on the new unit's
+    # WatchdogSec applies to the daemon that is ALREADY running, and that daemon
+    # predates it and sends no keep-alives — so systemd times it out and restarts
+    # it onto this version (gracefully: the watchdog sends SIGTERM, DEC-388).
+    # Detected by what systemd has loaded right now (a watchdog of 0), not by a
+    # version compare, so it fires exactly once whatever version the upgrade
+    # comes from. Said here so a one-off "Watchdog timeout" in the journal is not
+    # read as a crash.
+    if systemctl is-active --quiet ventulusd.service 2>/dev/null &&
+       [[ "$(systemctl show -p WatchdogUSec --value ventulusd.service 2>/dev/null)" == 0 ]]; then
+        echo ":: This version adds a systemd watchdog. When pacman reloads systemd at the"
+        echo "   end of this upgrade, the running daemon (which predates it) is stopped and"
+        echo "   restarted onto the new version automatically; the journal shows one"
+        echo "   'Watchdog timeout' for the old process. That is expected, and happens"
+        echo "   only on this upgrade."
+    fi
+    # The tray is a session process, not a systemd system service: an upgrade
+    # replaces the binary on disk but the running one keeps going until the
+    # user logs out. Say so, rather than leaving them wondering why a fixed bug
+    # is still present.
+    if [[ -x /usr/bin/ventulus-tray ]] && pgrep -x ventulus-tray >/dev/null 2>&1; then
+        echo ":: A ventulus-tray is running from the previous version. It will pick up"
+        echo "   this one at your next login, or immediately with:"
+        echo "   systemctl --user restart 'app-ventulus\\x2dtray@autostart.service'"
+    fi
+    if [[ -f /etc/systemd/system/ventulusd.service.d/superio-port-probe.conf ]]; then
+        echo ":: Opt-in Super-I/O port-probe drop-in detected — review it against the"
+        echo "   updated example in case the required directives changed:"
+        echo "   /usr/share/doc/ventulusd/superio-port-probe.conf.example"
+    fi
+    if [[ -f /etc/systemd/system/ventulusd.service.d/nvidia-telemetry.conf ]]; then
+        echo ":: Opt-in NVIDIA telemetry drop-in detected — review it against the"
+        echo "   updated example in case the required directives changed:"
+        echo "   /usr/share/doc/ventulusd/nvidia-telemetry.conf.example"
+    fi
+    if [[ -f /etc/systemd/system/ventulusd.service.d/openfan-firmware-write.conf ]]; then
+        echo ":: Opt-in OpenFAN firmware-write drop-in detected — review it against the"
+        echo "   updated example in case the required directives changed:"
+        echo "   /usr/share/doc/ventulusd/openfan-firmware-write.conf.example"
+    fi
+    # Only speak up once, on the upgrade that first brings the guard to every
+    # Gigabyte board (2.56.1, DEC-424), and only on a board that could be
+    # affected: a Gigabyte vendor with exactly one ITE chip visible. That is
+    # also the ordinary state of a single-chip board, so the wording is
+    # conditional, and it fires once rather than on every upgrade. The guard
+    # PREVENTS the latch from the next boot; it does NOT clear one already set.
+    # Without this the user restarts the daemon as told, sees no change, and has
+    # no pointer to the recovery except a journal line they may not read.
+    # The recovery is DEC-421's ladder; the old "look for DEVID=0x8883 in dmesg"
+    # check is gone, because the kernel logs that line at debug level only.
+    if [[ -n "${2-}" ]] && (( $(vercmp "$2" 2.56.1) < 0 )) &&
+       [[ -r /sys/class/dmi/id/board_vendor ]] &&
+       grep -qi gigabyte /sys/class/dmi/id/board_vendor 2>/dev/null &&
+       [[ $(ls -d /sys/class/hwmon/hwmon*/ 2>/dev/null |
+            xargs -r -I{} cat {}name 2>/dev/null |
+            grep -c '^it8') -eq 1 ]]; then
+        echo ":: This package now keeps nct6775/w83627ehf from probing on every Gigabyte"
+        echo "   board: their probe can hide a board's second Super-I/O chip. One ITE chip"
+        echo "   is visible here, which is normal on a single-chip board. If fan headers"
+        echo "   you expect are missing, the guard will not bring them back by itself:"
+        echo "   do not run sensors-detect (it probes the same way), reboot, and if they"
+        echo "   are still missing, shut down and switch off at the wall (PSU switch or"
+        echo "   unplug) -- the bridge that latches runs on standby power."
+        echo "   Full steps:"
+        echo "   https://github.com/Plan-B-Development/ventulus/blob/main/manual/hardware-troubleshooting.md"
+    fi
+}
+
+pre_remove() {
+    if systemctl is-active --quiet ventulusd.service; then
+        systemctl stop ventulusd.service
+    fi
+    if systemctl is-enabled --quiet ventulusd.service; then
+        systemctl disable ventulusd.service
+    fi
+}
+
+post_remove() {
+    echo ":: Configuration you edited is kept in /etc/ventulus/ as *.pacsave"
+    echo "   Remove manually if no longer needed."
+    echo ":: State data preserved in /var/lib/ventulus/ (includes runtime.toml,"
+    echo "   which holds your fan header roles). Remove manually if no longer needed."
+    if [[ -f /etc/systemd/system/ventulusd.service.d/superio-port-probe.conf ]]; then
+        echo ":: Opt-in Super-I/O port-probe drop-in left in place:"
+        echo "   /etc/systemd/system/ventulusd.service.d/superio-port-probe.conf"
+        echo "   Remove it manually (it was installed by hand, not by the package)."
+    fi
+    if [[ -f /etc/systemd/system/ventulusd.service.d/nvidia-telemetry.conf ]]; then
+        echo ":: Opt-in NVIDIA telemetry drop-in left in place:"
+        echo "   /etc/systemd/system/ventulusd.service.d/nvidia-telemetry.conf"
+        echo "   Remove it manually (it was installed by hand, not by the package)."
+    fi
+}

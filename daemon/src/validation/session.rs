@@ -1,0 +1,942 @@
+//! Validation-session data model (AIO-MB Phase 5).
+//!
+//! Pure data plus a handful of total constructors. Nothing here reads hardware,
+//! takes a lock, or performs I/O — the recorder samples, the store persists, the
+//! summariser derives, and this module only says what those three exchange.
+//!
+//! Every enum-ish value on the wire is a **stable lowercase token in a `String`**,
+//! not a Rust enum. That is the house convention (`CharacterizationRun::state`,
+//! `SkippedControl::reason`, `HeaderRole`): the client owns the wording, and an
+//! unrecognised token must be rendered rather than dropped, so a newer daemon can
+//! add one without a client update turning it into a blank cell.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+// ── Session lifecycle states (§2) ───────────────────────────────────────────
+
+/// No session has ever run in this process.
+pub const STATE_IDLE: &str = "idle";
+/// Sampling now.
+pub const STATE_RECORDING: &str = "recording";
+/// Finalised normally, summary computed.
+pub const STATE_COMPLETED: &str = "completed";
+/// Ended by the user. **Finalised like `COMPLETED`** — same summary, same
+/// samples, same persistence; this token records only that the operator ended
+/// the run deliberately rather than letting it finish (`P8-bc`). It said
+/// "before finalisation", which was wrong: `cancel()` goes through `finish()`.
+pub const STATE_CANCELLED: &str = "cancelled";
+/// Recording stopped without finalising and cannot be resumed — canonically a
+/// daemon restart. **Never fabricated telemetry for the gap** (§15).
+pub const STATE_INTERRUPTED: &str = "interrupted";
+/// The engine itself failed.
+pub const STATE_ERROR: &str = "error";
+
+// ── Result semantics (§7) ───────────────────────────────────────────────────
+//
+// `UNAVAILABLE` must never become `FAIL`: hardware that does not expose a
+// capability has not failed a test, it was never testable. Likewise absence of a
+// diagnostic is `NOT_TESTED`, never `PASS`.
+
+/// A meaningful criterion existed and was met.
+pub const RESULT_PASS: &str = "pass";
+/// A meaningful criterion existed and was not met.
+pub const RESULT_FAIL: &str = "fail";
+/// Happened, and is evidence rather than a verdict (§9's startup override).
+pub const RESULT_OBSERVED: &str = "observed";
+/// Watched for throughout the session and did not happen.
+pub const RESULT_NOT_OBSERVED: &str = "not_observed";
+/// The diagnostic that would decide this was not run.
+pub const RESULT_NOT_TESTED: &str = "not_tested";
+/// Ran, but the evidence does not settle the question.
+pub const RESULT_UNKNOWN: &str = "unknown";
+/// The hardware does not expose what this would need. **Not a failure.**
+pub const RESULT_UNAVAILABLE: &str = "unavailable";
+/// The session ended before this could be decided.
+pub const RESULT_INTERRUPTED: &str = "interrupted";
+
+// ── Session kinds (§8 / Phase 6 §11) ────────────────────────────────────────
+
+/// A full AIO validation run.
+pub const KIND_VALIDATION: &str = "validation";
+/// A startup/lifecycle recording — same engine, same wire type, different
+/// findings and a different Phase 6 preset. Two engines would be the duplication
+/// §17 forbids.
+pub const KIND_LIFECYCLE: &str = "lifecycle";
+/// A thermal observation (Batch 3a §2) — again the same engine, and again only
+/// the findings and the client preset differ.
+///
+/// **Capability-gated on the wire, unlike the two above.** `handlers::validation`
+/// falls back to [`KIND_VALIDATION`] for a kind it does not recognise, so an
+/// older daemon would accept a thermal request and silently record something
+/// else under a name the client would then misreport. `control.thermal_observation`
+/// is what lets a client know the difference.
+pub const KIND_THERMAL: &str = "thermal_observation";
+
+// ── Event markers (§5) ──────────────────────────────────────────────────────
+//
+// Only events Ventulus can genuinely observe. A cold boot and a physical
+// switch position are NOT here, deliberately — §5 forbids claiming them.
+
+pub const EV_SESSION_STARTED: &str = "session_started";
+pub const EV_SESSION_STOPPED: &str = "session_stopped";
+pub const EV_PROFILE_ACTIVATED: &str = "profile_activated";
+pub const EV_OVERRIDE_STARTED: &str = "manual_override_started";
+pub const EV_OVERRIDE_ENDED: &str = "manual_override_ended";
+pub const EV_THERMAL_ENTERED: &str = "thermal_failsafe_entered";
+pub const EV_THERMAL_CLEARED: &str = "thermal_failsafe_cleared";
+pub const EV_CONTROL_RECLAIMED: &str = "control_reclaimed";
+pub const EV_CONTROL_RESTORED: &str = "control_restored";
+pub const EV_SUSPEND: &str = "suspend";
+pub const EV_RESUME: &str = "resume";
+pub const EV_DAEMON_RESTART: &str = "daemon_restart_observed";
+pub const EV_CHAR_STARTED: &str = "characterization_started";
+pub const EV_CHAR_COMPLETED: &str = "characterization_completed";
+pub const EV_VERIFY_STARTED: &str = "verify_started";
+pub const EV_VERIFY_COMPLETED: &str = "verify_completed";
+pub const EV_DISCOVERY_STARTED: &str = "control_path_discovery_started";
+pub const EV_DISCOVERY_COMPLETED: &str = "control_path_discovery_completed";
+pub const EV_USER_MARKER: &str = "user_marker";
+pub const EV_SAMPLE_LIMIT: &str = "sample_limit_reached";
+
+// ── Orchestratable diagnostics (§6, scope Decision 3) ───────────────────────
+
+/// The Phase 3 PWM/RPM sweep. Reused verbatim — never reimplemented (§6).
+pub const DIAG_CHARACTERIZATION: &str = "pwm_characterization";
+/// The short write/readback verification.
+pub const DIAG_VERIFY: &str = "pwm_verify";
+/// The AIO Phase 8 Batch 1 PWM to tach control-path sweep. Reused verbatim from
+/// `api::discovery`, exactly as the characterisation run is — a session
+/// orchestrates diagnostics, it never reimplements one (§6).
+pub const DIAG_CONTROL_PATH: &str = "control_path_discovery";
+/// The AIO Phase 8 Batch 2 behaviour sweep (DEC-334): the same route and the
+/// same run slot as [`DIAG_CHARACTERIZATION`], with the bidirectional walk and
+/// the stability dwell enabled.
+///
+/// A **separate token** rather than a flag on the existing one so a session can
+/// ask for the basic sweep, the behaviour sweep, or neither, without a second
+/// request field the older daemon would ignore. Requesting both runs only the
+/// behaviour sweep — see `ordered_diagnostics`.
+pub const DIAG_BEHAVIOUR: &str = "pwm_behaviour_characterization";
+
+/// Every diagnostic a session knows how to run.
+///
+/// An array rather than a `matches!` arm list because two things now derive from
+/// it — the predicate below and the ingest bound in `normalise_diagnostics` — and
+/// a set with two definitions is a set that drifts.
+pub const KNOWN_DIAGNOSTICS: [&str; 4] = [
+    DIAG_CHARACTERIZATION,
+    DIAG_VERIFY,
+    DIAG_CONTROL_PATH,
+    DIAG_BEHAVIOUR,
+];
+
+/// Is this a diagnostic the session knows how to run?
+pub fn is_known_diagnostic(token: &str) -> bool {
+    KNOWN_DIAGNOSTICS.contains(&token)
+}
+
+/// Drop repeats from a requested-diagnostic list, keeping first-occurrence order.
+///
+/// **This is what bounds the list (`P8-s`), and the bound is `KNOWN_DIAGNOSTICS`
+/// rather than a number.** Each token was validated individually and the *count*
+/// was not, so `[DIAG_VERIFY; 320_000]` — comfortably inside the 4 MiB body limit
+/// — passed every check and was then copied verbatim into the persisted document.
+/// Two costs:
+///
+///   * `requested_diagnostics` is serialised into the session file, so ~400k
+///     repeats add ~7 MB to a document the store refuses to read past
+///     [`crate::constants::VALIDATION_MAX_SESSION_BYTES`] — and since DEC-320 an
+///     over-cap document is classified `TooLarge` and **deleted** by `prune`, so this
+///     is a way to destroy an operator's evidence rather than merely to waste disk.
+///     Unlike the reservation half of `P8-s` this one is reachable today: the
+///     worst-case document sits 444 KiB under the cap, and ~7 MB of repeats clears it;
+///   * every `ordered_diagnostics` call — one per member, twice in
+///     `spawn_orchestration` — runs a `.any()` scan per token over the whole
+///     list, so the repeats are re-walked `members x 4` times.
+///
+/// **What this is NOT.** An earlier draft of this comment claimed the unbounded
+/// list made the `evidence` array unbounded too. It did not, and
+/// the security review caught it: `ordered_diagnostics` pushes at most one
+/// entry per distinct diagnostic (each arm is a single `push` guarded by
+/// `.any()`), so evidence was already bounded at `sweep_members x 3` and still
+/// is. Recorded because a false rule is worse than none — someone would
+/// eventually weaken that collapse believing this function was the bound.
+///
+/// Deduplicating rather than rejecting: the set is closed and running the same
+/// diagnostic twice on the same member is not a thing a caller can want, so a
+/// `400` would refuse a harmless request. It is not silent either — the start
+/// response echoes `requested_diagnostics`, so a caller sees the list it got.
+///
+/// Post-condition, given every token has passed [`is_known_diagnostic`]: the
+/// result holds at most `KNOWN_DIAGNOSTICS.len()` entries. Deriving it from the
+/// set is the point — a fifth diagnostic raises the bound by construction, where
+/// a literal would have to be remembered.
+pub fn normalise_diagnostics(requested: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(requested.len().min(KNOWN_DIAGNOSTICS.len()));
+    for d in requested {
+        if !out.iter().any(|seen| seen == d) {
+            out.push(d.clone());
+        }
+    }
+    out
+}
+
+// ── Member roles within a session ───────────────────────────────────────────
+
+pub const MEMBER_PUMP: &str = "pump";
+pub const MEMBER_RADIATOR: &str = "radiator";
+pub const MEMBER_AUXILIARY: &str = "auxiliary";
+
+// ── Static session-start metadata (§1, §4) ──────────────────────────────────
+
+/// A member's role and safety posture, snapshotted once at session start.
+///
+/// `pump_protected` is the daemon's **union** predicate, not the display role
+/// (DEC-312): a header the user labelled `chassis_fan` that the hardware calls
+/// `PUMP` is still protected, and evidence that said otherwise would be a lie
+/// about what the daemon will refuse to do.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemberRoleSnapshot {
+    pub member_id: String,
+    pub label: String,
+    pub role: String,
+    pub member_kind: String,
+    pub pump_protected: bool,
+    #[serde(default)]
+    pub effective_min_pwm_pct: Option<u8>,
+    #[serde(default)]
+    pub stop_permitted: Option<bool>,
+    #[serde(default)]
+    pub writable: bool,
+}
+
+/// The compiled-in device policy in force for this session.
+///
+/// A snapshot, not a reference: the evidence must still be readable after the
+/// policy table changes in a later release. Carries `Deserialize` because it
+/// round-trips through the store — unlike `hwmon::device_policy::DevicePolicy`,
+/// which deliberately has none so that no payload can ever set a safety number.
+/// Nothing reads this struct back into a control decision; it is evidence only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DevicePolicySnapshot {
+    pub id: String,
+    pub display_name: String,
+    pub minimum_safe_pwm_pct: f64,
+    pub supports_stop: bool,
+    #[serde(default)]
+    pub startup_override_seconds: Option<u32>,
+    #[serde(default)]
+    pub expected_rpm_min: Option<u16>,
+    #[serde(default)]
+    pub expected_rpm_max: Option<u16>,
+    pub internal_control_possible: bool,
+}
+
+/// Everything about the session that is fixed at start (§4's static half).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionMetadata {
+    pub cooling_device_id: String,
+    pub device_name: String,
+    pub device_kind: String,
+    #[serde(default)]
+    pub pump_member: Option<String>,
+    #[serde(default)]
+    pub radiator_members: Vec<String>,
+    #[serde(default)]
+    pub auxiliary_members: Vec<String>,
+    #[serde(default)]
+    pub temperature_sensor: Option<String>,
+    #[serde(default)]
+    pub coolant_sensor: Option<String>,
+    /// `"available"` / `"unavailable"` — §1 is explicit that coolant telemetry is
+    /// NOT required, and a motherboard-PWM AIO on CPU temperature is a valid target.
+    pub coolant_telemetry: String,
+    pub device_policy: DevicePolicySnapshot,
+    #[serde(default)]
+    pub members: Vec<MemberRoleSnapshot>,
+    #[serde(default)]
+    pub active_profile_id: Option<String>,
+    #[serde(default)]
+    pub active_profile_name: Option<String>,
+    pub daemon_version: String,
+    /// Free-form user/test metadata (§11) — physical pump mode, workload name,
+    /// ambient notes. **Metadata only**: it never reaches a safety decision, and
+    /// the daemon does not claim to have detected any of it electronically.
+    #[serde(default)]
+    pub user_metadata: BTreeMap<String, String>,
+}
+
+// ── Sampled dynamic data (§3, §4's dynamic half) ────────────────────────────
+
+/// One member's telemetry at one instant.
+///
+/// `requested_pct` and `readback_pct` are deliberately separate — §3 lists them
+/// as separate columns and §10 classifies a device-side override from
+/// `command low + readback low + RPM high`. `None` on any field means "not
+/// known", never zero (§3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MemberSample {
+    pub member_id: String,
+    /// `pump` / `radiator` / `auxiliary` — identity is preserved per member and
+    /// never flattened into an invented aggregate (§3).
+    pub role: String,
+    #[serde(default)]
+    pub requested_pct: Option<u8>,
+    #[serde(default)]
+    pub readback_pct: Option<u8>,
+    #[serde(default)]
+    pub rpm: Option<u16>,
+    #[serde(default)]
+    pub pwm_enable_mode: Option<u8>,
+    #[serde(default)]
+    pub alarm: Option<bool>,
+    /// Cumulative BIOS/EC reclaim count for this header. Diffed between samples
+    /// to place a `control_reclaimed` marker; absolute value is evidence too.
+    #[serde(default)]
+    pub enable_revert_count: u64,
+    /// `daemon` when the daemon holds it in manual mode, `external` when
+    /// something else does, `unknown` when the driver does not say.
+    pub ownership: String,
+}
+
+pub const OWNERSHIP_DAEMON: &str = "daemon";
+pub const OWNERSHIP_EXTERNAL: &str = "external";
+pub const OWNERSHIP_UNKNOWN: &str = "unknown";
+
+/// One sampling tick.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationSample {
+    pub elapsed_ms: u64,
+    pub unix_ms: u64,
+    #[serde(default)]
+    pub temperature_c: Option<f64>,
+    #[serde(default)]
+    pub temperature_sensor: Option<String>,
+    #[serde(default)]
+    pub coolant_c: Option<f64>,
+    /// CPU package power in watts (Batch 3a §2).
+    ///
+    /// `None` means **not known**, never idle. Three separate causes produce it
+    /// and none of them is zero watts: the machine exposes no readable source
+    /// (measured: `k10temp` publishes no power attribute at all), this is the
+    /// first tick of a session whose source is a cumulative RAPL counter, or the
+    /// derived value failed the plausibility guard. See [`crate::hwmon::power`].
+    #[serde(default)]
+    pub package_power_w: Option<f64>,
+    /// GPU power in watts, where the GPU subsystem exposes it.
+    ///
+    /// Recorded because the GPU is a heat source inside the same case and a
+    /// thermal observation that ignores it cannot explain a coolant rise during
+    /// a mixed workload. It is **not** CPU package power and the two are never
+    /// summed here.
+    #[serde(default)]
+    pub gpu_power_w: Option<f64>,
+    /// `normal` / `emergency` / `no_sensor_fallback`. A session recorded before
+    /// DEC-386 removed the recovery rung can also hold `recovery`.
+    pub thermal_state: String,
+    pub members: Vec<MemberSample>,
+}
+
+/// The power value with the longest JSON rendering that a power field can hold.
+///
+/// `10 µJ / 900 000 µs` — 23 characters. Chosen by measurement over the
+/// achievable quotient space, not by inspection; see the note in
+/// [`probe_sample_bytes`] for why the obvious "largest value" guess is wrong.
+const WIDEST_POWER_SAMPLE: f64 = 10.0 / 900_000.0;
+
+// The probe value must be a reading a power field can actually hold — otherwise
+// the cap is padded rather than bounded, which is its own kind of wrong. Checked
+// at compile time rather than in a test: it is a property of two constants and
+// nothing at runtime can change it.
+const _: () = assert!(WIDEST_POWER_SAMPLE > 0.0);
+const _: () = assert!(WIDEST_POWER_SAMPLE <= crate::constants::POWER_MAX_PLAUSIBLE_W);
+
+/// The worst-case sample [`probe_sample_bytes`] measures, as a value.
+///
+/// Built to be a genuine upper bound rather than a typical case: every optional
+/// field is present, every integer sits at its widest decimal width, and the
+/// longest role and ownership tokens are used.
+///
+/// **Public because the byte-bound test must fill a session with the sample the
+/// probe actually measures, and `P8-ae` is what happens when it does not.** That
+/// test built its own fixture by hand — an 18-char power float against this
+/// function's 23, `enable_revert_count: 0` against `u64::MAX`, `"normal"`
+/// against `"no_sensor_fallback"` — leaving ~1.8 kB of slack per sample at 65
+/// members. The realised file therefore sat far under its budget whatever the
+/// probe said, so **any probe under-count smaller than that slack stayed green**,
+/// including the 10-byte power-rendering error that `WIDEST_POWER_SAMPLE` below
+/// exists to fix. One constructor, two callers, no drift: the fixture cannot
+/// stop being the worst case without this function stopping being it too.
+///
+/// **Every variable-length field is taken from the session itself, never
+/// assumed.** An earlier version used a 128-byte placeholder for
+/// `temperature_sensor` on the reasoning that no real sensor id is longer — but
+/// `recorder.rs` copies `metadata.temperature_sensor` into *every* sample, and
+/// that string is `preferred_sensor`/`fallback_sensor` from
+/// `POST /config/cooling-device`, which is client-supplied. A long one made the
+/// probe under-count without bound and reproduced `AUD3-i` exactly, inside its
+/// own fix. Caught by the security review. A guess is not a bound.
+pub fn worst_case_sample(session: &ValidationSession) -> ValidationSample {
+    let member_ids: Vec<String> = session
+        .metadata
+        .members
+        .iter()
+        .map(|m| m.member_id.clone())
+        .collect();
+    ValidationSample {
+        elapsed_ms: u64::MAX,
+        unix_ms: u64::MAX,
+        temperature_c: Some(-100.5),
+        // The session's own value, which is what every sample will carry.
+        temperature_sensor: session.metadata.temperature_sensor.clone(),
+        coolant_c: Some(-100.5),
+        // The widest value each power field can actually hold — MEASURED, not
+        // reasoned about (DEC-320).
+        //
+        // The first draft used `999.9999999999999` on the reasoning that the
+        // widest rendering must be a full-precision value just under
+        // `POWER_MAX_PLAUSIBLE_W`. That is 17 characters and it is **wrong**:
+        // the RAPL path computes `delta_uj as f64 / elapsed_us as f64`, an
+        // arbitrary quotient of two integers, and a small one such as
+        // `10 / 900_000` renders as `0.000011111111111111112` — **23**
+        // characters, six more per field per sample. Values below ~1e-5 switch
+        // to compact scientific notation, so this band is the true worst case
+        // and it is exactly where a near-idle or wrap-adjacent tick lands.
+        // Caught by the contract review; it is the same "measure the real
+        // value rather than assuming its ceiling" rule that DEC-320 exists for,
+        // missed in its own fix a second time.
+        //
+        // `WIDEST_POWER_SAMPLE` is pinned by `the_probe_covers_every_achievable_
+        // power_rendering`, which sweeps the achievable quotient space and
+        // asserts nothing serialises longer.
+        package_power_w: Some(WIDEST_POWER_SAMPLE),
+        gpu_power_w: Some(WIDEST_POWER_SAMPLE),
+        // The longest of the four thermal states, so the probe over-estimates.
+        thermal_state: "no_sensor_fallback".to_string(),
+        members: member_ids
+            .iter()
+            .map(|id| MemberSample {
+                member_id: id.clone(),
+                role: MEMBER_AUXILIARY.to_string(),
+                requested_pct: Some(u8::MAX),
+                readback_pct: Some(u8::MAX),
+                rpm: Some(u16::MAX),
+                pwm_enable_mode: Some(u8::MAX),
+                alarm: Some(false),
+                enable_revert_count: u64::MAX,
+                ownership: OWNERSHIP_EXTERNAL.to_string(),
+            })
+            .collect(),
+    }
+}
+
+/// Worst-case serialised bytes for one sample of `session`, measured from
+/// [`worst_case_sample`].
+fn probe_sample_bytes(session: &ValidationSession) -> usize {
+    let probe = worst_case_sample(session);
+    // Measured as the MARGINAL cost of one sample inside a `samples` field, not
+    // as a standalone value. Two reasons, both of which would otherwise
+    // under-count and so reintroduce the very defect this bounds:
+    //   * `store::save_to` uses `to_vec_pretty`, and pretty-printing is ~45% of
+    //     the cost, so a compact estimate is not the thing being bounded;
+    //   * a sample nested under `samples` sits two levels deep, so every one of
+    //     its ~40 lines carries four more spaces than it would standalone.
+    // Taking the difference between a one-element and an empty `samples` field
+    // captures the indentation, the separator and the brackets exactly, with no
+    // fudge factor to drift.
+    #[derive(serde::Serialize)]
+    struct SamplesField<'a> {
+        samples: &'a [ValidationSample],
+    }
+    let empty = serde_json::to_vec_pretty(&SamplesField { samples: &[] })
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let one = serde_json::to_vec_pretty(&SamplesField {
+        samples: std::slice::from_ref(&probe),
+    })
+    .map(|v| v.len())
+    // A serialisation failure must shrink the cap, never remove it.
+    .unwrap_or(usize::MAX / 2);
+    one.saturating_sub(empty)
+}
+
+/// How many samples `session` may hold within `budget_bytes`.
+///
+/// **This is what bounds the persisted document (`AUD3-i`).**
+/// [`crate::constants::VALIDATION_MAX_SAMPLES`] bounds the sample *count*, which
+/// is not the same thing: a sample carries one entry per cooling-device member,
+/// so the byte count scales with the topology and a three-member cooler reached
+/// 7.8 MiB against a 4 MiB read cap. Dividing a byte budget by the measured
+/// worst-case sample cost bounds the file directly, whatever the topology.
+///
+/// Never returns 0 — a pathological topology records one sample rather than
+/// finalising before its first tick — and never exceeds the hard sample cap, so
+/// the documented two-hour ceiling still holds for every realistic device.
+pub fn max_samples_for(session: &ValidationSession, budget_bytes: usize) -> usize {
+    let per = probe_sample_bytes(session).max(1);
+    (budget_bytes / per).clamp(1, crate::constants::VALIDATION_MAX_SAMPLES)
+}
+
+/// A point on the session timeline (§5). Phase 6 places these as chart markers.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationEvent {
+    pub elapsed_ms: u64,
+    pub unix_ms: u64,
+    pub kind: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub member_id: Option<String>,
+}
+
+// ── Referenced diagnostics (§6) ─────────────────────────────────────────────
+
+/// The outcome of one orchestrated diagnostic, carried by reference.
+///
+/// §6: a session is an orchestrator/evidence collector, **not** a second copy of
+/// each diagnostic algorithm. The Phase 3 run is attached verbatim, so
+/// `possible_device_override` and every verdict on it are the ones Phase 3
+/// computed — this module recalculates none of them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EvidenceRef {
+    pub kind: String,
+    pub member_id: String,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub started_unix_ms: u64,
+    #[serde(default)]
+    pub completed_unix_ms: Option<u64>,
+    /// A result token — how the *orchestration* went, not a verdict on the
+    /// hardware. A diagnostic the slot refused is `unavailable`, and that never
+    /// becomes a `fail` (§7).
+    pub outcome: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// The Phase 3 run, verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub characterization: Option<crate::api::characterization::CharacterizationRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify: Option<VerifyEvidence>,
+    /// The AIO Phase 8 Batch 1 discovery run, verbatim. Same rule as
+    /// `characterization` above: every verdict on it — relationship, confidence,
+    /// measurement resolution — is the one `api::discovery::summarise` computed,
+    /// recalculated nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_path: Option<crate::api::discovery::ControlPathRun>,
+}
+
+impl EvidenceRef {
+    /// `P8-br`: bound every daemon-formatted `detail` in this entry at the same
+    /// constant the client's text fields are bounded by at ingest.
+    ///
+    /// **This is the largest unbounded ancillary text in the document — not the
+    /// last of it.** Events and measurements are capped by
+    /// `VALIDATION_MAX_TEXT_FIELD_BYTES` at ingest, member ids by
+    /// `MAX_DEVICE_TEXT_BYTES` (`P8-bs`), and the evidence array's *length* by
+    /// the orchestration walk — but a `detail` is prose the daemon `format!`s,
+    /// and nothing capped it. That matters because a document which outgrows
+    /// `VALIDATION_MAX_ANCILLARY_BYTES` is not truncated but DELETED: `prune`
+    /// reclaims what it cannot read (DEC-320). `findings[].detail` and
+    /// `startup_fingerprints[].interpretation` are the same class and are still
+    /// unclamped — see `P8-ce` and the honest-limits note on
+    /// [`crate::constants::VALIDATION_MAX_ANCILLARY_BYTES`].
+    ///
+    /// Applied at the ONE point an entry enters a session
+    /// ([`crate::validation::recorder::ValidationEngine::attach_evidence_for`])
+    /// rather than at each of the ~15 `SweepOutcome` construction sites, so a
+    /// diagnostic added later is bounded without its author knowing this rule
+    /// exists. Only `detail` is touched: `member_id` is already bounded at
+    /// ingest, and `kind`/`outcome`/`run_id` are daemon tokens pinned at 64
+    /// bytes by `no_daemon_token_exceeds_the_evidence_allowance`.
+    pub fn clamp_detail(&mut self) {
+        let cap = crate::constants::VALIDATION_MAX_TEXT_FIELD_BYTES;
+        for d in [
+            self.detail.as_mut(),
+            self.characterization
+                .as_mut()
+                .and_then(|c| c.detail.as_mut()),
+            self.control_path.as_mut().and_then(|c| c.detail.as_mut()),
+            self.verify.as_mut().and_then(|v| v.detail.as_mut()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            crate::text::truncate(d, cap);
+        }
+    }
+}
+
+/// The result of a PWM write/readback verification, flattened for evidence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VerifyEvidence {
+    pub header_id: String,
+    pub write_ok: bool,
+    #[serde(default)]
+    pub readback_pct: Option<u8>,
+    #[serde(default)]
+    pub requested_pct: Option<u8>,
+    #[serde(default)]
+    pub rpm_before: Option<u16>,
+    #[serde(default)]
+    pub rpm_after: Option<u16>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// DEC-405 (`PTR-e`). Verify's own `result` token — `effective`,
+    /// `no_rpm_effect`, … — exactly as the verify handler returned it. `None` for
+    /// a refused verify (no body to read it from) and for evidence recorded by a
+    /// daemon before 2.52.0, which never stored it.
+    #[serde(default)]
+    pub result: Option<String>,
+    /// DEC-405. The verify's restore-to-original write failed, so the header
+    /// was left at the test duty.
+    #[serde(default)]
+    pub restore_failed: bool,
+}
+
+// ── External measurements (§14) ─────────────────────────────────────────────
+
+/// An externally measured observation — a meter reading, typed in by a person.
+///
+/// **Explicitly untrusted and read by nothing.** §14: these are not daemon
+/// control/safety inputs. The daemon stores and returns them; no code path
+/// consults one, and none may be added.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExternalMeasurement {
+    pub unix_ms: u64,
+    pub kind: String,
+    pub value: f64,
+    pub unit: String,
+    #[serde(default)]
+    pub member_id: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+// ── Summary (§8) ────────────────────────────────────────────────────────────
+
+/// One line of the compatibility/evidence summary.
+///
+/// `id` is a stable token and the **client owns the wording** (§8, §16): Phase 6
+/// renders "PWM header control" from `pwm_header_control` and recalculates no
+/// backend meaning. An unrecognised id must be rendered, not dropped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationFinding {
+    pub id: String,
+    pub state: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub member_id: Option<String>,
+    #[serde(default)]
+    pub evidence_kind: Option<String>,
+}
+
+// Finding ids — §8's list, one token each.
+pub const F_PWM_HEADER_CONTROL: &str = "pwm_header_control";
+pub const F_PWM_READBACK: &str = "pwm_readback";
+pub const F_PUMP_RPM: &str = "pump_rpm_telemetry";
+pub const F_RADIATOR_RPM: &str = "radiator_rpm_telemetry";
+pub const F_PWM_RESPONSE: &str = "pwm_response_characterization";
+pub const F_RESPONSE_LATENCY: &str = "response_latency";
+/// AIO Phase 8 Batch 2 §2. Observational: `§2` lists six legitimate explanations
+/// for hysteresis and forbids treating it as a fault.
+pub const F_HYSTERESIS: &str = "pwm_hysteresis";
+/// §4. Observational: `§4` forbids inferring cavitation or electrical failure
+/// from tach variability alone.
+pub const F_RPM_STABILITY: &str = "rpm_stability";
+/// §3. The band over which PWM actually moves reported RPM.
+pub const F_EFFECTIVE_RANGE: &str = "effective_control_range";
+/// §6. Whether this run agreed with what previous runs learned. Never a fault:
+/// `§6` requires cautious wording and forbids labelling unexpected RPM as
+/// hardware failure.
+pub const F_LEARNED_RANGE: &str = "learned_response_range";
+pub const F_STARTUP_BEHAVIOUR: &str = "startup_lifecycle_behaviour";
+pub const F_PWM_RPM_DIVERGENCE: &str = "pwm_rpm_divergence";
+pub const F_DEVICE_OVERRIDE: &str = "possible_device_override";
+pub const F_BIOS_RECLAIM: &str = "bios_ec_control_reclaim";
+pub const F_THERMAL_SAFETY: &str = "thermal_safety";
+pub const F_CONTROL_RESTORATION: &str = "control_restoration";
+pub const F_COOLANT_TELEMETRY: &str = "coolant_telemetry";
+/// AIO Phase 8 Batch 1: which tach channel(s) this header actually drives.
+pub const F_CONTROL_PATH: &str = "control_path_mapping";
+/// AIO Phase 8 Batch 3a §3: whether the observation reached thermal equilibrium.
+///
+/// Observational like every other finding here. "Not established" is a statement
+/// about the *observation*, never about the hardware — a run that was stopped
+/// early and a cooler that genuinely cannot stabilise produce the same token,
+/// and this finding does not claim to tell them apart.
+pub const F_STEADY_STATE: &str = "thermal_steady_state";
+pub const F_DAEMON_RESTART_RECOVERY: &str = "daemon_restart_recovery";
+
+// ── The session itself ──────────────────────────────────────────────────────
+
+/// A complete validation session — static metadata, sampled telemetry, the event
+/// timeline, referenced diagnostics, and the derived summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationSession {
+    pub session_id: String,
+    pub kind: String,
+    pub state: String,
+    pub started_unix_ms: u64,
+    #[serde(default)]
+    pub completed_unix_ms: Option<u64>,
+    pub metadata: SessionMetadata,
+    /// Which diagnostics the caller asked for at start. Empty is legitimate —
+    /// a passive recording session — and yields `not_tested`, never `pass` (§7).
+    #[serde(default)]
+    pub requested_diagnostics: Vec<String>,
+    /// Which members those diagnostics sweep. Defaults to the pump member.
+    #[serde(default)]
+    pub sweep_members: Vec<String>,
+    #[serde(default)]
+    pub samples: Vec<ValidationSample>,
+    #[serde(default)]
+    pub events: Vec<ValidationEvent>,
+    #[serde(default)]
+    pub evidence: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub external_measurements: Vec<ExternalMeasurement>,
+    #[serde(default)]
+    pub findings: Vec<ValidationFinding>,
+    /// Recording stopped because the sample cap was reached, not because the
+    /// user stopped it. Cap-and-stop, never a ring: evicting the oldest samples
+    /// would discard the startup evidence §9 exists to capture.
+    #[serde(default)]
+    pub sample_limit_reached: bool,
+    #[serde(default)]
+    pub interrupted_reason: Option<String>,
+    /// The last sample actually recorded before an interruption. Telemetry is
+    /// **never fabricated** for the gap after it (§15).
+    #[serde(default)]
+    pub truncated_at_unix_ms: Option<u64>,
+    /// This session was opened by the daemon at startup, not by an operator
+    /// (Batch 3a §1, `[startup] record_startup`).
+    ///
+    /// Two behaviours hang off it, and both exist to keep a background recording
+    /// from costing an operator anything: `ValidationEngine::start` **pre-empts**
+    /// an auto-record rather than refusing the operator's session, and
+    /// `store::prune` retains auto-records in their own slot so a boot loop
+    /// cannot evict hand-made sessions.
+    #[serde(default)]
+    pub auto_started: bool,
+    /// This session finalises itself when its orchestrated diagnostics finish
+    /// (`P8-az`), because the caller asked it to at start.
+    ///
+    /// **Echoed so the client renders the daemon's answer, not its own request
+    /// memory.** A GUI that remembers what it asked for cannot tell an accepted
+    /// request from one an older daemon parsed and dropped — `serde` ignores an
+    /// unknown field rather than rejecting it, so the pre-`P8-az` daemon returns
+    /// `200` for a request carrying this flag and then records for the full two
+    /// hours. `control.validation_auto_stop` is what a client gates the OFFER on;
+    /// this field is what it renders once a session exists.
+    ///
+    /// Never true without at least one requested diagnostic — the start handler
+    /// rejects that combination.
+    #[serde(default)]
+    pub stop_when_diagnostics_complete: bool,
+    /// Per-member startup behaviour (Batch 3a §1). Empty when nothing was
+    /// derivable — never a row of zeroes.
+    #[serde(default)]
+    pub startup_fingerprints: Vec<StartupFingerprint>,
+    /// Steady-state analysis of the control temperature (Batch 3a §3).
+    ///
+    /// `None` when the session recorded no temperature at all. A session that
+    /// recorded temperature but did not settle carries a result whose verdict is
+    /// `not_established` — which is a finding, not an absence.
+    #[serde(default)]
+    pub steady_state: Option<crate::api::stats::SteadyState>,
+}
+
+/// What one member's fans did in the moments after control was established
+/// (Batch 3a §1).
+///
+/// **Observational, always.** §1 is explicit: *"do not diagnose startup high RPM
+/// as failed PWM control when command/readback remain valid"*. A device that
+/// spins its fans to maximum for fifty seconds at power-on and then obeys the
+/// duty is a device behaving as designed, and the interpretation field says so
+/// rather than leaving a client to guess from a large number.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StartupFingerprint {
+    pub member_id: String,
+    pub role: String,
+    /// True when RPM began materially above where it settled.
+    pub override_observed: bool,
+    /// How long RPM stayed above the settled band.
+    #[serde(default)]
+    pub override_duration_ms: Option<u64>,
+    /// Highest RPM seen during the override.
+    #[serde(default)]
+    pub peak_rpm: Option<u16>,
+    /// The duty **commanded** while the override was in progress. Paired with
+    /// `readback_pct_during` because §1's whole point is that these two agreeing
+    /// is what rules out a control fault.
+    #[serde(default)]
+    pub requested_pct_during: Option<u8>,
+    #[serde(default)]
+    pub readback_pct_during: Option<u8>,
+    /// Where RPM settled once the override ended.
+    #[serde(default)]
+    pub post_override_rpm: Option<u16>,
+    /// Time from the peak to the first in-band reading.
+    #[serde(default)]
+    pub transition_ms: Option<u64>,
+    /// A stable token; the client owns the wording and must render an
+    /// unrecognised one rather than dropping it.
+    pub interpretation: String,
+}
+
+/// The override ended and the commanded duty was honoured throughout — a device
+/// startup behaviour, explicitly **not** a control fault (§1).
+pub const STARTUP_DEVICE_OVERRIDE: &str = "device_startup_override";
+/// RPM started high and never came down to a band consistent with the duty
+/// within the recording. Still observational: the recording may simply have been
+/// too short, which is why this does not say "stuck".
+pub const STARTUP_UNRESOLVED: &str = "override_did_not_resolve";
+/// No elevated startup period was seen at all.
+pub const STARTUP_NONE_OBSERVED: &str = "no_override_observed";
+/// The duty and its readback disagreed during the elevated period, so the
+/// elevated RPM cannot be attributed to a device override. **This still is not a
+/// failure verdict** — it says the evidence does not support the benign reading,
+/// which is a different claim from asserting a fault.
+pub const STARTUP_COMMAND_MISMATCH: &str = "command_readback_mismatch";
+
+impl ValidationSession {
+    /// Is this session still sampling?
+    pub fn is_recording(&self) -> bool {
+        self.state == STATE_RECORDING
+    }
+
+    /// Has it reached a state from which it will not sample again?
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state.as_str(),
+            STATE_COMPLETED | STATE_CANCELLED | STATE_INTERRUPTED | STATE_ERROR
+        )
+    }
+
+    /// Wall-clock milliseconds since start, from the last sample or event.
+    pub fn elapsed_ms(&self) -> u64 {
+        let last_sample = self.samples.last().map(|s| s.elapsed_ms).unwrap_or(0);
+        let last_event = self.events.last().map(|e| e.elapsed_ms).unwrap_or(0);
+        last_sample.max(last_event)
+    }
+}
+
+/// Milliseconds since the unix epoch. Saturates rather than panicking on a clock
+/// before 1970 — the same posture as `HistoryRing::record`.
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Session ids are `val-<unix_ms>-<seq>`: sortable, unique within a process, and
+/// safe as a filename component without escaping.
+pub fn next_session_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::SeqCst);
+    format!("val-{}-{}", unix_ms(), n)
+}
+
+/// Is this string safe to use as a session-file basename?
+///
+/// The store never interpolates a caller-supplied id into a path without this —
+/// `..` or a `/` would escape the session directory. Mirrors
+/// `profile_store::is_safe_profile_id`.
+pub fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins [`WIDEST_POWER_SAMPLE`] against the values a power field can
+    /// actually hold (DEC-320, the contract review).
+    ///
+    /// The probe's whole job is to be an upper bound, and the first draft was
+    /// not one: it assumed the widest rendering was a full-precision value just
+    /// under `POWER_MAX_PLAUSIBLE_W` (17 chars) when a small quotient renders in
+    /// 23. This sweeps the achievable space — `delta_uj / elapsed_us` for both
+    /// integers — and asserts nothing serialises longer than the constant.
+    ///
+    /// Asserts the **realised serialisation**, not a re-derivation of the
+    /// reasoning that produced the constant: a test that re-argued "the biggest
+    /// number is the longest" would share the original blind spot exactly.
+    #[test]
+    fn the_probe_covers_every_achievable_power_rendering() {
+        let widest = serde_json::to_string(&Some(WIDEST_POWER_SAMPLE))
+            .unwrap()
+            .len();
+
+        let mut worst = (0usize, String::new(), 0u64, 0u64);
+        for elapsed_us in [
+            1u64,
+            3,
+            7,
+            97,
+            999,
+            1_000,
+            65_537,
+            500_000,
+            900_000,
+            1_000_000,
+            1_048_576,
+            60_000_000,
+            3_600_000_000,
+        ] {
+            for delta_uj in [
+                1u64,
+                2,
+                3,
+                7,
+                10,
+                97,
+                999,
+                1_000,
+                65_537,
+                999_983,
+                123_456_789,
+                999_999_999,
+                7_200_000_000,
+            ] {
+                let w = delta_uj as f64 / elapsed_us as f64;
+                if !(w.is_finite() && w <= crate::constants::POWER_MAX_PLAUSIBLE_W) {
+                    continue;
+                }
+                let len = serde_json::to_string(&Some(w)).unwrap().len();
+                if len > worst.0 {
+                    worst = (
+                        len,
+                        serde_json::to_string(&Some(w)).unwrap(),
+                        delta_uj,
+                        elapsed_us,
+                    );
+                }
+            }
+        }
+
+        assert!(
+            worst.0 > 0,
+            "precondition: the sweep must actually have produced a plausible value"
+        );
+        assert!(
+            worst.0 <= widest,
+            "the probe under-counts a power field by {} bytes: {} ({} uJ / {} us) renders in {} \
+             chars, the probe assumes {}",
+            worst.0 - widest,
+            worst.1,
+            worst.2,
+            worst.3,
+            worst.0,
+            widest
+        );
+    }
+}

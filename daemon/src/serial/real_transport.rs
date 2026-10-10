@@ -1,0 +1,228 @@
+//! Real serial port transport using the `serialport` crate.
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::time::Duration;
+
+use crate::constants;
+use crate::error::SerialError;
+use crate::serial::transport::SerialTransport;
+
+/// Real serial transport backed by the `serialport` crate.
+pub struct RealSerialTransport {
+    reader: BufReader<Box<dyn serialport::SerialPort>>,
+    writer: Box<dyn serialport::SerialPort>,
+    /// Configured timeout — stored for accurate error reporting.
+    timeout: Duration,
+}
+
+/// Allowed serial port path prefixes. Paths not matching any of these are
+/// rejected to prevent accidentally opening arbitrary device nodes.
+const ALLOWED_SERIAL_PREFIXES: &[&str] = &[
+    "/dev/ttyS",
+    "/dev/ttyUSB",
+    "/dev/ttyACM",
+    "/dev/ttyAMA",
+    "/dev/serial/",
+];
+
+/// Check whether a serial port path starts with an allowed prefix.
+///
+/// Also rejects paths containing traversal components (`..`) or null bytes
+/// to prevent CWE-22 path traversal even if the prefix matches.
+///
+/// `pub` so `POST /config/serial-port` validates against this exact list rather
+/// than its own looser `/dev/` test — two copies of a security check drift, and
+/// the API's copy accepted paths (`/dev/shm/...`) that `open()` then rejected.
+pub fn is_allowed_serial_path(path: &str) -> bool {
+    if path.contains("..") || path.contains('\0') {
+        return false;
+    }
+    ALLOWED_SERIAL_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+impl RealSerialTransport {
+    /// Open a serial port at the given path.
+    pub fn open(path: &str, timeout: Duration) -> Result<Self, SerialError> {
+        if !is_allowed_serial_path(path) {
+            return Err(SerialError::Protocol {
+                message: format!(
+                    "serial path '{path}' does not match any allowed prefix ({ALLOWED_SERIAL_PREFIXES:?})"
+                ),
+            });
+        }
+
+        let port = serialport::new(path, constants::SERIAL_BAUD_RATE)
+            .timeout(timeout)
+            .open()
+            .map_err(|e| SerialError::Protocol {
+                message: format!("failed to open serial port '{path}': {e}"),
+            })?;
+
+        let reader = BufReader::new(port.try_clone().map_err(|e| SerialError::Protocol {
+            message: format!("failed to clone serial port: {e}"),
+        })?);
+
+        Ok(Self {
+            reader,
+            writer: port,
+            timeout,
+        })
+    }
+}
+
+impl SerialTransport for RealSerialTransport {
+    fn write_line(&mut self, data: &str) -> Result<(), SerialError> {
+        self.writer
+            .write_all(data.as_bytes())
+            .map_err(|e| SerialError::Protocol {
+                message: format!("serial write failed: {e}"),
+            })?;
+        self.writer.flush().map_err(|e| SerialError::Protocol {
+            message: format!("serial flush failed: {e}"),
+        })?;
+        Ok(())
+    }
+
+    fn read_line(&mut self, _timeout: Duration) -> Result<String, SerialError> {
+        use std::io::Read;
+        let mut line = String::new();
+        let timeout_ms = self.timeout.as_millis() as u64;
+        let n = self
+            .reader
+            .by_ref()
+            .take(constants::MAX_SERIAL_LINE_BYTES)
+            .read_line(&mut line)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::TimedOut => SerialError::Timeout { timeout_ms },
+                _ => SerialError::Protocol {
+                    message: format!("serial read failed: {e}"),
+                },
+            })?;
+
+        if n == 0 {
+            return Err(SerialError::Timeout { timeout_ms });
+        }
+
+        Ok(line)
+    }
+
+    /// `tcflush(TCOFLUSH)`. On `cdc-acm` that reaches `acm_tty_flush_buffer`,
+    /// which unlinks the write URBs a controller that is not reading leaves
+    /// pending, so the close that follows is not held for `closing_wait`. The
+    /// reader is a `dup` of this descriptor — one open file description — so one
+    /// flush covers both.
+    fn discard_pending_output(&mut self) {
+        if let Err(e) = self.writer.clear(serialport::ClearBuffer::Output) {
+            log::debug!("openfan: could not discard pending output before closing: {e}");
+        }
+    }
+
+    /// `tcsetattr` to 1200 baud (DEC-481). `cdc-acm` sends SET_LINE_CODING when
+    /// the line coding changes, and the OpenFan firmware's line-coding callback
+    /// answers a 1200 baud rate by rebooting into the USB bootloader — present
+    /// in the 2023 build and the 2026 source alike. The port closes when `self`
+    /// drops; queued output is discarded first, so the close does not wait on a
+    /// board that has already left the bus.
+    fn touch_1200_baud(mut self: Box<Self>) -> Result<(), SerialError> {
+        self.discard_pending_output();
+        self.writer
+            .set_baud_rate(1200)
+            .map_err(|e| SerialError::Protocol {
+                message: format!("could not switch the line to 1200 baud: {e}"),
+            })
+    }
+}
+
+/// List candidate serial ports without opening any `ttyACM`/`ttyUSB` (DEC-291).
+///
+/// This enumerates; identifying is `first_openfan_port`'s job, and identifying
+/// means `open(2)`, which asserts DTR and resets Arduino-class boards. It is the
+/// only candidate source since `DC-ae` retired `auto_detect_port`, the opening
+/// detector the reconnect probe used to call.
+///
+/// The rescan endpoint's cooldown exists to ration exactly that reset. It could
+/// not, because the candidate list it compares was built by `auto_detect_port` —
+/// so every refused rescan had already reset the board before the refusal was
+/// decided, and the handler's own comment asserted the opposite. Enumeration is a
+/// libudev/sysfs read plus `Path::exists`.
+///
+/// **Precisely what "opens nothing" means here**, because the over-broad version
+/// of this claim is what caused the defect: `available_ports()` does open the
+/// devnode of any tty whose parent driver is `serial8250`, before this function's
+/// `ttyACM`/`ttyUSB` filter ever runs. No candidate this function *returns* is
+/// opened, which is what the cooldown needs; but do not restate this as "touches
+/// no hardware". The shipped unit blocks those opens anyway
+/// (`DeviceAllow=char-ttyACM/ttyUSB`), so they are reachable only in a dev or
+/// container run.
+pub fn enumerate_serial_candidates() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match serialport::available_ports() {
+        Ok(ports) => out.extend(
+            ports
+                .into_iter()
+                .filter(|p| p.port_name.contains("ttyACM") || p.port_name.contains("ttyUSB"))
+                .map(|p| p.port_name),
+        ),
+        Err(e) => {
+            log::warn!("serialport::available_ports() failed: {e} — falling back to path scan");
+        }
+    }
+    // A path scan beside libudev, because it works without libudev:
+    // `available_ports()` can return `Ok(vec![])` where the nodes exist.
+    // `exists()` stats; it does not open.
+    for prefix in &["/dev/ttyACM", "/dev/ttyUSB"] {
+        for i in constants::SERIAL_PROBE_RANGE {
+            let path = format!("{prefix}{i}");
+            if Path::new(&path).exists() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowed_serial_paths() {
+        assert!(is_allowed_serial_path("/dev/ttyACM0"));
+        assert!(is_allowed_serial_path("/dev/ttyUSB0"));
+        assert!(is_allowed_serial_path("/dev/ttyS0"));
+        assert!(is_allowed_serial_path("/dev/ttyAMA0"));
+        assert!(is_allowed_serial_path("/dev/serial/by-id/usb-foo"));
+    }
+
+    #[test]
+    fn disallowed_serial_paths() {
+        assert!(!is_allowed_serial_path("/dev/sda1"));
+        assert!(!is_allowed_serial_path("/etc/passwd"));
+        assert!(!is_allowed_serial_path("/dev/null"));
+        assert!(!is_allowed_serial_path("ttyACM0")); // no leading /dev/
+        assert!(!is_allowed_serial_path(""));
+        // Path traversal attempts
+        assert!(!is_allowed_serial_path("/dev/ttyACM0/../sda1"));
+        assert!(!is_allowed_serial_path("/dev/ttyUSB0/../../etc/passwd"));
+        assert!(!is_allowed_serial_path("/dev/ttyACM0\0"));
+    }
+
+    #[test]
+    fn open_rejects_invalid_path_prefix() {
+        let result = RealSerialTransport::open("/etc/passwd", Duration::from_millis(100));
+        assert!(result.is_err());
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("does not match any allowed prefix"),
+                    "unexpected error: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected error for disallowed path"),
+        }
+    }
+}

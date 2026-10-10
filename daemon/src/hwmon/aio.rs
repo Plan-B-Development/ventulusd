@@ -1,0 +1,291 @@
+//! Liquid-cooling (AIO / custom-loop) device recognition — the single source
+//! of truth shared by coolant-sensor classification (`discovery.rs`), the
+//! `is_aio` PWM-header flag (`pwm_discovery.rs`), and the dynamic `aio_hwmon`
+//! capability (`api`).
+//!
+//! Scope is **hwmon-only** — the daemon never shells out to `liquidctl` or
+//! opens USB-HID, so USB-only coolers are detected-but-uncontrollable and stay
+//! out of scope. Classifying a sensor as coolant **is** a safety input since
+//! DEC-443 (`TS-f`): the hottest fresh `CoolantTemp` reading drives the coolant
+//! emergency at `safety.coolant_limit_c` (`safety.rs`, `profile_engine`). A sensor
+//! this module does not recognise as coolant is therefore also one that cannot
+//! trigger it.
+//!
+//! Per-driver pump writability is **not** second-guessed here. The kernel hwmon
+//! ABI exposes a writable (`0644`) `pwmN` only for genuinely controllable
+//! channels, so the existing file-permission `is_writable` check is already
+//! truthful per-channel — verified against the mainline drivers:
+//!   - `nzxt-kraken3`: `pwm1` (pump) `0644`; `pwm2` (fan) `0644` on Z-series/2023.
+//!   - `aquacomputer_d5next`: on the **D5 Next, `pwm1` is the PUMP duty and
+//!     `pwm2` the fan, both `0644`** (`d5next_ctrl_fan_offsets[] = { 0x97, 0x42 }
+//!     /* Pump and fan speed */`, since v6.0 / 09e893092e00). This comment said
+//!     "fan `pwm`" only until 2026-09-24 (DEC-421). The pump is still protected:
+//!     `roles::classify_header_role` maps channel 1 of a `LIQUID_COOLER_CHIPS`
+//!     chip to `Pump`. Octo (pwm1–8), Quadro and Aquaero (pwm1–4) are writable
+//!     fan controllers; flow/leak/farbwerk devices expose no pwm.
+//!   - `corsair-cpro`, `nzxt-smart2`: fan `pwm` `0644`.
+//!   - `nzxt-kraken2`: **no** `pwm` attribute → monitor-only by absence.
+//!
+//! Chip strings below are the kernel hwmon **device** `name`s (NOT module
+//! names) — verified in `drivers/hwmon/{nzxt-kraken3,nzxt-kraken2,
+//! aquacomputer_d5next}.c`:
+//!   - NZXT Kraken3 driver → `x53`, `z53`, `kraken2023`, `kraken2023elite`,
+//!     `kraken2024elite` (kernel 7.3+; same `KRAKEN2023` kind, DEC-423)
+//!   - NZXT Kraken2 driver → `kraken2`
+//!   - Aquacomputer family → `d5next`, `highflownext`, `leakshield`, …
+
+/// hwmon `name` strings for liquid coolers / pumps. Drives the `is_aio` header
+/// flag and `aio_hwmon.present`. Fan/RGB controllers (`corsaircpro`,
+/// `nzxtsmart2`, `octo`, `quadro`, `aquaero`, `farbwerk*`) are deliberately
+/// excluded — they are not liquid coolers, so flagging them would be untruthful.
+const LIQUID_COOLER_CHIPS: &[&str] = &[
+    // NZXT Kraken (nzxt-kraken3 + nzxt-kraken2 drivers).
+    "x53",
+    "z53",
+    "kraken2023",
+    "kraken2023elite",
+    // DEC-423 (`BRD-c`): the Kraken 2024 Elite, added to mainline in 7.3. Its
+    // pump was already protected by its "Pump speed" label; what this adds is
+    // `is_aio`, `aio_hwmon`, the radiator-fan channel's cooler floor, and its
+    // chip-mapped role (channel 2 was `unknown`).
+    "kraken2024elite",
+    "kraken2",
+    // Aquacomputer liquid devices (aquacomputer_d5next driver) that report a
+    // coolant temperature: pump (D5 Next), inline flow meter, leak shield.
+    "d5next",
+    "highflownext",
+    "leakshield",
+];
+
+/// Chips whose temperature channel is **unambiguously** the coolant temp, so a
+/// coolant sensor can be classified from the chip name alone. NZXT Kraken
+/// devices expose a single `temp1` = coolant. Aquacomputer devices expose
+/// **multiple labelled** temp channels (coolant, external probes, …), so they
+/// are intentionally absent here — their coolant channel classifies via the
+/// label hint (the driver labels it "Coolant temp"), avoiding false positives
+/// on external probes.
+const COOLANT_TEMP_CHIPS: &[&str] = &[
+    "x53",
+    "z53",
+    "kraken2023",
+    "kraken2023elite",
+    "kraken2024elite",
+    "kraken2",
+];
+
+/// hwmon `name` strings the **`nzxt-kraken3`** driver registers — the subset of
+/// [`LIQUID_COOLER_CHIPS`] that driver owns (`kraken2` is a different driver, with
+/// no `pwm*_enable` at all).
+///
+/// [SAFETY] DEC-382. Named on its own because one rule keys on the DRIVER, not on
+/// "is a cooler": `nzxt-kraken3`'s `pwm_enable=2` uploads the channel's curve
+/// buffer, which `devm_kzalloc` zeroes at probe and nothing but a userspace curve
+/// write ever fills. Writing `2` back to a Kraken therefore puts the pump on a 0 %
+/// curve, so `hwmon::handback` never hands one back that way.
+///
+/// `kraken2024elite` (USB 1e71:3012) was added here from mainline `kraken3_probe`
+/// (DEC-382 review), where it maps to the same `KRAKEN2023` kind and therefore the
+/// same zeroed buffer. It was missing from this file's other two lists until
+/// DEC-423 (`BRD-c`).
+const NZXT_KRAKEN3_CHIPS: &[&str] = &[
+    "x53",
+    "z53",
+    "kraken2023",
+    "kraken2023elite",
+    "kraken2024elite",
+];
+
+/// True when `chip_name` is a device driven by the `nzxt-kraken3` driver
+/// (case-insensitive exact match against [`NZXT_KRAKEN3_CHIPS`]).
+pub fn is_nzxt_kraken3_chip(chip_name: &str) -> bool {
+    let lower = chip_name.to_lowercase();
+    NZXT_KRAKEN3_CHIPS.contains(&lower.as_str())
+}
+
+/// Coolant-temperature label keywords (case-insensitive substring match). A
+/// lower-confidence fallback so a coolant channel on any chip — or an unlisted
+/// cooler — still classifies when the vendor labels it (covers Aquacomputer
+/// "Coolant temp" and ASUS-EC `asusec`'s `Water_In`/`Water_Out`/`Water_Block_In`/
+/// `Water_Block_Out`).
+const COOLANT_LABEL_HINTS: &[&str] = &["coolant", "water", "liquid"];
+
+/// True when `chip_name` is a known hwmon liquid cooler (case-insensitive
+/// exact match against [`LIQUID_COOLER_CHIPS`]).
+pub fn is_liquid_cooler_chip(chip_name: &str) -> bool {
+    let lower = chip_name.to_lowercase();
+    LIQUID_COOLER_CHIPS.contains(&lower.as_str())
+}
+
+/// True when a temperature sensor should classify as coolant — either its chip
+/// is a single-coolant-temp cooler (Kraken) or its label names a coolant.
+pub fn is_coolant_sensor(chip_name: &str, label: &str) -> bool {
+    let lower_chip = chip_name.to_lowercase();
+    if COOLANT_TEMP_CHIPS.contains(&lower_chip.as_str()) {
+        return true;
+    }
+    let lower_label = label.to_lowercase();
+    COOLANT_LABEL_HINTS
+        .iter()
+        .any(|hint| lower_label.contains(hint))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kraken_chips_are_liquid_coolers() {
+        for chip in [
+            "x53",
+            "z53",
+            "kraken2023",
+            "kraken2023elite",
+            "kraken2024elite",
+            "kraken2",
+        ] {
+            assert!(is_liquid_cooler_chip(chip), "{chip} should be a cooler");
+        }
+    }
+
+    /// DEC-423 (`BRD-c`): the Kraken 2024 Elite's temp channel is its coolant, by
+    /// chip — not only through the "Coolant temp" label, which an unlabelled read
+    /// would not have.
+    #[test]
+    fn the_kraken_2024_elite_coolant_classifies_by_chip() {
+        assert!(is_coolant_sensor("kraken2024elite", "temp1"));
+        assert!(is_coolant_sensor("KRAKEN2024ELITE", ""));
+        // Opposite branch: an unlabelled channel on a non-cooler chip is not.
+        assert!(!is_coolant_sensor("it8696", "temp1"));
+    }
+
+    /// DEC-382: the hand-back's Kraken rule keys on the DRIVER. `kraken2` is a
+    /// cooler too but a different driver with no `pwm*_enable`, so it must not
+    /// match; the opposite arm is what a stuck predicate would fail.
+    #[test]
+    fn only_nzxt_kraken3_devices_match_the_kraken3_predicate() {
+        for chip in [
+            "x53",
+            "z53",
+            "kraken2023",
+            "kraken2023elite",
+            "kraken2024elite",
+            "KRAKEN2023",
+        ] {
+            assert!(
+                is_nzxt_kraken3_chip(chip),
+                "{chip} is an nzxt-kraken3 device"
+            );
+        }
+        for chip in ["kraken2", "d5next", "it8696", "nct6798", ""] {
+            assert!(
+                !is_nzxt_kraken3_chip(chip),
+                "{chip} is not an nzxt-kraken3 device"
+            );
+        }
+    }
+
+    /// `BRD-r`: the cross-stack oracle's `is_aio` equality (asserted here in
+    /// `roles.rs` and in the GUI's parity test) only pins a chip the oracle
+    /// names. Require a vector for every chip on this list, so a chip added here
+    /// and not to the GUI's mirror cannot pass both repos unseen.
+    #[test]
+    fn every_cooler_chip_has_a_header_role_oracle_vector() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/header_role_classification.json"
+        );
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read header role fixture: {e}"));
+        let vectors: serde_json::Value =
+            serde_json::from_str(&text).expect("parse header role fixture");
+        let named: std::collections::BTreeSet<String> = vectors["cases"]
+            .as_array()
+            .expect("cases array")
+            .iter()
+            .map(|c| c["chip_name"].as_str().unwrap().to_lowercase())
+            .collect();
+        assert!(
+            !LIQUID_COOLER_CHIPS.is_empty(),
+            "an empty list passes vacuously"
+        );
+        let missing: Vec<&str> = LIQUID_COOLER_CHIPS
+            .iter()
+            .copied()
+            .filter(|chip| !named.contains(*chip))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "cooler chips with no vector in header_role_classification.json: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn aquacomputer_liquid_devices_are_coolers() {
+        for chip in ["d5next", "highflownext", "leakshield"] {
+            assert!(is_liquid_cooler_chip(chip), "{chip} should be a cooler");
+        }
+    }
+
+    #[test]
+    fn fan_controllers_are_not_coolers() {
+        // Truthfulness: a fan/RGB hub is not a liquid cooler.
+        for chip in [
+            "corsaircpro",
+            "nzxtsmart2",
+            "octo",
+            "quadro",
+            "aquaero",
+            "farbwerk",
+            "it8696",
+            "nct6798",
+            "k10temp",
+        ] {
+            assert!(!is_liquid_cooler_chip(chip), "{chip} is not a cooler");
+        }
+    }
+
+    #[test]
+    fn cooler_match_is_case_insensitive() {
+        assert!(is_liquid_cooler_chip("Z53"));
+        assert!(is_liquid_cooler_chip("Kraken2023"));
+    }
+
+    #[test]
+    fn kraken_temp_classifies_coolant_from_chip() {
+        // Kraken exposes a single temp1 = coolant; chip name alone is enough.
+        assert!(is_coolant_sensor("z53", "temp1"));
+        assert!(is_coolant_sensor("kraken2", ""));
+    }
+
+    #[test]
+    fn coolant_label_classifies_on_any_chip() {
+        assert!(is_coolant_sensor("d5next", "Coolant temp"));
+        // `DC-cg`: the labels `asusec` actually publishes, plus a spaced form —
+        // the `water` hint is a substring match, so the spelling does not matter.
+        for label in [
+            "Water_In",
+            "Water_Out",
+            "Water_Block_In",
+            "Water_Block_Out",
+            "Water In",
+        ] {
+            assert!(is_coolant_sensor("asusec", label), "{label}");
+        }
+        assert!(is_coolant_sensor("nct6798", "Liquid"));
+    }
+
+    #[test]
+    fn aquacomputer_external_probe_is_not_coolant() {
+        // d5next is a cooler for is_aio, but an unlabelled/external probe must
+        // NOT be force-classified as coolant — only its labelled coolant channel.
+        assert!(!is_coolant_sensor("d5next", "External sensor 1"));
+        assert!(!is_coolant_sensor("quadro", "Sensor 3"));
+    }
+
+    #[test]
+    fn ordinary_sensors_are_not_coolant() {
+        assert!(!is_coolant_sensor("k10temp", "Tctl"));
+        assert!(!is_coolant_sensor("it8696", "temp1"));
+        assert!(!is_coolant_sensor("amdgpu", "edge"));
+    }
+}

@@ -1,0 +1,1181 @@
+//! The validation-session engine (§2, §4, §5).
+//!
+//! # A pure observer of state that already exists
+//!
+//! The recorder plants **no hooks** in the profile engine, the PWM write path, or
+//! any handler.
+//!
+//! **It performed zero sysfs I/O until DEC-335, and that claim is now RETRACTED.**
+//! Batch 3a samples CPU package and GPU power, which are sysfs reads. The
+//! invariant that actually holds — and the one the safety argument below now
+//! rests on — is narrower and still structural: every read here is **read-only**,
+//! and none of it happens **under the session slot guard**. `tick` samples power
+//! before the guard is taken, exactly as the controller read already was.
+//!
+//! That narrowed form was itself untrue at `start` until DEC-342 (`P8-v`), which
+//! is worth stating because it is the shape the bug takes here: `start` did no
+//! sysfs I/O of its own, but it cleared the power sampler **under the slot
+//! guard**, and `tick` holds that same mutex across its reads. A wedged read
+//! therefore stalled `start` beneath the guard without either function
+//! containing a blocking call in the wrong place. `start` no longer touches the
+//! sampler at all — it is keyed by session id — so the invariant now holds at
+//! every entry point, and a blocking sysfs read cannot stall a start or stop
+//! request.
+//!
+//! Once per second it reads the
+//! `StateCache` snapshot the poll loop already fills, plus four cheap handles
+//! ([`RecorderContext`]), and derives every §5 event marker by **diffing
+//! consecutive observations**.
+//!
+//! That shape is what satisfies §15's "do not destabilise existing control
+//! behaviour merely to integrate validation logging" *structurally* rather than
+//! by care: there is no code path by which a fault in this module can perturb a
+//! control decision, and a panic here cannot take down the sensor feed.
+//!
+//! # What it is NOT
+//!
+//! It is not a second PWM owner (§2). Where a session orchestrates a diagnostic,
+//! it invokes the **existing** Phase 3 characterisation or PWM verify, which
+//! already own the hwmon lease, the pump floor clamp, the thermal guard and
+//! restore-on-drop. The engine attaches the result as evidence (§6). It never
+//! writes a duty itself, and there is deliberately no code here that could.
+
+use super::session::*;
+use super::{store, summary};
+use crate::constants;
+use crate::control_override::OverrideTable;
+use crate::health::cache::StateCache;
+use crate::hwmon::power::PowerSampler;
+use crate::hwmon::pwm_control::HwmonPwmController;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// The handles the recorder reads. Deliberately not `AppState`: the engine needs
+/// four things, and taking only those keeps it constructible in a unit test.
+#[derive(Clone)]
+pub struct RecorderContext {
+    pub cache: Arc<StateCache>,
+    pub hwmon_controller: Option<Arc<Mutex<HwmonPwmController>>>,
+    pub override_table: Arc<Mutex<OverrideTable>>,
+    pub characterization: crate::api::characterization::RunSlot,
+    /// Sysfs roots for power discovery (DEC-335). Fields rather than constants
+    /// so a test can point them at a fixture tree; see `SessionPower::discover`.
+    pub hwmon_root: PathBuf,
+    pub powercap_root: PathBuf,
+}
+
+impl RecorderContext {
+    /// The real sysfs roots. Every production caller uses this.
+    pub fn sysfs_roots() -> (PathBuf, PathBuf) {
+        (
+            PathBuf::from(crate::hwmon::HWMON_SYSFS_ROOT),
+            PathBuf::from(crate::hwmon::power::POWERCAP_ROOT),
+        )
+    }
+}
+
+/// Baselines the event derivation diffs against.
+///
+/// Seeded at session **start**, not at engine construction — otherwise the first
+/// tick of every session would emit a spurious event for each signal whose value
+/// happened to differ from the process-start default.
+#[derive(Default)]
+struct Watch {
+    profile_epoch: u64,
+    resume_generation: u64,
+    thermal_state: Option<String>,
+    overrides: HashSet<String>,
+    enable_reverts: HashMap<String, u64>,
+    enable_modes: HashMap<String, u8>,
+    char_run: Option<(String, String)>,
+    ticks_since_flush: u32,
+}
+
+/// Why a session could not be started.
+#[derive(Debug, PartialEq)]
+pub enum StartError {
+    /// One session at a time (§2).
+    AlreadyRecording,
+    /// No such cooling device.
+    UnknownDevice(String),
+    /// A `sweep_members` entry is not a member of the named device.
+    NotAMember(String),
+    /// An unrecognised diagnostic token.
+    UnknownDiagnostic(String),
+    /// A bound was exceeded.
+    TooMany(String),
+    /// The request is internally inconsistent: one field asks for behaviour
+    /// that nothing else in the same request can deliver. Distinct from
+    /// `TooMany`, which is a bound — this one is a contradiction, and both
+    /// render as `400 validation_error`.
+    Unsatisfiable(String),
+    /// The session could not be persisted.
+    Persistence(String),
+    /// An OpenFan firmware update owns the controller (DEC-481).
+    OpenFanMaintenance,
+}
+
+/// What became of a client's marker or measurement (§5, §14).
+///
+/// Three outcomes, because the handler owes the client three different answers
+/// (`DC-m`). With a `bool`, a marker dropped at the event cap answered
+/// `200 {"recorded": true}`, and a measurement refused at its cap answered
+/// "no validation session is recording" while one was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendOutcome {
+    /// Appended.
+    Recorded,
+    /// No session, or the current one has stopped recording.
+    NotRecording,
+    /// The session is recording but already holds `limit` entries of this
+    /// kind, so nothing was appended.
+    Full { limit: usize },
+}
+
+/// Flush to disk every this many ticks. Flushing every tick would rewrite the
+/// whole document once a second; flushing only at the end would lose the whole
+/// recording to a crash. On an interruption the file simply ends at the last
+/// flush — samples are lost, never invented (§15).
+///
+/// **Volume, corrected 2026-09-04 (`AUD3-i`).** This said a capped session is
+/// "~1 MB" and derived "~240 writes averaging ~0.5 MB, or ~120 MB spread across
+/// two hours (~17 KB/s)". The input was wrong by up to an order of magnitude, so
+/// the conclusion was too: a capped session is 3.6 MiB at one member and 7.8 MiB
+/// at three, which makes the real figure **~240 writes averaging ~3.9 MiB, or
+/// ~940 MiB across two hours (~133 KB/s)** for a three-member cooler, and ~1.4 GB
+/// at the `VALIDATION_MAX_SAMPLE_BYTES` ceiling. Each flush rewrites the whole
+/// document, so the total is quadratic in session length.
+///
+/// That is still bounded and it is still why the interval is 30 s and not 1 s —
+/// but "bounded and unremarkable" was a judgement made against 120 MB, and it has
+/// not been re-made against 1 GB. Recorded as `AUD3-x` rather than changed here:
+/// altering the cadence trades crash-loss against write volume and is a design
+/// decision, not a correction.
+const FLUSH_EVERY_TICKS: u32 = 30;
+
+/// How long a tick will wait for the hwmon controller before giving up on the
+/// commanded duties for that sample. Short by design — see the lock-order note
+/// in `tick`; the recorder must never queue behind a wedged sysfs write.
+const CONTROLLER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The eight scalars `/status` and `/poll` need, kept separately from the session.
+///
+/// The poll is the GUI's hottest path and runs once a second. Reading these from
+/// the session itself meant cloning every sample and event to produce them —
+/// order 10^5 allocations for a full two-hour session, growing linearly as it
+/// ran, **while holding the lock the recorder tick needs**. This struct is small,
+/// fixed-size, and lives behind its own mutex that is never held across anything.
+#[derive(Debug, Clone, Default)]
+pub struct LiveSummary {
+    pub session_id: String,
+    pub kind: String,
+    pub state: String,
+    pub elapsed_ms: u64,
+    pub sample_count: usize,
+    pub event_count: usize,
+    pub sample_limit_reached: bool,
+    pub cooling_device_id: String,
+}
+
+/// Holds at most one session and derives its timeline.
+pub struct ValidationEngine {
+    slot: Mutex<Option<ValidationSession>>,
+    watch: Mutex<Watch>,
+    /// The poll surface. Separate lock, tiny payload — see [`LiveSummary`].
+    live: Mutex<Option<LiveSummary>>,
+    /// The session's member ids, cached at start.
+    ///
+    /// They are fixed for a session's life, and caching them is what lets `tick`
+    /// acquire the hwmon controller lock **before** the session lock rather than
+    /// while holding it. See the lock-order note on `tick`.
+    member_ids: Mutex<Vec<String>>,
+    /// Serialises persistence — for **ordering**, not for corruption.
+    ///
+    /// The periodic flush and the finaliser both clone under the slot lock,
+    /// release it, and then write, so without this they reach
+    /// `atomic_io::write_atomic` concurrently. A flush that started first could
+    /// then rename its stale `recording` copy over a `completed` one, which the
+    /// next boot sweep would "repair" to `interrupted` despite a clean stop.
+    /// That hazard is real and is why this lock stays.
+    ///
+    /// **The other half of this comment is RETRACTED (AUD3-b).** It used to say
+    /// the helper opens a **fixed** `{path}.tmp` with `File::create`, so two
+    /// writers truncate each other and can publish a hybrid document. That was
+    /// true, and it was true of the four call sites that had *no* such lock —
+    /// which is why the hazard was moved into `atomic_io::tmp_path_for`, where
+    /// every caller gets a uniquely named scratch file and none has to know.
+    /// Do not re-derive a private save lock elsewhere for that reason.
+    save_lock: Mutex<()>,
+    /// The session's effective sample cap, derived at start from its topology.
+    ///
+    /// `VALIDATION_MAX_SAMPLES` bounds the sample COUNT; this bounds the
+    /// persisted document's SIZE, which is not the same thing once a sample
+    /// carries one entry per cooling-device member (`AUD3-i`). Cached for the
+    /// same reason `member_ids` is: it is fixed for the session's life and
+    /// deriving it costs a serialisation, which has no business running per tick.
+    max_samples: Mutex<usize>,
+    /// Power telemetry for the current session (Batch 3a §2).
+    ///
+    /// `None` means **not yet resolved**: discovery is a sysfs directory walk,
+    /// and `start` is reached from an axum handler on the async runtime while
+    /// `tick` already runs off it (`AUD3-n`). Resolving lazily on the first tick
+    /// keeps the blocking read where the other blocking reads already are, which
+    /// is the distinction `P8-b` is about.
+    ///
+    /// [LOCK ORDER] **Keyed by session id, and `start` never touches this
+    /// mutex** (`P8-v`). `start` used to clear it to `None` — under the slot
+    /// guard, because that is where the rest of its installation happens. But
+    /// `tick` holds this same mutex across blocking sysfs I/O (the discovery
+    /// walk, then an `energy_uj` read and an amdgpu `power1_average` read every
+    /// tick), so a read wedged on the SMU lock during a GPU reset stalled
+    /// `start` *underneath the slot guard* — and every `slot` reader with it:
+    /// `GET /validation/session`, `recording_session_id()`, `stop_if()` and the
+    /// shutdown flush, all non-cancellable `parking_lot` acquisitions.
+    ///
+    /// Carrying the id instead is what lets `start` leave the mutex alone
+    /// entirely: `tick` compares the stored id against the recording session's
+    /// and rediscovers on a mismatch, which resets the RAPL baseline exactly
+    /// where the clear used to. That reset is not optional — carrying a sampler
+    /// over would charge the whole idle gap between two sessions to the second
+    /// session's first sample, which is why `try_lock`-and-skip on the clear was
+    /// rejected as the fix: under the very contention it exists to survive, it
+    /// would silently publish that inflated first wattage.
+    power: Mutex<Option<SessionPower>>,
+}
+
+/// Close `session` out in place: stamp the terminal state and derive everything
+/// that is computed once, at the end.
+///
+/// Extracted (DEC-335) because there are now **two** callers — `finish`, and
+/// `start`'s pre-emption of an auto-record — and a second hand-written copy of
+/// this sequence would be free to drift. The order matters and is the reason it
+/// is one function: `derive_analysis` writes the §1 fingerprint and the §3
+/// steady-state result, and two of the findings `summarise` produces read them.
+///
+/// Takes no lock and performs no I/O. The caller holds the slot guard and owns
+/// persistence, which is what lets `start` finalise a superseded session while
+/// installing its replacement under the same guard.
+fn finalise_in_place(session: &mut ValidationSession, state: &str, reason: Option<String>) {
+    let now = unix_ms();
+    session.events.push(ValidationEvent {
+        elapsed_ms: now.saturating_sub(session.started_unix_ms),
+        unix_ms: now,
+        kind: EV_SESSION_STOPPED.to_string(),
+        detail: reason.clone(),
+        member_id: None,
+    });
+    session.state = state.to_string();
+    session.completed_unix_ms = Some(now);
+    session.interrupted_reason = reason;
+    summary::derive_analysis(session);
+    // Nothing downstream recalculates backend meaning (§16).
+    session.findings = summary::summarise(session);
+}
+
+/// Per-session power sources, resolved together on the first tick.
+struct SessionPower {
+    /// The session these sources belong to.
+    ///
+    /// The cache key, not decoration: `tick` rediscovers whenever this differs
+    /// from the recording session's id, which is what gives each session a fresh
+    /// RAPL baseline without `start` ever taking this mutex (`P8-v`).
+    session_id: String,
+    /// CPU package power. Stateful — a RAPL wattage is a difference between
+    /// two ticks.
+    package: PowerSampler,
+    /// The primary GPU's hwmon directory, or `None` when there is no AMD GPU.
+    ///
+    /// A path rather than a sampler because GPU power is already a rate: there
+    /// is nothing to difference and so nothing to keep. Read through
+    /// `gpu_detect::read_gpu_power_w`, never through the hwmon walk.
+    gpu_hwmon: Option<PathBuf>,
+}
+
+impl SessionPower {
+    /// Resolve both sources from the roots the context names.
+    ///
+    /// The roots come from [`RecorderContext`] rather than from the constants
+    /// directly, so a test can point them at a `tempfile::tempdir()`. Without
+    /// that seam every `engine.tick()` test walks the host's real `/sys` — which
+    /// `hwmon/power.rs` was explicitly built to avoid, and which this project's
+    /// rule against hardware-dependent tests forbids. Found by
+    /// the concurrency review.
+    fn discover(ctx: &RecorderContext, session_id: String) -> Self {
+        Self {
+            session_id,
+            package: PowerSampler::discover(&ctx.hwmon_root, &ctx.powercap_root),
+            gpu_hwmon: crate::hwmon::gpu_detect::detect_amd_gpus(&ctx.hwmon_root)
+                .first()
+                .map(|g| g.hwmon_path.clone()),
+        }
+    }
+}
+
+impl Default for ValidationEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ValidationEngine {
+    pub fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            watch: Mutex::new(Watch::default()),
+            live: Mutex::new(None),
+            member_ids: Mutex::new(Vec::new()),
+            save_lock: Mutex::new(()),
+            max_samples: Mutex::new(constants::VALIDATION_MAX_SAMPLES),
+            power: Mutex::new(None),
+        }
+    }
+
+    /// The current or most recent session, in full. Clones every sample — use
+    /// [`live_summary`](Self::live_summary) for anything on the poll path.
+    pub fn snapshot(&self) -> Option<ValidationSession> {
+        self.slot.lock().clone()
+    }
+
+    /// The eight scalars for `/status` + `/poll`. Cheap, fixed-size, and behind
+    /// its own lock, so a poll never contends with a recorder tick.
+    pub fn live_summary(&self) -> Option<LiveSummary> {
+        self.live.lock().clone()
+    }
+
+    fn refresh_live(&self, session: &ValidationSession) {
+        *self.live.lock() = Some(LiveSummary {
+            session_id: session.session_id.clone(),
+            kind: session.kind.clone(),
+            state: session.state.clone(),
+            elapsed_ms: session.elapsed_ms(),
+            sample_count: session.samples.len(),
+            event_count: session.events.len(),
+            sample_limit_reached: session.sample_limit_reached,
+            cooling_device_id: session.metadata.cooling_device_id.clone(),
+        });
+    }
+
+    /// Write a session to disk, serialised against every other writer.
+    ///
+    /// The re-read inside the lock is the load-bearing part: a periodic flush
+    /// clones a `recording` copy, releases the slot, and may only reach this
+    /// point after a concurrent `stop()` has already written `completed`.
+    /// Publishing the stale copy would resurrect a finished session as
+    /// `recording`, and the next boot sweep would then mark a cleanly-stopped
+    /// session `interrupted` and discard its findings.
+    fn persist(&self, session: &ValidationSession) {
+        let _guard = self.save_lock.lock();
+        if !session.is_terminal() {
+            // Drop the write unless the slot STILL HOLDS this exact session in a
+            // non-terminal state.
+            //
+            // The test used to be "the slot holds this id AND it is terminal",
+            // which was correct while `stop()` was the only finaliser: it leaves
+            // the finalised session installed, so a late flush could always see
+            // it. DEC-335's pre-emption removes the superseded session from the
+            // slot entirely, and the old test then passed a stale `recording`
+            // document straight through — republishing it over the `completed`
+            // one, so the next boot's `sweep_interrupted` would mark a cleanly
+            // superseded session `interrupted` and discard its findings.
+            //
+            // Every non-terminal writer only ever writes the session it believes
+            // is installed, so "not installed" and "installed but finalised" are
+            // both reasons to drop. Found by the concurrency review.
+            let still_ours = self
+                .slot
+                .lock()
+                .as_ref()
+                .is_some_and(|cur| cur.session_id == session.session_id && !cur.is_terminal());
+            if !still_ours {
+                return;
+            }
+        }
+        if let Err(e) = store::save(session) {
+            log::warn!(
+                "Could not persist validation session {}: {e}",
+                session.session_id
+            );
+        }
+    }
+
+    /// Is a session sampling right now?
+    pub fn is_recording(&self) -> bool {
+        self.slot.lock().as_ref().is_some_and(|s| s.is_recording())
+    }
+
+    /// Begin a session. The caller has already resolved and validated the
+    /// device, members and diagnostics — this installs the built session and
+    /// seeds the event baselines under one lock.
+    pub fn start(
+        &self,
+        session: ValidationSession,
+        ctx: &RecorderContext,
+    ) -> Result<ValidationSession, StartError> {
+        // [LOCK ORDER] Seeded BEFORE the slot lock, for the reason `tick` states
+        // at length: `seed_watch` reaches for the hwmon controller, the engine
+        // holds that same mutex across `set_pwm`'s `std::fs::write`, and a wedged
+        // write is a recorded failure mode (DEC-278/DEC-289). Doing it *under*
+        // the slot guard — which is what this did until `AUD3-k` — put an
+        // unbounded, non-cancellable acquisition behind the lock `/status`,
+        // `/poll`, `recording_session_id()` and the recorder tick all take. That
+        // is precisely the starvation the ordering rule in `tick` exists to
+        // prevent, arrived at from the one entry point that ignored it.
+        //
+        // Computed into a local and installed only once the recording check has
+        // passed: seeding straight into `self.watch` here would clobber a live
+        // session's baselines on behalf of a start that is about to be rejected.
+        let seeded = seed_watch(ctx);
+
+        let mut slot = self.slot.lock();
+        // DEC-481: no session starts while a firmware update owns the OpenFan
+        // controller. Checked under the slot guard, which `is_recording` takes:
+        // an update claims first and checks `is_recording` second, so this
+        // check-then-install and that claim-then-check cannot both pass.
+        if ctx.cache.openfan_maintenance_running() {
+            return Err(StartError::OpenFanMaintenance);
+        }
+        // DEC-335 §3.6: an operator ALWAYS wins over the background startup
+        // recording. Without this, enabling `[startup] record_startup` would
+        // make `POST /validation/session` return 409 for the first two minutes
+        // after every boot — a background diagnostic blocking a human, which is
+        // not acceptable behaviour for an opt-in convenience.
+        //
+        // The superseded recording is finalised rather than discarded: it is
+        // real evidence about this boot, and up to two minutes of it may already
+        // be recorded. Persisted below, after the slot guard is released.
+        let mut superseded: Option<ValidationSession> = None;
+        if let Some(current) = slot.as_mut() {
+            if current.is_recording() {
+                if !current.auto_started {
+                    return Err(StartError::AlreadyRecording);
+                }
+                finalise_in_place(
+                    current,
+                    STATE_COMPLETED,
+                    Some("superseded by an operator-started session".to_string()),
+                );
+                log::info!(
+                    "Startup auto-record {} superseded by an operator-started session",
+                    current.session_id
+                );
+                superseded = Some(current.clone());
+            }
+        }
+        let mut session = session;
+        session.events.push(ValidationEvent {
+            elapsed_ms: 0,
+            unix_ms: session.started_unix_ms,
+            kind: EV_SESSION_STARTED.to_string(),
+            detail: None,
+            member_id: None,
+        });
+        // Seed baselines from the live values so the first tick reports change,
+        // not merely difference-from-default. Installed under the slot guard,
+        // which is the order `tick` already uses (watch under slot, never the
+        // reverse); only the *controller* read moved out, above.
+        *self.watch.lock() = seeded;
+        // Fixed for this session's life, and cached so `tick` can take the hwmon
+        // controller lock BEFORE the session lock instead of underneath it.
+        let ids: Vec<String> = session
+            .metadata
+            .members
+            .iter()
+            .map(|m| m.member_id.clone())
+            .collect();
+        // Derived before the first tick from the session ITSELF, not from a
+        // summary of it: the byte cost scales with the member ids AND with the
+        // sensor id every sample carries, and the latter is client-supplied.
+        // See `session::max_samples_for`.
+        *self.max_samples.lock() =
+            super::session::max_samples_for(&session, constants::VALIDATION_MAX_SAMPLE_BYTES);
+        // [LOCK ORDER] The power sampler is deliberately NOT touched here
+        // (`P8-v`). It is keyed by session id, so `tick` rediscovers it — off
+        // the async runtime, with a fresh RAPL baseline — on the first tick
+        // whose session id differs from the stored one. Clearing it here instead
+        // meant taking a mutex that `tick` holds across blocking sysfs I/O,
+        // while holding the slot guard; see the field's own comment.
+        *self.member_ids.lock() = ids;
+        let started = session.clone();
+        self.refresh_live(&session);
+        *slot = Some(session);
+        drop(slot);
+
+        // After the guard, never under it: `persist` takes the save lock and
+        // writes a document `AUD3-i` measures at ~5.7 MiB for a realistic
+        // two-member session, bounded at 28 MiB by
+        // `VALIDATION_MAX_SESSION_BYTES`. A failure here is logged and not
+        // propagated — the operator's session started
+        // successfully, and failing their request because a superseded
+        // background recording could not be filed would be the wrong trade.
+        if let Some(old) = superseded {
+            self.persist(&old);
+        }
+
+        if let Err(e) = store::save(&started) {
+            // Roll the slot back: a session that cannot be persisted cannot be
+            // marked `interrupted` after a restart either, so admitting it would
+            // create exactly the silent gap §15 forbids.
+            //
+            // **Fenced on the id.** A slow failing save (a full or read-only
+            // state dir — the very condition that makes it slow) can outlive its
+            // own session: `stop()` finalises it, a second `POST` legitimately
+            // admits a new one, and an unconditional `= None` here would then
+            // silently wipe a session this call never installed.
+            self.rollback(&started.session_id);
+            return Err(StartError::Persistence(e));
+        }
+        Ok(started)
+    }
+
+    /// Finalise normally: compute the summary and persist (§8).
+    pub fn stop(&self) -> Option<ValidationSession> {
+        self.finish(STATE_COMPLETED, None)
+    }
+
+    /// Finalise **only if `session_id` is still the installed session.**
+    ///
+    /// The startup auto-record's timer fires ~120 s after it opened, and by then
+    /// an operator may have pre-empted it. `stop()` finalises whatever is in the
+    /// slot, so checking `recording_session_id()` and then calling it is a
+    /// check-and-act with a `spawn_blocking` dispatch in the gap — long enough
+    /// for a `POST /validation/session` to install an operator's session and
+    /// have this finalise *theirs*, seconds after it started. That is the exact
+    /// outcome the auto-record is supposed to be incapable of.
+    ///
+    /// The comparison happens under the same guard as the finalisation, so there
+    /// is no gap. Found by the concurrency review.
+    pub fn stop_if(&self, session_id: &str) -> Option<ValidationSession> {
+        let mut slot = self.slot.lock();
+        let session = slot.as_mut()?;
+        if session.session_id != session_id || !session.is_recording() {
+            return None;
+        }
+        finalise_in_place(session, STATE_COMPLETED, None);
+        let done = session.clone();
+        self.refresh_live(session);
+        drop(slot);
+        self.persist(&done);
+        Some(done)
+    }
+
+    /// Finalise, recording the session as `cancelled` rather than `completed`.
+    ///
+    /// **NOT a discard, despite the name** (`P8-bc`). This delegates to `finish`,
+    /// which calls `finalise_in_place` unconditionally — so a cancelled session
+    /// carries the same derived analysis, summary and samples as a stopped one
+    /// and is persisted identically. `state` is the only thing that differs.
+    /// This comment read "End without finalising" and was wrong; the GUI client
+    /// and `docs/08` repeated it, and a `danger`-styled "Cancel Session" button
+    /// in the GUI told users it destroyed their evidence.
+    pub fn cancel(&self) -> Option<ValidationSession> {
+        self.finish(STATE_CANCELLED, None)
+    }
+
+    fn finish(&self, state: &str, reason: Option<String>) -> Option<ValidationSession> {
+        let mut slot = self.slot.lock();
+        let session = slot.as_mut()?;
+        if !session.is_recording() {
+            return Some(session.clone());
+        }
+        finalise_in_place(session, state, reason);
+        let done = session.clone();
+        self.refresh_live(session);
+        drop(slot);
+        self.persist(&done);
+        Some(done)
+    }
+
+    /// Append a user marker or an engine-generated event (§5).
+    pub fn push_event(
+        &self,
+        kind: &str,
+        detail: Option<String>,
+        member_id: Option<String>,
+    ) -> AppendOutcome {
+        let mut slot = self.slot.lock();
+        let Some(session) = slot.as_mut() else {
+            return AppendOutcome::NotRecording;
+        };
+        if !session.is_recording() {
+            return AppendOutcome::NotRecording;
+        }
+        if !push_event_locked(session, kind, detail, member_id) {
+            return AppendOutcome::Full {
+                limit: constants::VALIDATION_MAX_EVENTS,
+            };
+        }
+        self.refresh_live(session);
+        AppendOutcome::Recorded
+    }
+
+    /// Attach an externally measured observation (§14). Untrusted; read by
+    /// nothing, and no control path may ever consult one.
+    pub fn add_measurement(&self, m: ExternalMeasurement) -> AppendOutcome {
+        let mut slot = self.slot.lock();
+        let Some(session) = slot.as_mut() else {
+            return AppendOutcome::NotRecording;
+        };
+        if !session.is_recording() {
+            return AppendOutcome::NotRecording;
+        }
+        if session.external_measurements.len() >= constants::VALIDATION_MAX_EXTERNAL_MEASUREMENTS {
+            return AppendOutcome::Full {
+                limit: constants::VALIDATION_MAX_EXTERNAL_MEASUREMENTS,
+            };
+        }
+        session.external_measurements.push(m);
+        AppendOutcome::Recorded
+    }
+
+    /// Record the result of an orchestrated diagnostic (§6), **fenced on the
+    /// session it was started for**.
+    ///
+    /// The fence is not defensive tidiness. An orchestration task outlives a
+    /// cancel: `cancel()` finalises immediately, a second `POST` then admits a
+    /// new session, and the in-flight task would otherwise append the *previous*
+    /// session's characterisation run — run id, points and all — to a session
+    /// that never requested it, on a member it may not even sweep. That run then
+    /// feeds `summarise` and changes the new session's findings. Fabricated
+    /// evidence, in the one artefact whose contract is that nothing is
+    /// fabricated (§15).
+    pub fn attach_evidence_for(&self, session_id: &str, ev: EvidenceRef) -> bool {
+        let mut slot = self.slot.lock();
+        let Some(session) = slot.as_mut() else {
+            return false;
+        };
+        if session.session_id != session_id || !session.is_recording() {
+            return false;
+        }
+        // `P8-br`: the one place an entry enters the document, so the one place
+        // its daemon-formatted prose has to be bounded. See
+        // `EvidenceRef::clamp_detail`.
+        let mut ev = ev;
+        ev.clamp_detail();
+        session.evidence.push(ev);
+        self.refresh_live(session);
+        true
+    }
+
+    /// Append an event to a **named** session. See [`attach_evidence_for`] for
+    /// why the orchestrator must not use the unfenced variant.
+    ///
+    /// [`attach_evidence_for`]: Self::attach_evidence_for
+    pub fn push_event_for(
+        &self,
+        session_id: &str,
+        kind: &str,
+        detail: Option<String>,
+        member_id: Option<String>,
+    ) -> bool {
+        let mut slot = self.slot.lock();
+        let Some(session) = slot.as_mut() else {
+            return false;
+        };
+        if session.session_id != session_id || !session.is_recording() {
+            return false;
+        }
+        push_event_locked(session, kind, detail, member_id);
+        self.refresh_live(session);
+        true
+    }
+
+    /// Flush a still-recording session through the **real** persistence path.
+    ///
+    /// The shutdown path's one write, and it goes through [`persist`] rather than
+    /// calling `store::save` directly so it shares the `save_lock` and the
+    /// stale-write guard with every other writer. It did not, and that was a live
+    /// race: a `POST /validation/session/stop` in flight when shutdown is
+    /// signalled can publish `completed` while this call is holding a `recording`
+    /// snapshot, and whichever `rename` lands second wins. Publishing the stale
+    /// copy resurrects a cleanly-stopped session as `recording`, and the next
+    /// boot sweep then "repairs" it to `interrupted` and discards its findings —
+    /// exactly the hazard [`save_lock`](Self::save_lock) exists to prevent.
+    ///
+    /// Returns whether anything was written.
+    ///
+    /// [`persist`]: Self::persist
+    pub fn flush_recording(&self) -> bool {
+        let Some(session) = self.snapshot() else {
+            return false;
+        };
+        if !session.is_recording() {
+            return false;
+        }
+        self.persist(&session);
+        true
+    }
+
+    /// Test-only: publish a session copy through the real persistence path,
+    /// including its stale-write guard. Exercises [`persist`](Self::persist)
+    /// without needing to win a race against a live recorder task.
+    #[doc(hidden)]
+    pub fn persist_for_test(&self, session: &ValidationSession) {
+        self.persist(session);
+    }
+
+    /// Un-install a session, but **only if it is still the one installed**.
+    ///
+    /// `start`'s rollback path. A slow failing save can outlive its own session —
+    /// `stop()` finalises it and a second `POST` legitimately admits a new one —
+    /// so an unconditional clear would silently wipe a session this call never
+    /// installed, leaving the new one un-recorded and its file `recording`
+    /// forever.
+    fn rollback(&self, session_id: &str) {
+        let mut slot = self.slot.lock();
+        if slot
+            .as_ref()
+            .is_some_and(|cur| cur.session_id == session_id)
+        {
+            *slot = None;
+            drop(slot);
+            *self.live.lock() = None;
+        }
+    }
+
+    /// Test-only: exercise `start`'s rollback directly.
+    ///
+    /// Delegates to [`rollback`](Self::rollback) rather than restating its
+    /// fence — a helper that reimplemented the rule would test the copy and
+    /// leave the production path unproven, which is a failure mode this project
+    /// has recorded six times.
+    #[doc(hidden)]
+    pub fn rollback_for_test(&self, session_id: &str) {
+        self.rollback(session_id);
+    }
+
+    /// The id of the session currently recording, if any.
+    pub fn recording_session_id(&self) -> Option<String> {
+        self.slot
+            .lock()
+            .as_ref()
+            .filter(|s| s.is_recording())
+            .map(|s| s.session_id.clone())
+    }
+
+    /// One sampling tick. Returns `true` if a sample was recorded.
+    pub fn tick(&self, ctx: &RecorderContext) -> bool {
+        // Take the observations BEFORE the session lock, so a slow controller
+        // lock never delays a start/stop request.
+        let snap = ctx.cache.snapshot();
+        let profile_epoch = ctx.cache.profile_activation_epoch();
+        let resume_generation = ctx.cache.resume_generation();
+        let overrides: HashSet<String> = ctx
+            .override_table
+            .lock()
+            .snapshot()
+            .controls
+            .keys()
+            .cloned()
+            .collect();
+        let char_run = ctx
+            .characterization
+            .lock()
+            .as_ref()
+            .map(|r| (r.run_id.clone(), r.state.clone()));
+
+        // [LOCK ORDER] The controller lock is taken HERE, before the session
+        // lock, and never while holding it.
+        //
+        // The engine holds this same mutex across `set_pwm`'s `std::fs::write`,
+        // and a wedged sysfs write is a recorded failure mode (DEC-278/DEC-289).
+        // Blocking on it while holding the session slot would put an unbounded
+        // wait behind a lock that `/status` and `/poll` also take — so a wedged
+        // header would block every 1 Hz poll task in a non-cancellable
+        // `parking_lot` acquisition on a tokio worker, and once the workers were
+        // exhausted the profile-engine loop could not be polled at all. A fault
+        // the engine is built to survive would become an engine stall, thermal
+        // ladder included. That is the recorder perturbing control by starvation
+        // rather than by writing, which this module's whole design forbids.
+        //
+        // `try_lock_for` rather than `lock`: even in the correct order, blocking
+        // a recorder tick on a wedged write buys nothing. A timeout records
+        // `requested_pct: None`, which the field already defines as "not known" —
+        // the honest answer, and the same one a daemon with no controller gives.
+        let member_ids: Vec<String> = self.member_ids.lock().clone();
+        let mut commanded: HashMap<String, u8> = HashMap::new();
+        let mut reverts: HashMap<String, u64> = HashMap::new();
+        if let Some(ctrl) = &ctx.hwmon_controller {
+            if let Some(guard) = ctrl.try_lock_for(CONTROLLER_READ_TIMEOUT) {
+                for id in &member_ids {
+                    if let Some(pct) = guard.last_commanded_pct(id) {
+                        commanded.insert(id.clone(), pct);
+                    }
+                }
+                reverts = guard.enable_revert_counts().clone();
+            } else {
+                log::debug!(
+                    "validation recorder: hwmon controller busy, recording this \
+                     sample without commanded duties"
+                );
+            }
+        }
+
+        // Power, sampled BEFORE the slot guard for exactly the reason the
+        // controller read above is: this is blocking sysfs I/O — a
+        // `/sys/class/hwmon` + `/sys/class/powercap` walk on the first tick,
+        // then an `energy_uj` read and an amdgpu `power1_average` read on every
+        // tick. An amdgpu read can park on the SMU lock during a GPU reset, and
+        // holding the session slot across that stalls every handler that calls
+        // `snapshot()` or `recording_session_id()`, plus the shutdown flush.
+        // The first draft did this inside the guarded region. Found by
+        // the concurrency review.
+        //
+        // Gated on the recording session's id so an idle daemon never touches
+        // sysfs at all. The check is advisory — a session can finish between here
+        // and the guard — but a wasted read is free, and the guard below is what
+        // decides whether the values are used.
+        //
+        // The id is also the sampler's cache key (`P8-v`): rediscovering on a
+        // mismatch is what resets the RAPL baseline per session, and it does so
+        // HERE, off the async runtime, instead of in `start` under the slot
+        // guard. `recording_session_id()` costs the same brief slot lock the
+        // `is_recording()` it replaced already took.
+        let (package_power_w, gpu_power_w) = if let Some(sid) = self.recording_session_id() {
+            let mut guard = self.power.lock();
+            let power = match guard.take() {
+                Some(p) if p.session_id == sid => guard.insert(p),
+                // Either nothing resolved yet, or the stored sampler belongs to
+                // a previous session. Dropping it is the baseline reset.
+                _ => guard.insert(SessionPower::discover(ctx, sid)),
+            };
+            (
+                power.package.sample(std::time::Instant::now()),
+                power
+                    .gpu_hwmon
+                    .as_deref()
+                    .and_then(crate::hwmon::gpu_detect::read_gpu_power_w),
+            )
+        } else {
+            (None, None)
+        };
+
+        let mut slot = self.slot.lock();
+        let Some(session) = slot.as_mut() else {
+            return false;
+        };
+        if !session.is_recording() {
+            return false;
+        }
+
+        let now = unix_ms();
+        let elapsed = now.saturating_sub(session.started_unix_ms);
+
+        // ── Sample ──────────────────────────────────────────────────────────
+        let mut members = Vec::with_capacity(session.metadata.members.len());
+        for m in &session.metadata.members {
+            let fan = snap.hwmon_fans.get(&m.member_id);
+            let enable = fan.and_then(|f| f.pwm_enable_mode);
+            // [HOST-a / DEC-326] The same exemption the reclaim decision below
+            // uses. Without it a sample records `ownership: external` for every
+            // tick a member sits at 100% while the session records no reclaim —
+            // an artefact that contradicts itself.
+            let alias = crate::pwm::is_full_speed_alias(
+                commanded.get(&m.member_id).copied().unwrap_or(0),
+                fan.and_then(|f| f.pwm_readback_pct),
+                enable,
+            );
+            members.push(MemberSample {
+                member_id: m.member_id.clone(),
+                role: m.member_kind.clone(),
+                requested_pct: commanded.get(&m.member_id).copied(),
+                readback_pct: fan.and_then(|f| f.pwm_readback_pct),
+                rpm: fan.and_then(|f| f.rpm),
+                pwm_enable_mode: enable,
+                alarm: fan.and_then(|f| f.alarm),
+                enable_revert_count: reverts.get(&m.member_id).copied().unwrap_or(0),
+                ownership: match enable {
+                    Some(1) => OWNERSHIP_DAEMON.to_string(),
+                    Some(_) if alias => OWNERSHIP_DAEMON.to_string(),
+                    Some(_) => OWNERSHIP_EXTERNAL.to_string(),
+                    None => OWNERSHIP_UNKNOWN.to_string(),
+                },
+            });
+        }
+
+        let temperature_sensor = session.metadata.temperature_sensor.clone();
+        let temperature_c = temperature_sensor
+            .as_ref()
+            .and_then(|id| snap.sensors.get(id))
+            .map(|s| s.value_c);
+        let coolant_c = session
+            .metadata
+            .coolant_sensor
+            .as_ref()
+            .and_then(|id| snap.sensors.get(id))
+            .map(|s| s.value_c);
+        let thermal_state = snap
+            .thermal_override_state
+            .clone()
+            .unwrap_or_else(|| "normal".to_string());
+
+        session.samples.push(ValidationSample {
+            elapsed_ms: elapsed,
+            unix_ms: now,
+            temperature_c,
+            temperature_sensor,
+            coolant_c,
+            package_power_w,
+            gpu_power_w,
+            thermal_state: thermal_state.clone(),
+            members,
+        });
+
+        // ── Events, by diffing against the watch baselines ──────────────────
+        {
+            let mut w = self.watch.lock();
+
+            if profile_epoch != w.profile_epoch {
+                w.profile_epoch = profile_epoch;
+                push_event_locked(session, EV_PROFILE_ACTIVATED, None, None);
+            }
+
+            if resume_generation != w.resume_generation {
+                w.resume_generation = resume_generation;
+                // A resume is observed only after the fact — the daemon is not
+                // running during the suspend, so `suspend` is emitted alongside
+                // it as the inferred start of the gap rather than pretended to
+                // have been noticed at the time.
+                push_event_locked(
+                    session,
+                    EV_SUSPEND,
+                    Some("inferred from the resume gap".to_string()),
+                    None,
+                );
+                push_event_locked(session, EV_RESUME, None, None);
+            }
+
+            if w.thermal_state.as_deref() != Some(thermal_state.as_str()) {
+                let was_emergency = matches!(
+                    w.thermal_state.as_deref(),
+                    Some("emergency") | Some("recovery")
+                );
+                let is_emergency = matches!(thermal_state.as_str(), "emergency" | "recovery");
+                if is_emergency && !was_emergency {
+                    push_event_locked(
+                        session,
+                        EV_THERMAL_ENTERED,
+                        Some(thermal_state.clone()),
+                        None,
+                    );
+                } else if was_emergency && !is_emergency {
+                    push_event_locked(
+                        session,
+                        EV_THERMAL_CLEARED,
+                        Some(thermal_state.clone()),
+                        None,
+                    );
+                }
+                w.thermal_state = Some(thermal_state);
+            }
+
+            for id in overrides.difference(&w.overrides) {
+                push_event_locked(session, EV_OVERRIDE_STARTED, None, Some(id.clone()));
+            }
+            for id in w.overrides.difference(&overrides) {
+                push_event_locked(session, EV_OVERRIDE_ENDED, None, Some(id.clone()));
+            }
+            w.overrides = overrides;
+
+            // Reclaim: the daemon had it in manual mode and no longer does, or
+            // the write path's own watchdog counted a revert. Two independent
+            // detectors, because either can miss: the mode sample can fall
+            // between two reclaims, and the counter only moves when the engine
+            // writes.
+            let member_ids: Vec<String> = session
+                .metadata
+                .members
+                .iter()
+                .map(|m| m.member_id.clone())
+                .collect();
+            for id in &member_ids {
+                let fan = snap.hwmon_fans.get(id);
+                let now_mode = fan.and_then(|f| f.pwm_enable_mode);
+                let was_mode = w.enable_modes.get(id).copied();
+                // [HOST-a / DEC-326] The full-speed alias is our own duty read
+                // back, not a second writer. Both halves come from the SAME poll
+                // snapshot, so they describe one instant. A member curve reaching
+                // 100% under load is what a validation session exists to observe;
+                // without this it was recorded as `control_reclaimed` and surfaced
+                // as the `bios_ec_control_reclaim` finding on the session report.
+                // "What we asked for" comes from the CONTROLLER (`commanded`,
+                // read from `last_commanded_pct` at the top of this tick), not
+                // from the cache's `pwm_commanded_pct`. The cache field is
+                // carried forward indefinitely by `update_hwmon_fans` and is
+                // never cleared when the daemon stops driving a header, so a
+                // stale "we commanded 100" would suppress a REAL reclaim on a
+                // header we no longer own. The controller's copy is cleared by
+                // `on_lease_released`, which is exactly the ownership signal
+                // this predicate needs. `None` (nothing commanded, or the
+                // controller lock was busy) means no duty of ours to recognise,
+                // so the event stands — the conservative direction.
+                let full_speed_alias = crate::pwm::is_full_speed_alias(
+                    commanded.get(id).copied().unwrap_or(0),
+                    fan.and_then(|f| f.pwm_readback_pct),
+                    now_mode,
+                );
+                if let Some(mode) = now_mode {
+                    if full_speed_alias {
+                        // [HOST-a / DEC-326] Suppressing the reclaim is not
+                        // enough: the WATERMARK must not move either. If it
+                        // advanced to 0 here, the next tick below 100% would see
+                        // `was_mode = Some(0)` and `mode == 1` and push a
+                        // phantom `EV_CONTROL_RESTORED` — and
+                        // `summary::control_restoration` counts reclaims and
+                        // restores GLOBALLY rather than per member, so one
+                        // member riding 100%→40% could satisfy the restore of a
+                        // DIFFERENT member's genuine, never-restored reclaim and
+                        // turn a FAIL into a PASS. Leaving the last non-aliased
+                        // mode in place makes both halves consistent.
+                    } else {
+                        if was_mode == Some(1) && mode != 1 {
+                            push_event_locked(
+                                session,
+                                EV_CONTROL_RECLAIMED,
+                                Some(format!("pwm_enable {mode}")),
+                                Some(id.clone()),
+                            );
+                        } else if was_mode.is_some_and(|w| w != 1) && mode == 1 {
+                            push_event_locked(session, EV_CONTROL_RESTORED, None, Some(id.clone()));
+                        }
+                        w.enable_modes.insert(id.clone(), mode);
+                    }
+                }
+                let now_rev = reverts.get(id).copied().unwrap_or(0);
+                let was_rev = w.enable_reverts.get(id).copied().unwrap_or(0);
+                if now_rev > was_rev {
+                    push_event_locked(
+                        session,
+                        EV_CONTROL_RECLAIMED,
+                        Some(format!("{} watchdog revert(s)", now_rev - was_rev)),
+                        Some(id.clone()),
+                    );
+                }
+                w.enable_reverts.insert(id.clone(), now_rev);
+            }
+
+            if char_run != w.char_run {
+                match (&w.char_run, &char_run) {
+                    (_, Some((run_id, state))) if state == "running" => {
+                        push_event_locked(session, EV_CHAR_STARTED, Some(run_id.clone()), None);
+                    }
+                    (Some((_, prev)), Some((run_id, state)))
+                        if prev == "running" && state != "running" =>
+                    {
+                        push_event_locked(
+                            session,
+                            EV_CHAR_COMPLETED,
+                            Some(format!("{run_id}: {state}")),
+                            None,
+                        );
+                    }
+                    _ => {}
+                }
+                w.char_run = char_run;
+            }
+
+            w.ticks_since_flush += 1;
+        }
+
+        // ── Cap and flush ───────────────────────────────────────────────────
+        // The topology-derived cap, never the raw sample count: a three-member
+        // cooler at 7200 samples wrote a 7.8 MiB document the store could not
+        // read back (`AUD3-i`). For a realistic AIO this is still 7200.
+        let at_cap = session.samples.len() >= *self.max_samples.lock();
+        let should_flush = {
+            let mut w = self.watch.lock();
+            if w.ticks_since_flush >= FLUSH_EVERY_TICKS {
+                w.ticks_since_flush = 0;
+                true
+            } else {
+                false
+            }
+        };
+        let to_persist = if at_cap {
+            session.sample_limit_reached = true;
+            push_event_locked(session, EV_SAMPLE_LIMIT, None, None);
+            None
+        } else if should_flush {
+            Some(session.clone())
+        } else {
+            None
+        };
+        self.refresh_live(session);
+        drop(slot);
+
+        if at_cap {
+            // Cap-and-stop: finalise rather than evicting the oldest samples,
+            // which are the startup evidence §9 exists to capture.
+            self.finish(STATE_COMPLETED, None);
+        } else if let Some(s) = to_persist {
+            self.persist(&s);
+        }
+        true
+    }
+}
+
+/// Append an event, bounded. Caller holds the slot lock. Returns `false` when
+/// the session already holds `VALIDATION_MAX_EVENTS` and nothing was appended;
+/// only the client marker path reports that (`DC-m`) — an engine event at the
+/// cap is dropped, as it always was.
+fn push_event_locked(
+    session: &mut ValidationSession,
+    kind: &str,
+    detail: Option<String>,
+    member_id: Option<String>,
+) -> bool {
+    if session.events.len() >= constants::VALIDATION_MAX_EVENTS {
+        return false;
+    }
+    let now = unix_ms();
+    session.events.push(ValidationEvent {
+        elapsed_ms: now.saturating_sub(session.started_unix_ms),
+        unix_ms: now,
+        kind: kind.to_string(),
+        detail,
+        member_id,
+    });
+    true
+}
+
+fn seed_watch(ctx: &RecorderContext) -> Watch {
+    let snap = ctx.cache.snapshot();
+    let mut enable_modes = HashMap::new();
+    for (id, fan) in &snap.hwmon_fans {
+        if let Some(mode) = fan.pwm_enable_mode {
+            enable_modes.insert(id.clone(), mode);
+        }
+    }
+    // `try_lock_for`, never `lock` — the same rule, and the same reason, as the
+    // read in `tick`. The cost of giving up is one spurious `control_reclaimed`
+    // event on the first tick if the watchdog counter was already non-zero; the
+    // cost of blocking is the caller's session lock, which is what `AUD3-k` was.
+    let enable_reverts = ctx
+        .hwmon_controller
+        .as_ref()
+        .and_then(|c| c.try_lock_for(CONTROLLER_READ_TIMEOUT))
+        .map(|guard| guard.enable_revert_counts().clone())
+        .unwrap_or_default();
+    Watch {
+        profile_epoch: ctx.cache.profile_activation_epoch(),
+        resume_generation: ctx.cache.resume_generation(),
+        thermal_state: snap.thermal_override_state.clone(),
+        overrides: ctx
+            .override_table
+            .lock()
+            .snapshot()
+            .controls
+            .keys()
+            .cloned()
+            .collect(),
+        enable_reverts,
+        enable_modes,
+        char_run: ctx
+            .characterization
+            .lock()
+            .as_ref()
+            .map(|r| (r.run_id.clone(), r.state.clone())),
+        ticks_since_flush: 0,
+    }
+}

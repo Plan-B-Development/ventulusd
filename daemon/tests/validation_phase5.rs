@@ -1,0 +1,3749 @@
+//! AIO-MB Phase 5 — validation sessions, evidence, and result semantics.
+//!
+//! Each test names the §18 bullet it discharges. The bias throughout is toward
+//! asserting the *specific* value a rule produces rather than that two states
+//! merely differ — a summariser that returned `unknown` for everything would
+//! satisfy "a finding exists", and that is exactly the bug these guard against.
+
+use ventulusd::validation::session::*;
+use ventulusd::validation::{store, summary};
+
+// ── Fixtures ────────────────────────────────────────────────────────────────
+
+fn policy() -> DevicePolicySnapshot {
+    DevicePolicySnapshot {
+        id: "generic_pump".into(),
+        display_name: "Generic pump".into(),
+        minimum_safe_pwm_pct: 30.0,
+        supports_stop: false,
+        startup_override_seconds: None,
+        expected_rpm_min: None,
+        expected_rpm_max: None,
+        internal_control_possible: true,
+    }
+}
+
+fn member(id: &str, kind: &str) -> MemberRoleSnapshot {
+    MemberRoleSnapshot {
+        member_id: id.into(),
+        label: format!("{id} label"),
+        role: if kind == MEMBER_PUMP {
+            "pump"
+        } else {
+            "radiator_fan"
+        }
+        .into(),
+        member_kind: kind.into(),
+        pump_protected: kind == MEMBER_PUMP,
+        effective_min_pwm_pct: Some(if kind == MEMBER_PUMP { 30 } else { 20 }),
+        stop_permitted: Some(kind != MEMBER_PUMP),
+        writable: true,
+    }
+}
+
+/// A device with one pump and two radiators — the two-radiator case §3 names
+/// explicitly, so identity-preservation is testable.
+fn metadata() -> SessionMetadata {
+    SessionMetadata {
+        cooling_device_id: "dev-1".into(),
+        device_name: "Test AIO".into(),
+        device_kind: "aio_liquid".into(),
+        pump_member: Some("hwmon:it87:pwm2:PUMP".into()),
+        radiator_members: vec!["hwmon:it87:pwm3:RAD1".into(), "hwmon:it87:pwm4:RAD2".into()],
+        auxiliary_members: vec![],
+        temperature_sensor: Some("cpu:package".into()),
+        coolant_sensor: None,
+        coolant_telemetry: "unavailable".into(),
+        device_policy: policy(),
+        members: vec![
+            member("hwmon:it87:pwm2:PUMP", MEMBER_PUMP),
+            member("hwmon:it87:pwm3:RAD1", MEMBER_RADIATOR),
+            member("hwmon:it87:pwm4:RAD2", MEMBER_RADIATOR),
+        ],
+        active_profile_id: Some("p1".into()),
+        active_profile_name: Some("Balanced".into()),
+        daemon_version: "2.32.0".into(),
+        user_metadata: Default::default(),
+    }
+}
+
+fn session() -> ValidationSession {
+    ValidationSession {
+        session_id: "val-1000-0".into(),
+        kind: KIND_VALIDATION.into(),
+        state: STATE_RECORDING.into(),
+        started_unix_ms: 1_000,
+        completed_unix_ms: None,
+        metadata: metadata(),
+        requested_diagnostics: vec![],
+        sweep_members: vec![],
+        samples: vec![],
+        events: vec![],
+        evidence: vec![],
+        external_measurements: vec![],
+        findings: vec![],
+        sample_limit_reached: false,
+        interrupted_reason: None,
+        truncated_at_unix_ms: None,
+        auto_started: false,
+        stop_when_diagnostics_complete: false,
+        startup_fingerprints: vec![],
+        steady_state: None,
+    }
+}
+
+fn member_sample(
+    id: &str,
+    kind: &str,
+    requested: Option<u8>,
+    readback: Option<u8>,
+    rpm: Option<u16>,
+) -> MemberSample {
+    MemberSample {
+        member_id: id.into(),
+        role: kind.into(),
+        requested_pct: requested,
+        readback_pct: readback,
+        rpm,
+        pwm_enable_mode: Some(1),
+        alarm: Some(false),
+        enable_revert_count: 0,
+        ownership: OWNERSHIP_DAEMON.into(),
+    }
+}
+
+fn sample_at(ms: u64, members: Vec<MemberSample>) -> ValidationSample {
+    ValidationSample {
+        elapsed_ms: ms,
+        unix_ms: 1_000 + ms,
+        temperature_c: Some(45.0),
+        temperature_sensor: Some("cpu:package".into()),
+        coolant_c: None,
+        package_power_w: None,
+        gpu_power_w: None,
+        thermal_state: "normal".into(),
+        members,
+    }
+}
+
+fn find<'a>(f: &'a [ValidationFinding], id: &str) -> &'a ValidationFinding {
+    f.iter().find(|x| x.id == id).unwrap_or_else(|| {
+        panic!(
+            "no finding '{id}' in {:?}",
+            f.iter().map(|x| &x.id).collect::<Vec<_>>()
+        )
+    })
+}
+
+fn find_for<'a>(f: &'a [ValidationFinding], id: &str, member: &str) -> &'a ValidationFinding {
+    f.iter()
+        .find(|x| x.id == id && x.member_id.as_deref() == Some(member))
+        .unwrap_or_else(|| panic!("no finding '{id}' for member '{member}'"))
+}
+
+// ── §18: result semantics ───────────────────────────────────────────────────
+
+/// §18 "result summary preserves NOT_TESTED/UNKNOWN/UNAVAILABLE semantics", and
+/// §7's central rule: absence of a diagnostic is NOT_TESTED, never PASS.
+#[test]
+fn a_session_with_no_diagnostics_reports_not_tested_and_never_pass() {
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    let findings = summary::summarise(&s);
+
+    for id in [
+        F_PWM_HEADER_CONTROL,
+        F_PWM_RESPONSE,
+        F_DEVICE_OVERRIDE,
+        F_RESPONSE_LATENCY,
+    ] {
+        let f = find(&findings, id);
+        assert_eq!(
+            f.state, RESULT_NOT_TESTED,
+            "{id} must be not_tested when no diagnostic ran"
+        );
+        // The explicit half: it must not have been silently promoted.
+        assert_ne!(f.state, RESULT_PASS, "{id} must never read as a pass");
+    }
+}
+
+/// §18 "missing telemetry is represented as unavailable rather than zero/failure".
+#[test]
+fn a_header_with_no_tach_reports_unavailable_not_zero_and_not_fail() {
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    // Present, sampled, but the driver exposes no RPM for the pump.
+    s.samples.push(sample_at(
+        0,
+        vec![
+            member_sample(
+                "hwmon:it87:pwm2:PUMP",
+                MEMBER_PUMP,
+                Some(50),
+                Some(50),
+                None,
+            ),
+            member_sample(
+                "hwmon:it87:pwm3:RAD1",
+                MEMBER_RADIATOR,
+                Some(50),
+                Some(50),
+                Some(900),
+            ),
+            member_sample(
+                "hwmon:it87:pwm4:RAD2",
+                MEMBER_RADIATOR,
+                Some(50),
+                Some(50),
+                Some(910),
+            ),
+        ],
+    ));
+    let findings = summary::summarise(&s);
+
+    let pump = find_for(&findings, F_PUMP_RPM, "hwmon:it87:pwm2:PUMP");
+    assert_eq!(pump.state, RESULT_UNAVAILABLE);
+    assert_ne!(
+        pump.state, RESULT_FAIL,
+        "absent telemetry is not a failure (§7)"
+    );
+    // And the radiator that DOES report is a pass, so the check above is not
+    // passing merely because everything is unavailable.
+    assert_eq!(
+        find_for(&findings, F_RADIATOR_RPM, "hwmon:it87:pwm3:RAD1").state,
+        RESULT_PASS
+    );
+}
+
+/// §18 "telemetry samples preserve pump/radiator/member identity" + §3's
+/// explicit "do not flatten multiple radiators into an invented single value".
+#[test]
+fn two_radiators_produce_two_named_findings_never_an_average() {
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    s.samples.push(sample_at(
+        0,
+        vec![
+            member_sample(
+                "hwmon:it87:pwm2:PUMP",
+                MEMBER_PUMP,
+                Some(50),
+                Some(50),
+                Some(2400),
+            ),
+            member_sample(
+                "hwmon:it87:pwm3:RAD1",
+                MEMBER_RADIATOR,
+                Some(50),
+                Some(50),
+                Some(800),
+            ),
+            // A deliberately different RPM: an averaging bug would show as 900.
+            member_sample(
+                "hwmon:it87:pwm4:RAD2",
+                MEMBER_RADIATOR,
+                Some(50),
+                Some(50),
+                Some(1000),
+            ),
+        ],
+    ));
+    let findings = summary::summarise(&s);
+
+    let radiators: Vec<_> = findings.iter().filter(|f| f.id == F_RADIATOR_RPM).collect();
+    assert_eq!(radiators.len(), 2, "each radiator keeps its own finding");
+    let ids: Vec<_> = radiators
+        .iter()
+        .filter_map(|f| f.member_id.as_deref())
+        .collect();
+    assert!(ids.contains(&"hwmon:it87:pwm3:RAD1"));
+    assert!(ids.contains(&"hwmon:it87:pwm4:RAD2"));
+
+    // The samples themselves keep both series distinct.
+    let rpms: Vec<_> = s.samples[0]
+        .members
+        .iter()
+        .filter(|m| m.role == MEMBER_RADIATOR)
+        .filter_map(|m| m.rpm)
+        .collect();
+    assert_eq!(rpms, vec![800, 1000]);
+}
+
+/// §18 "startup/device-override evidence can be represented without false
+/// failure" and §10's "do not treat this automatically as PWM write failure".
+#[test]
+fn a_possible_device_override_is_observed_evidence_and_never_a_failure() {
+    use ventulusd::api::characterization::{CharPoint, CharSummary, CharacterizationRun};
+
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    s.evidence.push(EvidenceRef {
+        kind: DIAG_CHARACTERIZATION.into(),
+        member_id: "hwmon:it87:pwm2:PUMP".into(),
+        run_id: Some("char-1".into()),
+        started_unix_ms: 1_000,
+        completed_unix_ms: Some(2_000),
+        outcome: RESULT_OBSERVED.into(),
+        detail: None,
+        characterization: Some(CharacterizationRun {
+            run_id: "char-1".into(),
+            header_id: "hwmon:it87:pwm2:PUMP".into(),
+            state: "complete".into(),
+            requested_points_pct: vec![30, 50, 100],
+            settle_seconds: 5,
+            points: vec![CharPoint {
+                requested_pct: 30,
+                command_accepted: true,
+                readback_pct: Some(30),
+                readback_raw: Some(76),
+                pwm_enable: Some(1),
+                rpm_before: Some(2400),
+                rpm_after: Some(2400),
+                settle_ms: 5_000,
+                first_change_ms: None,
+                readback_verdict: "pass".into(),
+                rpm_verdict: "no_effect".into(),
+                ..Default::default()
+            }],
+            summary: Some(CharSummary {
+                command_acceptance: "pass".into(),
+                pwm_readback: "pass".into(),
+                rpm_response: "fail".into(),
+                min_tested_pct: Some(30),
+                max_tested_pct: Some(100),
+                min_rpm: Some(2400),
+                max_rpm: Some(2400),
+                monotonic: Some(false),
+                dead_zone_upper_pct: None,
+                clamp_pct: None,
+                // The signature §10 describes: control and readback are valid,
+                // the physical response is not what was asked for.
+                possible_device_override: true,
+                interference_detected: false,
+                ..Default::default()
+            }),
+            original_pct: Some(50),
+            restore_failed: false,
+            restore_outcome: "restored".into(),
+            detail: None,
+            ..Default::default()
+        }),
+        verify: None,
+        control_path: None,
+    });
+
+    let findings = summary::summarise(&s);
+
+    // The classification is preserved as OBSERVED evidence...
+    let ovr = find(&findings, F_DEVICE_OVERRIDE);
+    assert_eq!(ovr.state, RESULT_OBSERVED);
+    assert_ne!(
+        ovr.state, RESULT_FAIL,
+        "§10: cautious semantics, never a failure"
+    );
+
+    // ...and the working half of the same run is NOT dragged down with it.
+    // This is the "without false failure" half of the bullet: motherboard PWM
+    // control was valid and must still report as valid.
+    assert_eq!(find(&findings, F_PWM_HEADER_CONTROL).state, RESULT_PASS);
+    assert_eq!(find(&findings, F_PWM_READBACK).state, RESULT_PASS);
+}
+
+/// §18 "existing characterisation results can be associated/referenced without
+/// rerunning or reimplementing the test" (§6).
+#[test]
+fn characterisation_evidence_is_carried_verbatim_not_recomputed() {
+    use ventulusd::api::characterization::{CharSummary, CharacterizationRun};
+
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    let run = CharacterizationRun {
+        run_id: "char-7".into(),
+        header_id: "hwmon:it87:pwm2:PUMP".into(),
+        state: "complete".into(),
+        requested_points_pct: vec![40, 80],
+        settle_seconds: 4,
+        points: vec![],
+        summary: Some(CharSummary {
+            command_acceptance: "pass".into(),
+            pwm_readback: "clamped".into(),
+            rpm_response: "pass".into(),
+            min_tested_pct: Some(40),
+            max_tested_pct: Some(80),
+            min_rpm: Some(700),
+            max_rpm: Some(1800),
+            monotonic: Some(true),
+            dead_zone_upper_pct: None,
+            clamp_pct: Some(60),
+            possible_device_override: false,
+            interference_detected: false,
+            ..Default::default()
+        }),
+        original_pct: Some(50),
+        restore_failed: false,
+        restore_outcome: "restored".into(),
+        detail: None,
+        ..Default::default()
+    };
+    s.evidence.push(EvidenceRef {
+        kind: DIAG_CHARACTERIZATION.into(),
+        member_id: "hwmon:it87:pwm2:PUMP".into(),
+        run_id: Some("char-7".into()),
+        started_unix_ms: 1_000,
+        completed_unix_ms: Some(2_000),
+        outcome: RESULT_OBSERVED.into(),
+        detail: None,
+        characterization: Some(run.clone()),
+        verify: None,
+        control_path: None,
+    });
+
+    // The attached run is bit-for-bit the one Phase 3 produced.
+    assert_eq!(s.evidence[0].characterization.as_ref().unwrap(), &run);
+
+    // And the summariser reports Phase 3's own verdict rather than deriving a
+    // second opinion: `clamped` is preserved as OBSERVED, not turned into a fail.
+    let findings = summary::summarise(&s);
+    assert_eq!(find(&findings, F_PWM_READBACK).state, RESULT_OBSERVED);
+    assert_eq!(find(&findings, F_PWM_RESPONSE).state, RESULT_PASS);
+}
+
+/// §7: `UNAVAILABLE` must not become `FAIL` when the hardware simply does not
+/// expose the capability. A refused diagnostic is the same case.
+#[test]
+fn a_refused_diagnostic_is_unavailable_not_fail() {
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    s.evidence.push(EvidenceRef {
+        kind: DIAG_CHARACTERIZATION.into(),
+        member_id: "hwmon:it87:pwm2:PUMP".into(),
+        run_id: None,
+        started_unix_ms: 1_000,
+        completed_unix_ms: Some(1_100),
+        // The thermal ladder was forcing, so the sweep never started.
+        outcome: RESULT_UNAVAILABLE.into(),
+        detail: Some("thermal_abort".into()),
+        characterization: None,
+        verify: None,
+        control_path: None,
+    });
+    let findings = summary::summarise(&s);
+    for id in [F_PWM_HEADER_CONTROL, F_PWM_RESPONSE, F_DEVICE_OVERRIDE] {
+        assert_ne!(find(&findings, id).state, RESULT_FAIL, "{id}");
+    }
+}
+
+/// The divergence rule needs a real duty swing, or the question is unanswerable
+/// — a pump idling correctly at its floor must not be reported as divergent.
+#[test]
+fn divergence_is_not_tested_until_the_duty_actually_moves() {
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    for i in 0..5u64 {
+        s.samples.push(sample_at(
+            i * 1000,
+            vec![member_sample(
+                "hwmon:it87:pwm2:PUMP",
+                MEMBER_PUMP,
+                Some(30),
+                Some(30),
+                Some(2400),
+            )],
+        ));
+    }
+    let findings = findings_of(&s);
+    let f = find_for(&findings, F_PWM_RPM_DIVERGENCE, "hwmon:it87:pwm2:PUMP");
+    assert_eq!(f.state, RESULT_NOT_TESTED, "steady duty proves nothing");
+}
+
+#[test]
+fn divergence_is_observed_when_rpm_does_not_follow_a_real_pwm_swing() {
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    for (i, duty) in [30u8, 50, 80, 100].iter().enumerate() {
+        s.samples.push(sample_at(
+            i as u64 * 1000,
+            vec![member_sample(
+                "hwmon:it87:pwm2:PUMP",
+                MEMBER_PUMP,
+                Some(*duty),
+                Some(*duty),
+                // RPM pinned: the device is running its own control.
+                Some(2400),
+            )],
+        ));
+    }
+    let findings = findings_of(&s);
+    let f = find_for(&findings, F_PWM_RPM_DIVERGENCE, "hwmon:it87:pwm2:PUMP");
+    assert_eq!(f.state, RESULT_OBSERVED);
+
+    // The converse, so the assertion above is discriminating rather than
+    // constant: RPM that tracks the same swing is NOT flagged.
+    let mut ok = session();
+    ok.state = STATE_COMPLETED.into();
+    for (i, (duty, rpm)) in [(30u8, 900u16), (50, 1500), (80, 2200), (100, 2900)]
+        .iter()
+        .enumerate()
+    {
+        ok.samples.push(sample_at(
+            i as u64 * 1000,
+            vec![member_sample(
+                "hwmon:it87:pwm2:PUMP",
+                MEMBER_PUMP,
+                Some(*duty),
+                Some(*duty),
+                Some(*rpm),
+            )],
+        ));
+    }
+    let ok_findings = findings_of(&ok);
+    assert_eq!(
+        find_for(&ok_findings, F_PWM_RPM_DIVERGENCE, "hwmon:it87:pwm2:PUMP").state,
+        RESULT_NOT_OBSERVED
+    );
+}
+
+fn findings_of(s: &ValidationSession) -> Vec<ValidationFinding> {
+    summary::summarise(s)
+}
+
+/// §1 is explicit that coolant telemetry is NOT required — a motherboard-PWM AIO
+/// on CPU temperature is a valid validation target.
+#[test]
+fn absent_coolant_telemetry_is_unavailable_and_the_session_is_still_valid() {
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    s.samples.push(sample_at(0, vec![]));
+    let findings = summary::summarise(&s);
+    let f = find(&findings, F_COOLANT_TELEMETRY);
+    assert_eq!(f.state, RESULT_UNAVAILABLE);
+    assert_ne!(f.state, RESULT_FAIL);
+}
+
+// ── §18: interruption ───────────────────────────────────────────────────────
+
+/// §18 "session interruption is represented explicitly" + §15 "do not fabricate
+/// telemetry for periods where no data was collected".
+#[test]
+fn a_recording_session_left_on_disk_becomes_interrupted_without_invented_samples() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session();
+    s.samples.push(sample_at(0, vec![]));
+    s.samples.push(sample_at(1000, vec![]));
+    store::save_to(dir.path(), &s).unwrap();
+
+    let repaired = store::sweep_interrupted(dir.path(), "daemon_restart");
+    assert_eq!(repaired, vec!["val-1000-0".to_string()]);
+
+    let back = store::load_from(dir.path(), "val-1000-0").unwrap().unwrap();
+    assert_eq!(back.state, STATE_INTERRUPTED);
+    assert_eq!(back.interrupted_reason.as_deref(), Some("daemon_restart"));
+    // Truncated exactly at the last real sample...
+    assert_eq!(back.truncated_at_unix_ms, Some(2_000));
+    // ...and not one sample was invented to fill the gap.
+    assert_eq!(
+        back.samples.len(),
+        2,
+        "no telemetry may be fabricated (§15)"
+    );
+    // The findings say `interrupted`, not `not_tested` — the distinction §7
+    // exists to preserve.
+    assert_eq!(
+        find(&back.findings, F_PWM_HEADER_CONTROL).state,
+        RESULT_INTERRUPTED
+    );
+}
+
+/// A session that finished normally must be left alone by the boot sweep.
+#[test]
+fn the_boot_sweep_does_not_touch_a_completed_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    store::save_to(dir.path(), &s).unwrap();
+
+    assert!(store::sweep_interrupted(dir.path(), "daemon_restart").is_empty());
+    let back = store::load_from(dir.path(), "val-1000-0").unwrap().unwrap();
+    assert_eq!(back.state, STATE_COMPLETED);
+}
+
+// ── §18: serialization ──────────────────────────────────────────────────────
+
+/// §18 "JSON/session serialization correctness".
+#[test]
+fn a_session_round_trips_through_json_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session();
+    s.state = STATE_COMPLETED.into();
+    s.samples.push(sample_at(
+        0,
+        vec![member_sample(
+            "hwmon:it87:pwm2:PUMP",
+            MEMBER_PUMP,
+            Some(40),
+            Some(41),
+            Some(2400),
+        )],
+    ));
+    s.events.push(ValidationEvent {
+        elapsed_ms: 0,
+        unix_ms: 1_000,
+        kind: EV_SESSION_STARTED.into(),
+        detail: None,
+        member_id: None,
+    });
+    s.external_measurements.push(ExternalMeasurement {
+        unix_ms: 1_500,
+        kind: "supply_voltage_v".into(),
+        value: 12.03,
+        unit: "V".into(),
+        member_id: None,
+        note: Some("bench meter".into()),
+    });
+    s.findings = summary::summarise(&s);
+
+    store::save_to(dir.path(), &s).unwrap();
+    let back = store::load_from(dir.path(), &s.session_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        back, s,
+        "the stored session must survive a round trip exactly"
+    );
+}
+
+/// §18 "unrelated system information is not included" (§3's "do not collect
+/// unrelated system data").
+#[test]
+fn the_serialized_session_contains_only_cooling_relevant_keys() {
+    let mut s = session();
+    s.samples.push(sample_at(
+        0,
+        vec![member_sample(
+            "hwmon:it87:pwm2:PUMP",
+            MEMBER_PUMP,
+            Some(40),
+            Some(41),
+            Some(2400),
+        )],
+    ));
+    let json: serde_json::Value = serde_json::to_value(&s).unwrap();
+    let obj = json.as_object().unwrap();
+
+    // An allowlist, not a denylist: a new field must be considered rather than
+    // silently shipped, which is the only way this test can catch a leak.
+    const ALLOWED: &[&str] = &[
+        "session_id",
+        "kind",
+        "state",
+        "started_unix_ms",
+        "completed_unix_ms",
+        "metadata",
+        "requested_diagnostics",
+        "sweep_members",
+        "samples",
+        "events",
+        "evidence",
+        "external_measurements",
+        "findings",
+        "sample_limit_reached",
+        "interrupted_reason",
+        "truncated_at_unix_ms",
+        // DEC-335 (Batch 3a). All three are cooling-relevant and carry no host
+        // or user identity: `auto_started` is the recording's provenance (a
+        // daemon-opened startup capture versus an operator's), and the other two
+        // are derived fan and thermal behaviour.
+        "auto_started",
+        "startup_fingerprints",
+        "steady_state",
+        // `P8-az` (Run 2). The session's own end condition — whether it
+        // finalises itself when its diagnostics finish. Cooling-relevant and
+        // identity-free: it is a property of the recording, and it is echoed
+        // precisely so a client renders the daemon's answer rather than its own
+        // request memory.
+        "stop_when_diagnostics_complete",
+    ];
+    for key in obj.keys() {
+        assert!(
+            ALLOWED.contains(&key.as_str()),
+            "unexpected top-level key '{key}' — is it cooling-relevant? (§3)"
+        );
+    }
+
+    // And nothing resembling host/user identity rode along. Asserted against
+    // the KEY SET, not the raw text: a bare substring search for "uid" matches
+    // inside "aio_liquid", which is the same trap as a filtered grep matching
+    // its own subject.
+    let mut keys = Vec::new();
+    collect_keys(&json, &mut keys);
+    for forbidden in [
+        "hostname",
+        "username",
+        "uid",
+        "gid",
+        "user",
+        "home",
+        "kernel_version",
+        "cmdline",
+        "environment",
+        "path",
+    ] {
+        assert!(
+            !keys.iter().any(|k| k == forbidden),
+            "serialized session must not carry a '{forbidden}' key; keys were {keys:?}"
+        );
+    }
+
+    // Values must not leak a filesystem path either — hwmon ids are opaque
+    // stable ids, never sysfs paths.
+    let text = serde_json::to_string(&s).unwrap();
+    for forbidden in ["/home/", "/sys/", "/proc/", "/var/lib/"] {
+        assert!(
+            !text.contains(forbidden),
+            "serialized session must not carry the path '{forbidden}'"
+        );
+    }
+}
+
+/// Every object key in the document, at any depth.
+fn collect_keys(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            for (k, child) in m {
+                out.push(k.clone());
+                collect_keys(child, out);
+            }
+        }
+        serde_json::Value::Array(a) => {
+            for child in a {
+                collect_keys(child, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── §18: retention and bounds ───────────────────────────────────────────────
+
+#[test]
+fn pruning_keeps_the_newest_and_never_deletes_a_recording_session() {
+    let dir = tempfile::tempdir().unwrap();
+    // One live session, plus four completed ones at increasing start times.
+    let mut live = session();
+    live.session_id = "val-live".into();
+    live.started_unix_ms = 1; // oldest, so a naive prune would take it
+    store::save_to(dir.path(), &live).unwrap();
+
+    for i in 0..4u64 {
+        let mut s = session();
+        s.session_id = format!("val-done-{i}");
+        s.state = STATE_COMPLETED.into();
+        s.started_unix_ms = 100 + i;
+        store::save_to(dir.path(), &s).unwrap();
+    }
+
+    store::prune(dir.path(), 2);
+    let left: Vec<String> = store::list_from(dir.path())
+        .into_iter()
+        .map(|s| s.session_id)
+        .collect();
+
+    assert!(
+        left.contains(&"val-live".to_string()),
+        "a recording session is never pruned"
+    );
+    assert!(left.contains(&"val-done-3".to_string()));
+    assert!(left.contains(&"val-done-2".to_string()));
+    assert!(!left.contains(&"val-done-0".to_string()));
+    assert!(!left.contains(&"val-done-1".to_string()));
+}
+
+/// A session id reaches the store from a URL path segment. It must never be
+/// interpolated into a filename without confinement.
+#[test]
+fn a_traversing_session_id_cannot_escape_the_session_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in ["../escape", "a/b", "..", ".", "", "with space", "x/../../y"] {
+        assert!(!is_safe_session_id(bad), "'{bad}' must be rejected");
+        assert!(
+            store::load_from(dir.path(), bad).unwrap().is_none(),
+            "'{bad}' must not resolve to a file"
+        );
+    }
+    assert!(is_safe_session_id("val-1000-0"));
+    assert!(is_safe_session_id("val_1000_0"));
+}
+
+// ── §18: the safety claims, asserted structurally ───────────────────────────
+
+/// §18 "session logging does not alter PWM/control state" and §2 "validation
+/// recording must not acquire a second PWM ownership path".
+///
+/// Asserted against the source, because that is the only way to prove an
+/// *absence*. A behavioural test can show that the paths we thought of do not
+/// write; this shows that no path does, including one added later.
+#[test]
+fn the_recorder_contains_no_hardware_write_path() {
+    let recorder = include_str!("../src/validation/recorder.rs");
+    let body = strip_comments(recorder);
+
+    for forbidden in [
+        "set_pwm",
+        "write_file",
+        "force_all_with_floor",
+        "acquire_lease",
+        "std::fs::write",
+        "OpenOptions",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "the recorder must not reference '{forbidden}' — it is an observer (§2)"
+        );
+    }
+
+    // The summariser and the data model are likewise inert.
+    for (name, src) in [
+        ("summary", include_str!("../src/validation/summary.rs")),
+        ("session", include_str!("../src/validation/session.rs")),
+    ] {
+        let b = strip_comments(src);
+        assert!(!b.contains("set_pwm"), "{name} must not command a duty");
+        assert!(
+            !b.contains("std::fs::"),
+            "{name} must not touch the filesystem"
+        );
+    }
+}
+
+/// The write path must not have grown a validation call site — the other
+/// direction of the same claim.
+#[test]
+fn the_pwm_write_path_does_not_call_into_validation() {
+    for (name, src) in [
+        ("pwm_control", include_str!("../src/hwmon/pwm_control.rs")),
+        (
+            "profile_engine",
+            include_str!("../src/profile_engine/mod.rs"),
+        ),
+        ("safety", include_str!("../src/safety.rs")),
+    ] {
+        let body = strip_comments(src);
+        assert!(
+            !body.contains("validation::"),
+            "{name} must not call into the validation engine — logging is an \
+             observer, and a hook here is how it would stop being one (§15)"
+        );
+    }
+}
+
+/// The pump floor and the thermal refusal are the existing handlers' job, and
+/// the orchestrator must not reimplement (or bypass) either.
+#[test]
+fn the_orchestrator_delegates_rather_than_reimplementing_safety() {
+    let src = include_str!("../src/api/handlers/validation.rs");
+    let body = strip_comments(src);
+
+    // It calls the existing handlers...
+    assert!(body.contains("hwmon_verify_handler"));
+    assert!(body.contains("hwmon_characterize_handler"));
+    // ...and contains no floor arithmetic, lease handling or duty write of its own.
+    for forbidden in [
+        "HARD_PUMP_CPU_FLOOR_PCT",
+        "resolve_policy_floor(policy, pump_protected)\n        .max",
+        "set_pwm",
+        "force_take",
+        "begin_verify_pause",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "the orchestrator must delegate '{forbidden}', not reimplement it (§6)"
+        );
+    }
+}
+
+// `AUD3-j`'s call-site guard was RETIRED by DEC-374 (`P8-bu`), not dropped.
+// It scanned this source for a `cancel_run_fenced(` between the orchestrator's
+// session fence and the `return;` it guards, because neither watch loop was
+// reachable without stubbing `hwmon_characterize_handler`, which drives
+// hardware. Extracting `watch_run` removed that obstacle, and the rule is now
+// asserted by running the loop:
+// `api::handlers::validation::tests::ending_the_session_cancels_the_sweep_and_refuses_to_attach`.
+
+/// `AUD3-n`. The session document is written with `write` + `fsync` + `rename` +
+/// a directory `fsync`, over a document `AUD3-i` measures at ~5.7 MiB for a
+/// realistic two-member session and `VALIDATION_MAX_SESSION_BYTES` bounds at
+/// 28 MiB. None of that belongs on
+/// the worker threads the 1 Hz profile engine — and therefore the thermal-safety
+/// decision — is scheduled on.
+///
+/// **This is a wiring guard, and deliberately not a runtime measurement.** The
+/// property "this call did not block a tokio worker" is only observable as a
+/// latency difference, and discriminating a ~10 ms inline write from a scheduled
+/// one needs a timing threshold — which the project rulebook forbids ("no flaky timing")
+/// and which CI would decide by load rather than by correctness. What can be
+/// asserted honestly is that each call site still goes through the wrapper, which
+/// is the thing a regression would undo.
+#[test]
+fn the_session_lifecycle_writes_stay_off_the_async_runtime() {
+    let body = strip_comments(include_str!("../src/api/handlers/validation.rs"));
+
+    // The finalisers: no direct engine call left in either handler...
+    for direct in ["state.validation.stop()", "state.validation.cancel()"] {
+        assert!(
+            !body.contains(direct),
+            "`{direct}` finalises AND persists inline on the request path — hand \
+             it to `finalise_off_runtime` (`AUD3-n`)"
+        );
+    }
+    // ...and the wrapper they share is what carries the hop.
+    let at = body
+        .find("async fn finalise_off_runtime")
+        .expect("the off-runtime finaliser must still exist");
+    let wrapper = &body[at..];
+    let end = wrapper.find("\n}\n").unwrap_or(wrapper.len());
+    assert!(
+        wrapper[..end].contains("spawn_blocking"),
+        "`finalise_off_runtime` no longer goes off the runtime"
+    );
+
+    // The start path wraps the whole engine call, so `start`'s
+    // admit-only-if-persisted rollback stays inside the engine.
+    let at = body
+        .find("pub async fn start_session_handler")
+        .expect("the start handler must still exist");
+    let handler = &body[at..];
+    let call = handler
+        .find("engine.start(session, &ctx)")
+        .expect("the start handler must still start a session");
+    assert!(
+        handler[..call].contains("spawn_blocking"),
+        "`start` writes the session document inline on the request path (`AUD3-n`)"
+    );
+
+    // The `P8-az` terminal hop finalises too, from a detached task on the same
+    // runtime — and it is the one finalise that is NOT on a request path, so
+    // nothing upstream would ever notice the latency it added.
+    let at = body
+        .find("fn spawn_orchestration")
+        .expect("the orchestrator must still exist");
+    let orch = &body[at..];
+    // Match the CALL SHAPE, not a window containing both tokens. The first
+    // draft asserted `orch[..hop].contains("spawn_blocking")`, which passes if
+    // *any* `spawn_blocking` appears anywhere earlier in the function — so
+    // moving the finalise back onto the async worker would have kept it green
+    // while a sibling call held the token. A guard that passes when its own
+    // property is violated is worse than no guard. Found by
+    // the concurrency review.
+    assert!(
+        orch.contains("spawn_blocking(move || engine.stop_if("),
+        "the orchestrator's terminal hop no longer finalises through \
+         `spawn_blocking(move || engine.stop_if(...))` — it either persists inline \
+         on the async runtime (`AUD3-n`) or has lost its id fence (`P8-az`)"
+    );
+
+    // And the 1 Hz recorder tick, whose 30th flush rewrites the whole document.
+    let main_body = strip_comments(include_str!("../src/main.rs"));
+    let tick = main_body
+        .lines()
+        .find(|l| l.contains(".tick(&c)") || l.contains("engine.tick(&ctx)"))
+        .expect("the recorder task must still tick the engine");
+    assert!(
+        tick.contains("spawn_blocking"),
+        "the recorder tick flushes the session document on a tokio worker \
+         (`AUD3-n`): {tick}"
+    );
+}
+
+/// A source-scanning guard matches its own explanation unless comments are
+/// stripped first — the `polling.rs` precedent. Attribute-position matching does
+/// not help here because the tokens are ordinary identifiers, so strip instead.
+fn strip_comments(src: &str) -> String {
+    src.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//") && !t.starts_with("*") && !t.starts_with("/*")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ── §18: non-AIO operation unaffected ───────────────────────────────────────
+
+/// §18 "non-AIO operation remains unaffected". The engine holds no session until
+/// one is started, and every accessor is safe in that state.
+#[test]
+fn an_engine_with_no_session_is_inert() {
+    use ventulusd::validation::recorder::ValidationEngine;
+    let engine = ValidationEngine::new();
+
+    assert!(engine.snapshot().is_none());
+    assert!(!engine.is_recording());
+    assert_eq!(
+        engine.push_event(EV_USER_MARKER, None, None),
+        AppendOutcome::NotRecording
+    );
+    assert!(engine.stop().is_none());
+    assert!(engine.cancel().is_none());
+    assert_eq!(
+        engine.add_measurement(ExternalMeasurement {
+            unix_ms: 0,
+            kind: "x".into(),
+            value: 1.0,
+            unit: "V".into(),
+            member_id: None,
+            note: None,
+        }),
+        AppendOutcome::NotRecording
+    );
+}
+
+// ── Token hygiene ───────────────────────────────────────────────────────────
+
+/// Only the two diagnostics the session knows how to run are accepted; an
+/// unknown token is rejected at the door rather than silently ignored, which
+/// would look like a diagnostic that ran and found nothing.
+#[test]
+fn only_known_diagnostics_are_accepted() {
+    assert!(is_known_diagnostic(DIAG_VERIFY));
+    assert!(is_known_diagnostic(DIAG_CHARACTERIZATION));
+    for bad in ["", "characterize", "pwm_char", "verify", "gpu_verify"] {
+        assert!(!is_known_diagnostic(bad), "'{bad}' must not be accepted");
+    }
+}
+
+// ── Cap-and-stop (§4, §9) ───────────────────────────────────────────────────
+
+use std::sync::Arc;
+use ventulusd::validation::recorder::{AppendOutcome, RecorderContext, ValidationEngine};
+
+/// Point the process's state dir at a temp directory so the recorder's periodic
+/// flush writes somewhere harmless. `init_state_dir` is a `OnceLock`, so the
+/// first test to call it wins and the rest share it — which is fine, they all
+/// want the same thing.
+fn temp_state_dir() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    let d = DIR.get_or_init(|| {
+        let d = tempfile::tempdir().unwrap();
+        ventulusd::daemon_state::init_state_dir(d.path().to_str().unwrap());
+        d
+    });
+    d.path()
+}
+
+/// A session with a unique id. The recorder tests share one temp state dir and
+/// run in parallel, so a shared id would have two tests writing the same file.
+fn unique_session(tag: &str) -> ValidationSession {
+    let mut s = session();
+    s.session_id = format!("val-{tag}");
+    s
+}
+
+fn test_context() -> RecorderContext {
+    RecorderContext {
+        cache: Arc::new(ventulusd::health::cache::StateCache::new()),
+        hwmon_controller: None,
+        override_table: Arc::new(parking_lot::Mutex::new(
+            ventulusd::control_override::OverrideTable::new(),
+        )),
+        characterization: Arc::new(parking_lot::Mutex::new(None)),
+        // DEC-335: EMPTY fixture roots, not the real `/sys`. Power discovery
+        // finds nothing here, which is the deterministic answer — pointing these
+        // at the host would make every recorder test depend on whether the
+        // machine running it happens to expose a RAPL zone, which the project's
+        // hardware-fixtures rule forbids. Raised by the concurrency review.
+        hwmon_root: empty_sysfs_root().join("hwmon"),
+        powercap_root: empty_sysfs_root().join("powercap"),
+    }
+}
+
+/// A shared empty directory standing in for `/sys`. One per test binary, like
+/// `temp_state_dir`, so parallel tests share it safely.
+fn empty_sysfs_root() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().unwrap()).path()
+}
+
+/// §4 "keep in-memory/session storage bounded" — and §9's reason it must be
+/// cap-and-stop rather than a ring: the OLDEST samples are the startup evidence,
+/// so evicting them would discard exactly what the session was recording.
+#[test]
+fn reaching_the_sample_cap_finalises_the_session_and_keeps_the_earliest_samples() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    // A memberless device: the cap is about sample COUNT, and an empty member
+    // list keeps each periodic flush small so this test costs a second rather
+    // than fifteen.
+    let mut s = unique_session("cap");
+    s.metadata.members.clear();
+    engine.start(s, &ctx).unwrap();
+
+    let cap = ventulusd::constants::VALIDATION_MAX_SAMPLES;
+    for _ in 0..cap + 10 {
+        if !engine.tick(&ctx) {
+            break;
+        }
+    }
+
+    let s = engine.snapshot().expect("a session must still be readable");
+    assert_eq!(
+        s.state, STATE_COMPLETED,
+        "the cap finalises rather than evicting"
+    );
+    assert!(s.sample_limit_reached, "the reason must be recorded");
+    assert_eq!(s.samples.len(), cap, "bounded at exactly the cap");
+
+    // The startup evidence survived: sample 0 is the FIRST tick, not a
+    // survivor of eviction. A ring buffer would have dropped it.
+    assert_eq!(
+        s.samples[0].elapsed_ms,
+        s.samples.iter().map(|x| x.elapsed_ms).min().unwrap()
+    );
+    assert!(
+        s.events.iter().any(|e| e.kind == EV_SAMPLE_LIMIT),
+        "the timeline must say why it stopped"
+    );
+
+    // And it really stopped — further ticks record nothing.
+    let before = s.samples.len();
+    assert!(!engine.tick(&ctx), "a finalised session must not resume");
+    assert_eq!(engine.snapshot().unwrap().samples.len(), before);
+}
+
+/// §2 "only one active session should control/record a given logical validation
+/// target" — single-flight, enforced at the door.
+#[test]
+fn a_second_session_is_refused_while_one_is_recording() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("single-flight"), &ctx).unwrap();
+
+    let mut second = session();
+    second.session_id = "val-second".into();
+    let err = engine.start(second, &ctx).unwrap_err();
+    assert_eq!(
+        err,
+        ventulusd::validation::recorder::StartError::AlreadyRecording
+    );
+
+    // After it finishes, a new one is allowed.
+    engine.stop().unwrap();
+    let mut third = session();
+    third.session_id = "val-third".into();
+    assert!(engine.start(third, &ctx).is_ok());
+}
+
+/// §18 "validation session start/stop/finalisation", and §8: the summary is
+/// computed at finalisation, by the summariser.
+///
+/// This is the **call-site test** — `summarise` has its own unit coverage above,
+/// but the project rulebook records "extracting a rule into a testable function does NOT
+/// test the call site" as having recurred six times. A `stop()` that forgot to
+/// call it would leave `findings` empty and every test above would still pass.
+#[test]
+fn stopping_a_session_populates_the_findings_via_the_summariser() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("findings"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    let done = engine.stop().expect("stop returns the finalised session");
+    assert_eq!(done.state, STATE_COMPLETED);
+    assert!(done.completed_unix_ms.is_some());
+    assert!(
+        !done.findings.is_empty(),
+        "stop() must run the summariser, not merely change the state"
+    );
+
+    // The findings are the summariser's own output for this session, not a
+    // placeholder — compare against a direct call.
+    let expected = summary::summarise(&done);
+    let got: Vec<_> = done.findings.iter().map(|f| (&f.id, &f.state)).collect();
+    let want: Vec<_> = expected.iter().map(|f| (&f.id, &f.state)).collect();
+    assert_eq!(got, want);
+
+    // A stopped session carries the closing marker.
+    assert!(done.events.iter().any(|e| e.kind == EV_SESSION_STOPPED));
+    assert!(done.events.iter().any(|e| e.kind == EV_SESSION_STARTED));
+}
+
+/// §15: "loss/restart of the GUI must not corrupt an active daemon-side session"
+/// and §18's "GUI disconnect/restart does not create a second control path".
+///
+/// The session lives entirely in the daemon, so a client vanishing is simply an
+/// absence of further requests. Recording continues, and nothing about a client
+/// reconnecting can start a second one while the first is live.
+#[test]
+fn a_client_vanishing_and_reconnecting_cannot_fork_the_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    let started = engine.start(unique_session("reconnect"), &ctx).unwrap();
+
+    // "GUI closes" — no calls at all for a while. Recording is unaffected.
+    engine.tick(&ctx);
+    engine.tick(&ctx);
+    assert!(engine.is_recording());
+    assert_eq!(engine.snapshot().unwrap().samples.len(), 2);
+
+    // "GUI reconnects" and naively tries to start again: refused, and the
+    // original session is untouched.
+    let mut reconnect = session();
+    reconnect.session_id = "val-from-new-client".into();
+    assert!(engine.start(reconnect, &ctx).is_err());
+    let now = engine.snapshot().unwrap();
+    assert_eq!(now.session_id, started.session_id);
+    assert_eq!(now.samples.len(), 2, "the live recording was not disturbed");
+}
+
+/// §5: a user marker lands on the same timeline as the engine's own events.
+#[test]
+fn a_user_marker_is_recorded_only_while_a_session_is_live() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("marker"), &ctx).unwrap();
+
+    assert_eq!(
+        engine.push_event(EV_USER_MARKER, Some("pump to Quiet".into()), None),
+        AppendOutcome::Recorded
+    );
+    let s = engine.snapshot().unwrap();
+    let marker = s
+        .events
+        .iter()
+        .find(|e| e.kind == EV_USER_MARKER)
+        .expect("the marker must be on the timeline");
+    assert_eq!(marker.detail.as_deref(), Some("pump to Quiet"));
+
+    engine.stop();
+    assert_eq!(
+        engine.push_event(EV_USER_MARKER, Some("too late".into()), None),
+        AppendOutcome::NotRecording,
+        "a finalised session must not accept new events"
+    );
+}
+
+/// §14: external measurements are stored and returned, and are read by nothing.
+#[test]
+fn external_measurements_are_stored_untrusted_and_bounded() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("measurements"), &ctx).unwrap();
+
+    assert_eq!(
+        engine.add_measurement(ExternalMeasurement {
+            unix_ms: 1,
+            kind: "supply_voltage_v".into(),
+            value: 11.94,
+            unit: "V".into(),
+            member_id: Some("hwmon:it87:pwm2:PUMP".into()),
+            note: None,
+        }),
+        AppendOutcome::Recorded
+    );
+    let s = engine.snapshot().unwrap();
+    assert_eq!(s.external_measurements.len(), 1);
+    assert_eq!(s.external_measurements[0].value, 11.94);
+
+    // Bounded — a client cannot grow the session without limit, and past the
+    // cap it is TOLD so (`DC-m`), rather than told no session is recording.
+    let cap = ventulusd::constants::VALIDATION_MAX_EXTERNAL_MEASUREMENTS;
+    let outcomes: Vec<AppendOutcome> = (0..cap + 50)
+        .map(|i| {
+            engine.add_measurement(ExternalMeasurement {
+                unix_ms: i as u64,
+                kind: "pwm_duty_pct".into(),
+                value: 50.0,
+                unit: "%".into(),
+                member_id: None,
+                note: None,
+            })
+        })
+        .collect();
+    assert_eq!(engine.snapshot().unwrap().external_measurements.len(), cap);
+    // One was added above, so the loop's first `cap - 1` land and the rest are full.
+    assert!(outcomes[..cap - 1]
+        .iter()
+        .all(|o| *o == AppendOutcome::Recorded));
+    assert!(outcomes[cap - 1..]
+        .iter()
+        .all(|o| *o == AppendOutcome::Full { limit: cap }));
+}
+
+/// `DC-m`: a marker past the event cap is reported as not recorded. The engine
+/// used to drop it and answer `true`, which the route turned into
+/// `200 {"recorded": true}`.
+#[test]
+fn a_marker_past_the_event_cap_is_reported_full_not_recorded() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("event-cap"), &ctx).unwrap();
+
+    let cap = ventulusd::constants::VALIDATION_MAX_EVENTS;
+    let mut recorded = 0;
+    while engine.push_event(EV_USER_MARKER, None, None) == AppendOutcome::Recorded {
+        recorded += 1;
+        assert!(recorded <= cap, "the event cap must bind");
+    }
+    assert!(
+        recorded > 0,
+        "precondition: markers were recorded before the cap"
+    );
+    assert_eq!(engine.snapshot().unwrap().events.len(), cap);
+    assert_eq!(
+        engine.push_event(EV_USER_MARKER, Some("late".into()), None),
+        AppendOutcome::Full { limit: cap }
+    );
+    assert_eq!(engine.snapshot().unwrap().events.len(), cap);
+}
+
+// ── Interleavings (added after the DEC-317 concurrency review) ──────────────
+//
+// The suite above is entirely synchronous, and that is exactly why four defects
+// survived it: a session fence, a lock order, a save race and a rollback. Each
+// test below reproduces one deterministically — with channels and held locks,
+// never a wall-clock sleep, so none can flake and none depends on timing.
+
+/// **The session fence.** An orchestration outlives a cancel, and without a fence
+/// it appends the previous session's evidence to whatever session is live now.
+///
+/// This is fabricated evidence in the one artefact whose contract says nothing is
+/// fabricated, and it changes the new session's findings.
+#[test]
+fn evidence_from_a_cancelled_session_cannot_land_on_its_successor() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    engine.start(unique_session("fence-a"), &ctx).unwrap();
+    let a_id = "val-fence-a".to_string();
+
+    // The user cancels A and immediately starts B — legal, and the exact
+    // interleaving an in-flight orchestration sees.
+    engine.cancel().unwrap();
+    engine.start(unique_session("fence-b"), &ctx).unwrap();
+
+    // Orchestration A, still running, tries to file its result.
+    let accepted = engine.attach_evidence_for(
+        &a_id,
+        EvidenceRef {
+            kind: DIAG_CHARACTERIZATION.into(),
+            member_id: "hwmon:it87:pwm2:PUMP".into(),
+            run_id: Some("char-from-A".into()),
+            started_unix_ms: 1,
+            completed_unix_ms: Some(2),
+            outcome: RESULT_OBSERVED.into(),
+            detail: None,
+            characterization: None,
+            verify: None,
+            control_path: None,
+        },
+    );
+    let event_accepted = engine.push_event_for(&a_id, EV_CHAR_COMPLETED, None, Some("pump".into()));
+
+    assert!(
+        !accepted,
+        "A's evidence must be refused once A is not the live session"
+    );
+    assert!(!event_accepted, "and so must A's events");
+
+    let b = engine.snapshot().unwrap();
+    assert_eq!(b.session_id, "val-fence-b");
+    assert!(
+        b.evidence.is_empty(),
+        "B must not carry a diagnostic it never requested"
+    );
+    assert!(
+        !b.events.iter().any(|e| e.kind == EV_CHAR_COMPLETED),
+        "nor an event from A's run"
+    );
+
+    // The fence is on identity, not on refusing everything: B's own evidence
+    // still lands, so this test cannot pass by rejecting all writes.
+    assert!(engine.attach_evidence_for(
+        &b.session_id,
+        EvidenceRef {
+            kind: DIAG_VERIFY.into(),
+            member_id: "hwmon:it87:pwm2:PUMP".into(),
+            run_id: None,
+            started_unix_ms: 3,
+            completed_unix_ms: Some(4),
+            outcome: RESULT_OBSERVED.into(),
+            detail: None,
+            characterization: None,
+            verify: None,
+            control_path: None,
+        },
+    ));
+    assert_eq!(engine.snapshot().unwrap().evidence.len(), 1);
+}
+
+/// **The lock order.** A wedged hwmon write must not stall the recorder or the poll.
+///
+/// The recorder reads the controller once a second. Doing that *while holding the
+/// session lock* — which `/status` and `/poll` also take — means a header wedged
+/// in `std::fs::write` blocks every 1 Hz poll task in a non-cancellable
+/// `parking_lot` acquisition on a tokio worker, and once the workers are
+/// exhausted the profile-engine loop cannot be polled at all.
+///
+/// **The assertion is that `tick` RETURNS**, not that `live_summary` is fast.
+/// The first version of this test measured `live_summary` latency from the main
+/// thread and passed with the defect reinstated, because it usually won the race
+/// to the lock before the ticker ever took it. `tick` completing is deterministic:
+/// under the correct order it gives up on the controller after a short timeout,
+/// and under the bad order it cannot return until the wedge releases.
+///
+/// **The wedge is now established BEFORE `start`, which is `AUD3-k`.** Until
+/// 2026-09-04 this test started the session first, so `tick` was the only entry
+/// point ever exercised against a wedged controller — and `start` was meanwhile
+/// performing the exact inversion the comment above forbids, holding the session
+/// slot across a bare blocking `c.lock()` inside `seed_watch`. A `POST
+/// /validation/session` arriving during a DEC-278/289 wedge therefore parked a
+/// tokio worker indefinitely *while holding the slot*, blocking the recorder,
+/// `GET /validation/session` and `recording_session_id()` behind it. Both entry
+/// points are asserted here now, in the order a real session meets them.
+#[test]
+fn a_wedged_controller_stalls_neither_the_recorder_nor_the_poll() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    temp_state_dir();
+    let engine = Arc::new(ValidationEngine::new());
+    let mut ctx = test_context();
+
+    // No headers, so it can never write anything — the recorder only reads
+    // `last_commanded_pct` and `enable_revert_counts`, both header-keyed. No
+    // mock writer needed.
+    let controller = Arc::new(parking_lot::Mutex::new(
+        ventulusd::hwmon::pwm_control::HwmonPwmController::new(
+            Vec::new(),
+            ventulusd::hwmon::lease::LeaseManager::new(),
+            Box::new(ventulusd::hwmon::pwm_control::RealSysfsWriter),
+            ctx.cache.clone(),
+        ),
+    ));
+    ctx.hwmon_controller = Some(controller.clone());
+
+    // Wedge the controller from another thread, BEFORE the session starts. The
+    // self-releasing deadline is deliberate: a failed assertion below skips this
+    // test's own cleanup, and an unbounded held lock would turn a red test into a
+    // hung CI job (DEC-272).
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let held = controller.clone();
+    let wedge = std::thread::spawn(move || {
+        let _guard = held.lock();
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+
+    // Precondition: the wedging thread genuinely holds it. Without this the
+    // test can pass by measuring a lock nobody ever took.
+    let mut waited = 0;
+    while controller.try_lock().is_some() {
+        std::thread::sleep(Duration::from_millis(5));
+        waited += 1;
+        assert!(waited < 400, "the wedging thread never took the lock");
+    }
+
+    // THE FIRST assertion (`AUD3-k`): `start` returns while the controller is
+    // wedged. On another thread with a bounded wait, for the same reason `tick`
+    // is below — a `join` on the bad ordering hangs the job instead of failing it.
+    let (start_tx, start_rx) = mpsc::channel::<bool>();
+    {
+        let engine = engine.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let ok = engine.start(unique_session("lockorder"), &ctx).is_ok();
+            let _ = start_tx.send(ok);
+        });
+    }
+    let admitted = start_rx.recv_timeout(Duration::from_secs(3)).expect(
+        "start() did not return while the controller was wedged — it is \
+                 holding the session lock across an unbounded controller acquisition",
+    );
+    assert!(
+        admitted,
+        "the session must still be admitted: a missed watchdog baseline costs one \
+         spurious first-tick event, and is never a reason to refuse a recording"
+    );
+
+    // Tick on another thread, reporting completion through a channel so we can
+    // bound the wait instead of blocking forever on `join`.
+    let (done_tx, done_rx) = mpsc::channel::<bool>();
+    {
+        let engine = engine.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let recorded = engine.tick(&ctx);
+            let _ = done_tx.send(recorded);
+        });
+    }
+
+    // THE assertion. Correct order: the tick abandons the controller after
+    // `CONTROLLER_READ_TIMEOUT` and returns. Bad order: it holds the session lock
+    // and blocks here until the 10 s wedge releases.
+    let recorded = done_rx.recv_timeout(Duration::from_secs(3)).expect(
+        "tick() did not return while the controller was wedged — it is \
+                 holding the session lock across the controller acquisition",
+    );
+    assert!(recorded, "the tick still recorded a sample");
+
+    // And the poll surface stays responsive throughout.
+    let start = Instant::now();
+    let summary = engine.live_summary();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "the poll surface blocked behind a wedged controller"
+    );
+    assert!(
+        summary.is_some(),
+        "a started session must be visible to the poll"
+    );
+
+    let _ = release_tx.send(());
+    wedge.join().unwrap();
+
+    // It recorded honestly: with the controller unavailable the commanded duty
+    // is absent rather than invented.
+    let s = engine.snapshot().unwrap();
+    let sample = s.samples.last().expect("a sample was recorded");
+    assert!(
+        sample.members.iter().all(|m| m.requested_pct.is_none()),
+        "an unreadable controller must yield `None`, never a fabricated duty"
+    );
+}
+
+/// **The rejected start must not disturb the live session's baselines** —
+/// the hazard `AUD3-k`'s fix introduces, and the reason the seed is computed
+/// into a local rather than written straight into `self.watch`.
+///
+/// Moving `seed_watch` above the slot guard also moves it above the
+/// `AlreadyRecording` check, so a second `POST /validation/session` now reads the
+/// live values on its way to being refused. If it *installed* them, it would
+/// silently re-baseline the recording session and the next tick would report no
+/// change — a thermal failsafe entered between the two calls would vanish from
+/// the timeline of the session that was running when it happened.
+///
+/// Asserted through the event the baseline produces, because `Watch` is private:
+/// an intact baseline says "normal", sees "emergency", and emits. A clobbered one
+/// says "emergency", sees "emergency", and says nothing.
+#[test]
+fn a_refused_start_does_not_reseed_the_recording_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    // Baseline: normal, at session start.
+    ctx.cache.record_engine_tick("normal", 105.0);
+    engine.start(unique_session("reseed-a"), &ctx).unwrap();
+
+    // The ladder trips while the session is recording, and BEFORE the next tick
+    // observes it — the window a re-seed would erase.
+    ctx.cache.record_engine_tick("emergency", 105.0);
+
+    // A second start arrives in that window and is refused.
+    let err = engine.start(unique_session("reseed-b"), &ctx).unwrap_err();
+    assert_eq!(
+        err,
+        ventulusd::validation::recorder::StartError::AlreadyRecording
+    );
+
+    // The refused start must have left A's baselines alone.
+    assert!(engine.tick(&ctx), "A is still recording");
+    let s = engine.snapshot().unwrap();
+    assert!(
+        s.events.iter().any(|e| e.kind == EV_THERMAL_ENTERED),
+        "the failsafe A was recording through must still reach A's timeline; a \
+         refused start re-seeded its baselines"
+    );
+    assert_eq!(
+        s.session_id, "val-reseed-a",
+        "and the refused start must not have installed itself"
+    );
+
+    engine.stop();
+}
+
+/// **The save race.** A periodic flush must never republish a stale `recording`
+/// copy over a session that has already finalised.
+///
+/// If it does, the next boot sweep sees `recording`, marks a cleanly-stopped
+/// session `interrupted`, and discards its findings.
+#[test]
+fn a_late_flush_cannot_resurrect_a_finalised_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("saverace"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // Take the copy a flush would hold: still `recording`.
+    let stale = engine.snapshot().unwrap();
+    assert_eq!(stale.state, STATE_RECORDING);
+
+    // The session finalises while that copy is in flight.
+    let done = engine.stop().unwrap();
+    assert_eq!(done.state, STATE_COMPLETED);
+    assert!(!done.findings.is_empty());
+
+    // Now the flush lands. It must be dropped, not published.
+    engine.persist_for_test(&stale);
+
+    let dir = temp_state_dir().join("validation");
+    let back = store::load_from(&dir, &done.session_id).unwrap().unwrap();
+    assert_eq!(
+        back.state, STATE_COMPLETED,
+        "a stale recording copy must not overwrite a finalised session"
+    );
+    assert!(!back.findings.is_empty(), "and its findings must survive");
+
+    // The consequence the guard prevents: a boot sweep must not "repair" THIS
+    // session. Scoped to it by id rather than asserting the sweep found nothing
+    // at all — the temp state dir is shared with the other tests in this file,
+    // several of which deliberately leave a session recording.
+    let repaired = store::sweep_interrupted(&dir, "daemon_restart");
+    assert!(
+        !repaired.contains(&done.session_id),
+        "a cleanly-stopped session must not be repaired to `interrupted`"
+    );
+}
+
+/// **The shutdown flush shares the stale-write guard.** Found in review of DEC-323.
+///
+/// The recorder task's last write used to call `store::save` directly, bypassing
+/// `persist`'s `save_lock` and its supersession check. That is a live race, and
+/// DEC-323 made it likelier by moving the concurrent writer onto the blocking
+/// pool: a `POST /validation/session/stop` in flight when shutdown is signalled
+/// publishes `completed`, while the flush holds a `recording` snapshot taken
+/// before it — and whichever `rename` lands second wins. The stale copy
+/// resurrects a cleanly-stopped session as `recording`, and the next boot sweep
+/// "repairs" it to `interrupted` and discards its findings.
+///
+/// Two halves, because the rule and its call site are different claims: the
+/// engine method must obey the guard, and `main.rs` must actually use it.
+#[test]
+fn the_shutdown_flush_cannot_resurrect_a_finalised_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine
+        .start(unique_session("shutdown-flush"), &ctx)
+        .unwrap();
+    engine.tick(&ctx);
+
+    // While recording, it writes.
+    assert!(
+        engine.flush_recording(),
+        "a recording session must be flushed at shutdown"
+    );
+    let dir = temp_state_dir().join("validation");
+    let back = store::load_from(&dir, "val-shutdown-flush")
+        .unwrap()
+        .unwrap();
+    assert_eq!(back.state, STATE_RECORDING);
+
+    // Once finalised it writes nothing — and, critically, cannot publish a
+    // `recording` copy over the `completed` one.
+    let done = engine.stop().unwrap();
+    assert_eq!(done.state, STATE_COMPLETED);
+    assert!(
+        !engine.flush_recording(),
+        "a finalised session must not be re-flushed as `recording`"
+    );
+    let back = store::load_from(&dir, "val-shutdown-flush")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        back.state, STATE_COMPLETED,
+        "the shutdown flush must not resurrect a finalised session"
+    );
+    assert!(!back.findings.is_empty(), "and its findings must survive");
+
+    // The call site: `main.rs` must reach the disk through the engine, so the
+    // guard applies. A direct `store::save` there would satisfy every assertion
+    // above and still carry the race.
+    let main_body = strip_comments(include_str!("../src/main.rs"));
+    assert!(
+        main_body.contains("engine.flush_recording()"),
+        "the recorder task's shutdown flush must go through the engine"
+    );
+    assert!(
+        !main_body.contains("store::save"),
+        "main.rs must not write a session document directly — that bypasses \
+         `persist`'s save_lock and stale-write guard"
+    );
+}
+
+/// **The rollback.** A failed persist must clear only the session it installed.
+///
+/// A slow failing save can outlive its own session — `stop()` finalises it and a
+/// second `POST` legitimately admits a new one — and an unconditional clear would
+/// then silently wipe a session this call never installed.
+#[test]
+fn a_failed_start_rollback_cannot_wipe_a_later_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    engine.start(unique_session("rollback-b"), &ctx).unwrap();
+    let live = engine.snapshot().unwrap();
+
+    // Simulate A's late rollback arriving with a foreign id.
+    engine.rollback_for_test("val-rollback-a");
+
+    let after = engine.snapshot().expect("B must still be installed");
+    assert_eq!(after.session_id, live.session_id);
+    assert!(engine.is_recording(), "B must still be recording");
+
+    // The fence is on identity, not a no-op: rolling back B's own id does clear it.
+    engine.rollback_for_test(&live.session_id);
+    assert!(engine.snapshot().is_none());
+}
+
+// ── AUD3-i: the persisted document must be bounded in BYTES, not only in rows ──
+
+/// Realistic AIO ids, at the length the daemon actually produces.
+fn aio_member_ids(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| format!("hwmon:it8696:isa-0a40:pwm{i}:CHA_FAN{i}"))
+        .collect()
+}
+
+/// Member ids at `MAX_DEVICE_TEXT_BYTES` — the widest a client can now get past
+/// `validate_device` (`P8-bs`).
+///
+/// The ancillary reservation has to be measured against THIS, not against
+/// `aio_member_ids`' realistic ~40-byte ids. These strings are copied verbatim
+/// into `members[].member_id` and `.label`, `radiator_members` and
+/// `sweep_members`, and until `P8-bs` they were bounded by nothing — which is
+/// exactly why `VALIDATION_MAX_ANCILLARY_BYTES` recorded them as a term its
+/// measurement could not cover. Now that they are bounded, the worst case is
+/// computable and the fixture must take it (DEC-320: measure the realised
+/// artefact, and bound the input at ingest).
+fn aio_member_ids_at_bound(n: usize) -> Vec<String> {
+    let bound = ventulusd::hwmon::cooling_device::MAX_DEVICE_TEXT_BYTES;
+    (0..n)
+        .map(|i| {
+            let head = format!("hwmon:it8696:isa-0a40:pwm{i}:CHA_FAN{i}:");
+            assert!(
+                head.len() <= bound,
+                "the distinguishing prefix no longer fits the ingest bound"
+            );
+            format!("{head}{}", "a".repeat(bound - head.len()))
+        })
+        .collect()
+}
+
+/// A session over `n` members whose samples carry `sensor` as their
+/// `temperature_sensor` — the field `recorder.rs` copies into every sample.
+fn sized_session(tag: &str, n: usize, sensor: &str) -> ValidationSession {
+    let ids = aio_member_ids(n);
+    let mut s = session();
+    s.session_id = format!("val-{tag}");
+    s.metadata.temperature_sensor = Some(sensor.to_string());
+    s.metadata.members = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| member(id, if i == 0 { MEMBER_PUMP } else { MEMBER_RADIATOR }))
+        .collect();
+    s
+}
+
+/// Fill `s` to its derived cap with **the sample the probe measures** (`P8-ae`).
+///
+/// `worst_case_sample` is the production constructor `probe_sample_bytes` divides
+/// the budget by, so filling from it makes the realised file land *at* the budget
+/// rather than under it — which is what gives this fixture the power to detect an
+/// under-count at all.
+///
+/// It did not, until 2026-09-08. The fixture built its own sample by hand and was
+/// systematically narrower than the probe at nearly every field — an 18-char power
+/// float against the probe's 23, `enable_revert_count: 0` against `u64::MAX`,
+/// `"normal"` against `"no_sensor_fallback"`, mid-range integers against
+/// `u8::MAX`/`u16::MAX` — for roughly 1.8 kB of slack per sample at 65 members.
+/// Its own comment claimed the opposite ("the cap probe assumes every optional
+/// field is PRESENT at its widest"), which is true of *presence* and was false of
+/// *width*, and that is exactly the gap the comment hid. The realised file
+/// therefore sat far below its budget however wrong the probe was, so **any probe
+/// under-count smaller than the slack passed** — including the 10-byte power
+/// rendering error caught by review rather than by this test.
+fn fill_to_cap(s: &mut ValidationSession) -> usize {
+    let cap = max_samples_for(s, ventulusd::constants::VALIDATION_MAX_SAMPLE_BYTES);
+    let probe = worst_case_sample(s);
+    s.samples = vec![probe; cap];
+    cap
+}
+
+/// Save `s` and return the realised file length.
+fn saved_len(dir: &std::path::Path, s: &ValidationSession) -> u64 {
+    store::save_to(dir, s).expect("a session at its own cap must be writable");
+    std::fs::metadata(dir.join(format!("{}.json", s.session_id)))
+        .unwrap()
+        .len()
+}
+
+/// **The regression test for `AUD3-i`.** A pump plus two radiator fans, recorded
+/// to the session's own cap, must still read back.
+///
+/// Before the fix the store wrote with no byte bound and read under
+/// `atomic_io::MAX_CONFIG_BYTES` (4 MiB), while a three-member session at 7200
+/// samples serialises to ~7.8 MiB. The file was written successfully and was then
+/// invisible to *every* read path at once: `load_from` failed, `list_from` skipped
+/// it, `GET /validation/sessions/{id}` 500'd, `sweep_interrupted` could never
+/// repair it and `prune` could never delete it, so it also leaked disk for ever.
+#[test]
+fn a_session_at_its_derived_cap_still_reads_back_from_the_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = sized_session("bytes-cap", 3, "hwmon:k10temp:k10temp-pci-00c3:Tctl");
+    let cap = fill_to_cap(&mut s);
+    let len = saved_len(tmp.path(), &s);
+
+    assert!(
+        len <= ventulusd::constants::VALIDATION_MAX_SESSION_BYTES,
+        "a session at its derived cap wrote {len} bytes, over the {} the store can read",
+        ventulusd::constants::VALIDATION_MAX_SESSION_BYTES
+    );
+    // The precondition that makes this test non-vacuous: the file must actually
+    // be big enough to have tripped the old 4 MiB cap, or it proves nothing.
+    assert!(
+        len > ventulusd::atomic_io::MAX_CONFIG_BYTES,
+        "this fixture no longer reproduces the defect: {len} bytes is under the \
+         old {} cap, so it would have round-tripped before the fix too",
+        ventulusd::atomic_io::MAX_CONFIG_BYTES
+    );
+
+    let back = store::load_from(tmp.path(), "val-bytes-cap")
+        .expect("a session the store wrote must be readable");
+    assert!(back.is_some(), "the session must load, not vanish");
+    assert_eq!(back.unwrap().samples.len(), cap);
+    assert_eq!(
+        store::list_from(tmp.path()).len(),
+        1,
+        "and it must be listed"
+    );
+}
+
+/// The byte bound must hold **as a realised file**, across every topology —
+/// including the many-member case where the derivation actually binds.
+///
+/// The first version of this test compared the derived cap against a per-sample
+/// size measured with a *standalone* `to_vec_pretty`, which is strictly smaller
+/// than the nested marginal cost the production code divides by — so it held by
+/// construction and **passed with the nesting correction deleted**. That is this
+/// project's recurring "the unit test proves you answered, never that you were
+/// asked" shape, and it was caught by the security review, not by the test.
+/// Asserting the length of the file that is actually written cannot go vacuous
+/// the same way.
+#[test]
+fn every_topology_writes_a_file_the_store_can_read_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hard = ventulusd::constants::VALIDATION_MAX_SAMPLES;
+    let budget = ventulusd::constants::VALIDATION_MAX_SAMPLE_BYTES;
+    let cap_bytes = ventulusd::constants::VALIDATION_MAX_SESSION_BYTES;
+    let mut derivation_bound_at_least_once = false;
+
+    // 65 = the maximum a device may claim (1 pump + 2 x MAX_MEMBERS_PER_LIST).
+    for n in [1usize, 3, 8, 65] {
+        let mut s = sized_session(
+            &format!("topo-{n}"),
+            n,
+            "hwmon:k10temp:k10temp-pci-00c3:Tctl",
+        );
+        let cap = fill_to_cap(&mut s);
+        assert!(cap > 0, "{n} members must still record at least one sample");
+        if cap < hard {
+            derivation_bound_at_least_once = true;
+        }
+        let len = saved_len(tmp.path(), &s);
+        assert!(
+            len <= cap_bytes,
+            "{n} members: {cap} samples wrote {len} bytes, over the {cap_bytes} cap"
+        );
+
+        // And the SAMPLES portion must stay inside its own budget, measured as
+        // the difference the samples make to the realised file. The whole-file
+        // check above is satisfied by the read cap's headroom and so cannot see
+        // an over-spending derivation; this can. It is also the invariant the
+        // `VALIDATION_MAX_SESSION_BYTES > SAMPLE + ANCILLARY` assertion rests
+        // on — if samples may exceed their budget, the ancillary reservation is
+        // not sound and the const assert is decoration.
+        let mut empty = s.clone();
+        empty.session_id = format!("{}-empty", s.session_id);
+        empty.samples.clear();
+        let samples_bytes = len - saved_len(tmp.path(), &empty);
+        assert!(
+            samples_bytes as usize <= budget,
+            "{n} members: the samples array realised {samples_bytes} bytes, over its {budget} budget"
+        );
+        assert!(
+            store::load_from(tmp.path(), &s.session_id)
+                .unwrap()
+                .is_some(),
+            "{n} members: the file the store just wrote must read back"
+        );
+    }
+    // Or the loop only ever exercised the clamp and proved nothing about the
+    // derivation — the same precondition discipline as the test above.
+    assert!(
+        derivation_bound_at_least_once,
+        "no topology in this sweep was actually bounded by the byte budget"
+    );
+}
+
+// ── P8-s: the ancillary reservation must cover the ancillary content ──────────
+
+/// The widest an `f64` in this document renders.
+///
+/// Same reasoning as `session::WIDEST_POWER_SAMPLE`, and the same trap: the
+/// widest rendering is **not** a full-precision value near the top of the range
+/// but a small arbitrary quotient, which switches to compact scientific notation
+/// below ~1e-5 and serialises to 23 characters. Pinned by
+/// `the_widest_measurement_value_is_really_the_widest`.
+const WIDEST_MEASUREMENT_VALUE: f64 = 10.0 / 900_000.0;
+
+/// Allowance for a **daemon-produced** token — a verdict, a direction, an
+/// interpretation state, a provenance key.
+///
+/// These are not client text and must not be measured as if they were: padding
+/// every enum to `VALIDATION_MAX_TEXT_FIELD_BYTES` inflated the evidence term
+/// from ~0.3 MB to 4.2 MB, which would have sized the reservation from a fiction.
+/// A bound that is mostly padding is not a bound. Pinned by
+/// `no_daemon_token_exceeds_the_evidence_allowance`, which sweeps the real ones.
+const WIDEST_DAEMON_TOKEN: usize = 64;
+
+/// A `CharacterizationRun` at every cap it has, for the `evidence` term.
+///
+/// Every array is at its constant-defined length and every optional field is
+/// present at its widest, so this over-states a real run rather than modelling
+/// one. See the `evidence` note on `VALIDATION_MAX_ANCILLARY_BYTES` for the
+/// honest limit: the run's own size is bounded by these caps, not by a byte
+/// budget of its own.
+fn widest_characterization_run() -> ventulusd::api::characterization::CharacterizationRun {
+    use ventulusd::api::characterization as ch;
+    let t = ventulusd::constants::VALIDATION_MAX_TEXT_FIELD_BYTES;
+    let tok = WIDEST_DAEMON_TOKEN;
+    let n = ventulusd::constants::CHARACTERIZATION_MAX_POINTS;
+    ch::CharacterizationRun {
+        run_id: text_at(tok),
+        header_id: text_at(tok),
+        state: text_at(tok),
+        requested_points_pct: vec![u8::MAX; n],
+        settle_seconds: u64::MAX,
+        points: (0..n)
+            .map(|_| ch::CharPoint {
+                requested_pct: u8::MAX,
+                command_accepted: true,
+                readback_pct: Some(u8::MAX),
+                readback_raw: Some(u8::MAX),
+                pwm_enable: Some(u8::MAX),
+                rpm_before: Some(u16::MAX),
+                rpm_after: Some(u16::MAX),
+                settle_ms: u64::MAX,
+                first_change_ms: Some(u64::MAX),
+                readback_verdict: text_at(tok),
+                rpm_verdict: text_at(tok),
+                direction: text_at(tok),
+                step_index: u16::MAX,
+                settled_ms: Some(u64::MAX),
+                stability: Some(ch::PointStability {
+                    samples: u32::MAX,
+                    usable: u32::MAX,
+                    dropouts: u32::MAX,
+                    outliers: u32::MAX,
+                    mean_rpm: Some(WIDEST_MEASUREMENT_VALUE),
+                    median_rpm: Some(u16::MAX),
+                    min_rpm: Some(u16::MAX),
+                    max_rpm: Some(u16::MAX),
+                    stddev_rpm: Some(WIDEST_MEASUREMENT_VALUE),
+                    cv_pct: Some(WIDEST_MEASUREMENT_VALUE),
+                    verdict: text_at(tok),
+                    sample_interval_ms: u64::MAX,
+                    dwell_ms: u64::MAX,
+                    window_start_ms: u64::MAX,
+                    update_interval_ms: Some(u64::MAX),
+                }),
+                estimated_physical_rpm: Some(ch::EstimatedRpm {
+                    value: u16::MAX,
+                    provenance: text_at(tok),
+                    correction_factor: WIDEST_MEASUREMENT_VALUE,
+                    correction_source: text_at(tok),
+                }),
+            })
+            .collect(),
+        summary: Some(ch::CharSummary {
+            command_acceptance: text_at(tok),
+            pwm_readback: text_at(tok),
+            rpm_response: text_at(tok),
+            min_tested_pct: Some(u8::MAX),
+            max_tested_pct: Some(u8::MAX),
+            min_rpm: Some(u16::MAX),
+            max_rpm: Some(u16::MAX),
+            monotonic: Some(true),
+            monotonic_falling: Some(true),
+            monotonic_rising: Some(true),
+            dead_zone_upper_pct: Some(u8::MAX),
+            clamp_pct: Some(u8::MAX),
+            possible_device_override: true,
+            interference_detected: true,
+            hysteresis_pct: Some(WIDEST_MEASUREMENT_VALUE),
+            hysteresis_verdict: text_at(tok),
+            hysteresis_worst_duty_pct: Some(u8::MAX),
+            hysteresis_worst_delta_rpm: Some(u16::MAX),
+            hysteresis_compared_points: u32::MAX,
+            min_responsive_pct: Some(u8::MAX),
+            max_responsive_pct: Some(u8::MAX),
+            low_plateau_to_pct: Some(u8::MAX),
+            saturation_from_pct: Some(u8::MAX),
+            plateaus: vec![
+                ch::PlateauSpan {
+                    from_pct: u8::MAX,
+                    to_pct: u8::MAX,
+                    rpm_min: u16::MAX,
+                    rpm_max: u16::MAX,
+                };
+                n
+            ],
+            stability_verdict: text_at(tok),
+            worst_cv_pct: Some(WIDEST_MEASUREMENT_VALUE),
+            total_dropouts: u32::MAX,
+            total_outliers: u32::MAX,
+            measurement_resolution_ms: Some(u64::MAX),
+            typical_response_ms: Some(u64::MAX),
+            typical_settling_ms: Some(u64::MAX),
+            outside_learned_range: Some(true),
+            learned_range_note: Some(text_at(t)),
+            interpretation_states: vec![text_at(tok); n],
+        }),
+        original_pct: Some(u8::MAX),
+        restore_failed: true,
+        restore_outcome: text_at(tok),
+        detail: Some(text_at(t)),
+        bidirectional: true,
+        stability_seconds: u64::MAX,
+        completed_unix_ms: Some(u64::MAX),
+        provenance: (0..n)
+            .map(|i| (format!("{i:02}{}", text_at(tok - 2)), text_at(tok)))
+            .collect(),
+        // `P8-bg`: present at its widest, per this function's rule — a run
+        // snapshotted mid-hold carries one.
+        current_step: Some(ch::RunStep {
+            phase: text_at(tok),
+            index: u16::MAX,
+            duty_pct: u8::MAX,
+            started_unix_ms: u64::MAX,
+            max_ms: u64::MAX,
+        }),
+    }
+}
+
+/// A string of exactly `n` bytes, which is what every bounded text field is
+/// allowed to be. `too_long` rejects `len() > BOUND`, so `BOUND` itself passes.
+fn text_at(n: usize) -> String {
+    "x".repeat(n)
+}
+
+/// A session holding the worst-case **ancillary** content and no samples: every
+/// non-sample array at its cap, every bounded text field at its bound.
+///
+/// This is the document `VALIDATION_MAX_ANCILLARY_BYTES` reserves for, built
+/// from the caps that bound it rather than from a per-item byte estimate — the
+/// estimate is what `P8-s` was.
+fn worst_case_ancillary_session(tag: &str) -> ValidationSession {
+    use ventulusd::constants as k;
+    let t = k::VALIDATION_MAX_TEXT_FIELD_BYTES;
+
+    // 65 members = the maximum a device may claim (1 pump + 2 x MAX_MEMBERS_PER_LIST),
+    // the same ceiling `every_topology_writes_a_file_the_store_can_read_back` sweeps to.
+    // At the INGEST BOUND, not realistic (`P8-bs`) — see `aio_member_ids_at_bound`.
+    let ids = aio_member_ids_at_bound(65);
+    let mut s = session();
+    s.session_id = format!("val-{tag}");
+    s.state = STATE_COMPLETED.into();
+    s.completed_unix_ms = Some(u64::MAX);
+    s.interrupted_reason = Some(text_at(t));
+    s.truncated_at_unix_ms = Some(u64::MAX);
+    s.sample_limit_reached = true;
+
+    s.metadata.temperature_sensor = Some(text_at(t));
+    s.metadata.coolant_sensor = Some(text_at(t));
+    s.metadata.active_profile_id = Some(text_at(t));
+    s.metadata.active_profile_name = Some(text_at(t));
+    s.metadata.members = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| member(id, if i == 0 { MEMBER_PUMP } else { MEMBER_RADIATOR }))
+        .collect();
+    s.metadata.radiator_members = ids.clone();
+    s.metadata.user_metadata = (0..k::VALIDATION_MAX_METADATA_KEYS)
+        .map(|i| {
+            (
+                format!(
+                    "{i:02}{}",
+                    text_at(k::VALIDATION_MAX_METADATA_KEY_BYTES - 2)
+                ),
+                text_at(k::VALIDATION_MAX_METADATA_VALUE_BYTES),
+            )
+        })
+        .collect();
+
+    // Bounded at ingest by `normalise_diagnostics` to the size of the token set.
+    s.requested_diagnostics = KNOWN_DIAGNOSTICS.iter().map(|d| d.to_string()).collect();
+    s.sweep_members = ids
+        .iter()
+        .take(k::VALIDATION_MAX_SWEEP_MEMBERS)
+        .cloned()
+        .collect();
+
+    // `detail` AND `member_id` are each permitted at the text bound — which is
+    // the arithmetic `P8-s` found wrong: the reservation was derived from ~760 B
+    // per event against a real worst case of ~1.1 kB.
+    s.events = (0..k::VALIDATION_MAX_EVENTS)
+        .map(|_| ValidationEvent {
+            elapsed_ms: u64::MAX,
+            unix_ms: u64::MAX,
+            kind: EV_DISCOVERY_COMPLETED.into(),
+            detail: Some(text_at(t)),
+            member_id: Some(text_at(t)),
+        })
+        .collect();
+
+    // Four bounded text fields each, so a measurement is wider than an event.
+    s.external_measurements = (0..k::VALIDATION_MAX_EXTERNAL_MEASUREMENTS)
+        .map(|_| ExternalMeasurement {
+            unix_ms: u64::MAX,
+            kind: text_at(t),
+            value: WIDEST_MEASUREMENT_VALUE,
+            unit: text_at(t),
+            member_id: Some(text_at(t)),
+            note: Some(text_at(t)),
+        })
+        .collect();
+
+    // One finding per member per finding id is far above what `summarise`
+    // produces, and the summariser is the only writer.
+    s.findings = ids
+        .iter()
+        .flat_map(|id| {
+            [F_PWM_HEADER_CONTROL, F_PWM_READBACK, F_PUMP_RPM].map(move |f| ValidationFinding {
+                id: f.into(),
+                state: RESULT_NOT_TESTED.into(),
+                detail: Some(text_at(t)),
+                member_id: Some(id.clone()),
+                evidence_kind: Some(text_at(t)),
+            })
+        })
+        .collect();
+
+    s.startup_fingerprints = ids
+        .iter()
+        .map(|id| StartupFingerprint {
+            member_id: id.clone(),
+            role: MEMBER_AUXILIARY.into(),
+            override_observed: true,
+            override_duration_ms: Some(u64::MAX),
+            peak_rpm: Some(u16::MAX),
+            requested_pct_during: Some(u8::MAX),
+            readback_pct_during: Some(u8::MAX),
+            post_override_rpm: Some(u16::MAX),
+            transition_ms: Some(u64::MAX),
+            interpretation: text_at(t),
+        })
+        .collect();
+
+    s.steady_state = Some(ventulusd::api::stats::SteadyState {
+        verdict: text_at(t),
+        start_ms: Some(u64::MAX),
+        warmup_ms: Some(u64::MAX),
+        slope_c_per_min: Some(WIDEST_MEASUREMENT_VALUE),
+        stddev_c: Some(WIDEST_MEASUREMENT_VALUE),
+        mean_c: Some(WIDEST_MEASUREMENT_VALUE),
+        peak_c: Some(WIDEST_MEASUREMENT_VALUE),
+        confidence: text_at(t),
+        criterion: text_at(t),
+    });
+
+    // Evidence is bounded by the orchestration walk, not by a cap of its own:
+    // `ordered_diagnostics` collapses repeats, so production reaches at most
+    // `sweep_members x 3`. 32 here deliberately over-states that. Each entry
+    // carries a full Phase 3 run, which is the term the old derivation omitted.
+    //
+    // `verify` and `control_path` are `None` deliberately, and that is not a
+    // gap: the three payloads are **mutually exclusive** in production — each
+    // `attach_evidence_for` call site sets exactly one (`handlers/validation.rs`
+    // :1138, :1270, :1513) — and `widest_characterization_run()` is by far the
+    // largest of the three, so taking it every time over-states a real entry.
+    // All four of their `detail` fields are still bounded; that is asserted at
+    // the call site by `every_daemon_formatted_detail_is_bounded_when_evidence_is_filed`,
+    // which is where a forgotten arm belongs, rather than here.
+    s.evidence = s
+        .sweep_members
+        .iter()
+        .flat_map(|id| {
+            KNOWN_DIAGNOSTICS.map(move |kind| EvidenceRef {
+                kind: kind.into(),
+                member_id: id.clone(),
+                run_id: Some(text_at(t)),
+                started_unix_ms: u64::MAX,
+                completed_unix_ms: Some(u64::MAX),
+                outcome: text_at(t),
+                detail: Some(text_at(t)),
+                characterization: Some(widest_characterization_run()),
+                verify: None,
+                control_path: None,
+            })
+        })
+        .collect();
+    s
+}
+
+/// `WIDEST_DAEMON_TOKEN` must really cover the tokens the daemon puts in an
+/// evidence entry, or the ancillary measurement is sized from a fiction in the
+/// other direction.
+///
+/// Scanned from the source rather than from a hand-list, because a hand-list is
+/// what stops covering a token the moment someone adds one. **Comment lines are
+/// excluded before matching**, which is the whole trick: this file's own prose
+/// explains the rule and names the fields, and a naive substring sweep would
+/// match its own explanation — the `polling.rs` trap in the project rulebook. Matching
+/// only outside `//` lines keeps the scan pointed at code.
+#[test]
+fn no_daemon_token_exceeds_the_evidence_allowance() {
+    let whole = include_str!("../src/api/characterization.rs");
+    // Production only: an assertion message in the module's own test block is not
+    // a wire token, and one of them is 71 bytes.
+    let source = whole.split("#[cfg(test)]").next().unwrap();
+    let mut widest = 0usize;
+    let mut widest_token = String::new();
+    let mut checked = 0usize;
+    for line in source.lines() {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            continue;
+        }
+        for lit in code.split('"').skip(1).step_by(2) {
+            // A token has no whitespace — that is what distinguishes one from a
+            // log line or an error message, and both of those also live in
+            // string literals here. Format strings carry runtime values.
+            if lit.is_empty() || lit.contains('{') || lit.split_whitespace().count() != 1 {
+                continue;
+            }
+            checked += 1;
+            if lit.len() > widest {
+                widest = lit.len();
+                widest_token = lit.to_string();
+            }
+        }
+    }
+    // Or the scan found nothing and the assertion below is vacuous — the same
+    // precondition discipline the byte-bound tests use.
+    assert!(
+        checked > 50,
+        "the token scan matched only {checked} literals; it has stopped scanning"
+    );
+    assert!(
+        widest <= WIDEST_DAEMON_TOKEN,
+        "'{widest_token}' is {widest} bytes, over the {WIDEST_DAEMON_TOKEN}-byte \
+         allowance the ancillary measurement gives a daemon token — that measurement \
+         now under-counts every evidence entry"
+    );
+}
+
+/// **The regression test for `P8-s`.** The ancillary reservation must cover the
+/// ancillary content, measured as a realised file rather than estimated.
+///
+/// The reservation was derived in prose from ~760 B per event and ~810 B per
+/// measurement. Both were under-counts: `too_long` permits an event's `detail`
+/// **and** its `member_id` at 512 B each, and a measurement's `kind`, `unit`,
+/// `note` and `member_id` likewise, so 4096 events and 512 measurements at their
+/// caps are far larger than the arithmetic said. The reservation is the term the
+/// `VALIDATION_MAX_SESSION_BYTES > SAMPLE + ANCILLARY` assertion rests on, and an
+/// under-count there makes that assertion decorative: it certifies a fit it has not
+/// measured. Measured, the worst-case document is 24,710,972 B against a cap of
+/// 29,360,128 — and was 444 KiB under the *old* cap, so nothing was being lost yet.
+/// That margin was accidental, which is the defect: the reservation claimed 4 MiB of
+/// room against 7.57 MiB of content, so one more event field would have crossed it in
+/// silence, and since DEC-320 `prune` **deletes** what it cannot read.
+///
+/// Asserting the length of the file that is actually written is what keeps this
+/// from being a second copy of the same arithmetic (DEC-320).
+#[test]
+fn the_ancillary_reservation_covers_the_worst_case_ancillary_document() {
+    use ventulusd::constants as k;
+    let tmp = tempfile::tempdir().unwrap();
+    let s = worst_case_ancillary_session("ancillary");
+
+    // Preconditions: the fixture must really be at the caps, or a passing
+    // assertion says nothing about the worst case.
+    assert_eq!(s.events.len(), k::VALIDATION_MAX_EVENTS);
+    assert_eq!(
+        s.external_measurements.len(),
+        k::VALIDATION_MAX_EXTERNAL_MEASUREMENTS
+    );
+    assert_eq!(
+        s.metadata.user_metadata.len(),
+        k::VALIDATION_MAX_METADATA_KEYS
+    );
+    assert_eq!(s.sweep_members.len(), k::VALIDATION_MAX_SWEEP_MEMBERS);
+    // `P8-bs`: member ids are ancillary text bounded at ingest, so the worst case
+    // uses them at that bound. With realistic ids this measurement is an
+    // under-count and a passing assertion says nothing about the worst case —
+    // the same defect `P8-ae` closed for the sample probe.
+    let id_bound = ventulusd::hwmon::cooling_device::MAX_DEVICE_TEXT_BYTES;
+    // ALL SIX arrays, not the three that are easiest to reach. `findings` and
+    // `evidence` alone are 227 of the 495 at-bound id occurrences, so a
+    // precondition over `members`/`radiator_members`/`sweep_members` pins 28% of
+    // the term it exists to pin — and `aio_member_ids`, the realistic helper, is
+    // still here and still used elsewhere, so a later edit re-pointing one array
+    // at it would leave this green while the measurement silently reverted to an
+    // under-count.
+    assert!(
+        s.metadata
+            .radiator_members
+            .iter()
+            .all(|m| m.len() == id_bound)
+            && s.metadata
+                .members
+                .iter()
+                .all(|m| m.member_id.len() == id_bound)
+            && s.sweep_members.iter().all(|m| m.len() == id_bound)
+            && s.findings
+                .iter()
+                .all(|f| f.member_id.as_ref().is_some_and(|m| m.len() == id_bound))
+            && s.startup_fingerprints
+                .iter()
+                .all(|f| f.member_id.len() == id_bound)
+            && s.evidence.iter().all(|e| e.member_id.len() == id_bound),
+        "every member id must be at the {id_bound}-byte ingest bound"
+    );
+    // The label is a RELATIONSHIP to the id, not a literal: `member()` builds it
+    // as `{id} label`, so a byte count here would stop tracking the id bound the
+    // moment that format changed.
+    assert!(
+        s.metadata
+            .members
+            .iter()
+            .all(|m| m.label.len() == m.member_id.len() + " label".len()),
+        "each member label must still derive from its id, or it stops scaling with the bound"
+    );
+    assert!(
+        s.events.iter().all(|e| e.detail.as_ref().unwrap().len()
+            == k::VALIDATION_MAX_TEXT_FIELD_BYTES
+            && e.member_id.as_ref().unwrap().len() == k::VALIDATION_MAX_TEXT_FIELD_BYTES),
+        "every event must carry BOTH text fields at the bound — carrying one is \
+         the under-count this test exists to catch"
+    );
+    // `P8-br`: the "bounding the daemon's `detail` moved no measurement"
+    // argument rests entirely on these two already being at the bound here, and
+    // nothing asserted it — the same unasserted-fixture gap `P8-bs` closed for
+    // member ids one field over. Re-point either at a realistic string and this
+    // fails rather than silently reverting the measurement to an under-count.
+    assert!(
+        s.evidence.iter().all(|e| e
+            .detail
+            .as_ref()
+            .is_some_and(|d| d.len() == k::VALIDATION_MAX_TEXT_FIELD_BYTES)
+            && e.characterization
+                .as_ref()
+                .and_then(|c| c.detail.as_ref())
+                .is_some_and(|d| d.len() == k::VALIDATION_MAX_TEXT_FIELD_BYTES)),
+        "every evidence entry must carry its own `detail` AND its run's at the \
+         {}-byte bound `clamp_detail` enforces",
+        k::VALIDATION_MAX_TEXT_FIELD_BYTES
+    );
+    assert!(
+        s.samples.is_empty(),
+        "the ancillary measurement must exclude samples, which have their own budget"
+    );
+
+    let len = saved_len(tmp.path(), &s) as usize;
+    assert!(
+        len <= k::VALIDATION_MAX_ANCILLARY_BYTES,
+        "the worst-case ancillary document realised {len} bytes against a \
+         {} reservation — the reservation is an under-count, so the \
+         SESSION > SAMPLE + ANCILLARY assertion certifies a fit nothing measured",
+        k::VALIDATION_MAX_ANCILLARY_BYTES
+    );
+    // The reservation must not have been inflated past the point where it means
+    // anything either: it is sized above the measurement, not orders above it.
+    assert!(
+        len > k::VALIDATION_MAX_ANCILLARY_BYTES / 2,
+        "the fixture realised {len} bytes, under half the {} reservation — either \
+         the fixture stopped being the worst case or the reservation is padding",
+        k::VALIDATION_MAX_ANCILLARY_BYTES
+    );
+}
+
+/// A `ControlPathRun` carrying nothing but the `detail` under test.
+///
+/// Written out rather than derived from `Default`, because adding a derive to a
+/// pinned wire struct for a test's convenience is a production change this test
+/// does not need.
+fn control_path_run(detail: &str) -> ventulusd::api::discovery::ControlPathRun {
+    ventulusd::api::discovery::ControlPathRun {
+        run_id: "cp-1".into(),
+        header_id: "hwmon:it87:pwm2:PUMP".into(),
+        state: "complete".into(),
+        delta_pct: 10,
+        requested_cycles: 2,
+        window_seconds: 6,
+        baseline_pct: 40,
+        perturbed_pct: 50,
+        direction: "up".into(),
+        channels: vec![],
+        cycles: vec![],
+        summary: None,
+        original_pct: Some(40),
+        restore_failed: false,
+        restore_outcome: "restored".into(),
+        detail: Some(detail.to_string()),
+        completed_unix_ms: Some(2),
+        current_step: None,
+    }
+}
+
+/// One evidence entry with the same `detail` prose in all four places it can
+/// appear — the entry's own, and each of the three runs it may carry.
+fn evidence_with_detail_everywhere(detail: &str) -> EvidenceRef {
+    EvidenceRef {
+        kind: DIAG_CHARACTERIZATION.into(),
+        member_id: "hwmon:it87:pwm2:PUMP".into(),
+        run_id: Some("run-1".into()),
+        started_unix_ms: 1,
+        completed_unix_ms: Some(2),
+        outcome: RESULT_OBSERVED.into(),
+        detail: Some(detail.to_string()),
+        characterization: Some(ventulusd::api::characterization::CharacterizationRun {
+            detail: Some(detail.to_string()),
+            ..Default::default()
+        }),
+        verify: Some(VerifyEvidence {
+            header_id: "hwmon:it87:pwm2:PUMP".into(),
+            write_ok: true,
+            readback_pct: Some(50),
+            requested_pct: Some(50),
+            rpm_before: Some(900),
+            rpm_after: Some(1400),
+            detail: Some(detail.to_string()),
+            result: Some("no_rpm_effect".into()),
+            restore_failed: false,
+        }),
+        control_path: Some(control_path_run(detail)),
+    }
+}
+
+/// Every `detail` on one evidence entry, in wire order. The helper exists so a
+/// field added to the clamp is added here too rather than silently unasserted.
+fn details_of(ev: &EvidenceRef) -> Vec<&str> {
+    vec![
+        ev.detail.as_deref().expect("entry detail"),
+        ev.characterization
+            .as_ref()
+            .and_then(|c| c.detail.as_deref())
+            .expect("characterization detail"),
+        ev.verify
+            .as_ref()
+            .and_then(|v| v.detail.as_deref())
+            .expect("verify detail"),
+        ev.control_path
+            .as_ref()
+            .and_then(|c| c.detail.as_deref())
+            .expect("control_path detail"),
+    ]
+}
+
+/// **The regression test for `P8-br`.** Daemon-formatted `detail` prose was the
+/// last unbounded ancillary text in the document, so the reservation above was a
+/// bound on the terms that *are* bounded and said nothing about these.
+///
+/// Asserted at the **call site** — through `attach_evidence_for`, the one route
+/// an entry takes into a session — never against `clamp_detail` alone. A unit
+/// test on the rule proves the rule exists and not that anything applies it,
+/// which is the trap the project rulebook § Hard-won lessons records fourteen times.
+///
+/// All four `detail` fields are over the bound at once, so an arm the clamp
+/// forgets fails here rather than in the arm nobody thought to write a test for.
+/// The second entry is the opposite branch: without it, a clamp that overwrote
+/// every `detail` unconditionally would pass.
+#[test]
+fn every_daemon_formatted_detail_is_bounded_when_evidence_is_filed() {
+    use ventulusd::constants as k;
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    engine.start(unique_session("detail-bound"), &ctx).unwrap();
+    let sid = "val-detail-bound".to_string();
+
+    // Eight times the bound — far more than any `format!` in the daemon
+    // produces today, which is the point: nothing stopped one tomorrow.
+    let over = "d".repeat(k::VALIDATION_MAX_TEXT_FIELD_BYTES * 8);
+    let short = "restore of pwm2 to 40% failed".to_string();
+    assert!(
+        over.len() > k::VALIDATION_MAX_TEXT_FIELD_BYTES
+            && short.len() < k::VALIDATION_MAX_TEXT_FIELD_BYTES,
+        "the fixtures must straddle the bound, or neither branch tests anything"
+    );
+
+    assert!(engine.attach_evidence_for(&sid, evidence_with_detail_everywhere(&over)));
+    assert!(engine.attach_evidence_for(&sid, evidence_with_detail_everywhere(&short)));
+
+    let s = engine.snapshot().unwrap();
+    assert_eq!(s.evidence.len(), 2, "both entries must have been filed");
+
+    for (i, d) in details_of(&s.evidence[0]).iter().enumerate() {
+        // A RELATIONSHIP to the constant, not the literal 512: asserting the
+        // number would keep passing if the constant moved and the clamp did not.
+        assert_eq!(
+            d.len(),
+            k::VALIDATION_MAX_TEXT_FIELD_BYTES,
+            "detail #{i} landed at {} bytes, not the {}-byte bound — an \
+             unbounded detail is ancillary text the reservation never measured, \
+             and a document over the reservation is DELETED by prune, not truncated",
+            d.len(),
+            k::VALIDATION_MAX_TEXT_FIELD_BYTES
+        );
+    }
+    for (i, d) in details_of(&s.evidence[1]).iter().enumerate() {
+        assert_eq!(
+            *d, short,
+            "detail #{i} was already inside the bound and must be left alone"
+        );
+    }
+}
+
+/// And the two budgets must hold **together**, as one realised file.
+///
+/// This is the assertion the `const` assert stands in for at compile time, and
+/// the only one that exercises what a real session actually is: worst-case
+/// ancillary content *and* samples to the derived cap, written and read back.
+/// Either budget being an under-count fails here, whatever the arithmetic says.
+#[test]
+fn a_session_at_every_cap_at_once_still_reads_back_from_the_store() {
+    use ventulusd::constants as k;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = worst_case_ancillary_session("everycap");
+    let cap = fill_to_cap(&mut s);
+    assert!(cap > 0, "a 65-member session must still record a sample");
+
+    let len = saved_len(tmp.path(), &s) as usize;
+    assert!(
+        len <= k::VALIDATION_MAX_SESSION_BYTES as usize,
+        "a session at every cap wrote {len} bytes, over the {} the store can read \
+         — it would be written, then classified TooLarge, then deleted by prune",
+        k::VALIDATION_MAX_SESSION_BYTES
+    );
+    let back = store::load_from(tmp.path(), "val-everycap")
+        .expect("a session the store wrote must be readable");
+    let back = back.expect("the session must load, not vanish");
+    assert_eq!(back.samples.len(), cap);
+    assert_eq!(back.events.len(), k::VALIDATION_MAX_EVENTS);
+    assert_eq!(
+        store::list_from(tmp.path()).len(),
+        1,
+        "and it must be listed"
+    );
+}
+
+/// `WIDEST_MEASUREMENT_VALUE` must really be the widest `f64` rendering, for the
+/// same reason `WIDEST_POWER_SAMPLE` is pinned: the intuitive choice — a
+/// full-precision value near the top of the range — is six characters short of a
+/// small arbitrary quotient, and a probe built on the intuitive one under-counts.
+#[test]
+fn the_widest_measurement_value_is_really_the_widest() {
+    let widest = serde_json::to_string(&WIDEST_MEASUREMENT_VALUE)
+        .unwrap()
+        .len();
+    for candidate in [
+        999.9999999999999_f64,
+        123.45678901234567,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        -100.5,
+        1.0 / 3.0,
+        2.0 / 3.0,
+        1e-5,
+        9.999999999999999e-5,
+    ] {
+        let n = serde_json::to_string(&candidate).unwrap().len();
+        assert!(
+            n <= widest,
+            "{candidate} renders in {n} bytes, wider than the {widest} the probe \
+             assumes — the ancillary measurement under-counts every f64 field"
+        );
+    }
+}
+
+/// **Regression for the defect found INSIDE the fix.** The per-sample probe used
+/// a 128-byte placeholder for `temperature_sensor` on the reasoning that no real
+/// sensor id is longer. But `recorder.rs` copies `metadata.temperature_sensor`
+/// into every sample, and that string comes from `preferred_sensor` on
+/// `POST /config/cooling-device` — client-supplied. A long one made the probe
+/// under-count without bound and reproduced `AUD3-i` exactly. A guess is not a
+/// bound; the probe now measures the session's own value.
+#[test]
+fn a_long_configured_sensor_id_cannot_break_the_byte_bound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let budget = ventulusd::constants::VALIDATION_MAX_SAMPLE_BYTES;
+    let long = "s".repeat(ventulusd::hwmon::cooling_device::MAX_DEVICE_TEXT_BYTES);
+
+    // Measured at a member count where the byte budget actually binds. At three
+    // members the hard 7200 clamp masks the derivation entirely, so a comparison
+    // there would pass whether or not the probe reads the sensor id at all —
+    // pick the sample that can move (the project rulebook), or the check is blind.
+    let long_cap = max_samples_for(&sized_session("l", 65, &long), budget);
+    let short_cap = max_samples_for(&sized_session("s", 65, "hwmon:k10temp:Tctl"), budget);
+    assert!(
+        long_cap < short_cap,
+        "the probe must read the session's own sensor id: {long_cap} vs {short_cap}"
+    );
+
+    let mut s = sized_session("long-sensor", 65, &long);
+    let cap = fill_to_cap(&mut s);
+    assert_eq!(cap, long_cap);
+    let len = saved_len(tmp.path(), &s);
+    assert!(
+        len <= ventulusd::constants::VALIDATION_MAX_SESSION_BYTES,
+        "a long configured sensor id produced {len} bytes, over the cap"
+    );
+    assert!(store::load_from(tmp.path(), "val-long-sensor")
+        .unwrap()
+        .is_some());
+}
+
+/// A realistic cooler keeps the documented two hours; only pathological
+/// topologies shorten. Asserted as a relationship to the hard cap, never as a
+/// sample count — the budget is allowed to move, the guarantee is not.
+#[test]
+fn the_derived_cap_is_the_full_two_hours_for_every_realistic_aio() {
+    let budget = ventulusd::constants::VALIDATION_MAX_SAMPLE_BYTES;
+    let hard = ventulusd::constants::VALIDATION_MAX_SAMPLES;
+    let sensor = "hwmon:k10temp:k10temp-pci-00c3:Tctl";
+    // Pump alone, through pump + four radiator fans — a 360 mm cooler is four
+    // members, so this covers every consumer AIO with one member of margin.
+    for n in 1..=5 {
+        assert_eq!(
+            max_samples_for(&sized_session("real", n, sensor), budget),
+            hard,
+            "a {n}-member cooler must still record the full sample cap"
+        );
+    }
+    let pathological = max_samples_for(&sized_session("path", 65, sensor), budget);
+    assert!(
+        pathological < hard && pathological > 0,
+        "a 65-member device must be bounded but still record: got {pathological}"
+    );
+}
+
+/// An over-cap file is unreadable for ever, so retention can never reach it —
+/// which is why `prune` must delete it rather than step over it.
+#[test]
+fn prune_deletes_a_session_too_large_to_read_but_spares_a_merely_corrupt_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let oversized = tmp.path().join("val-oversized.json");
+    let corrupt = tmp.path().join("val-corrupt.json");
+    std::fs::write(
+        &oversized,
+        vec![b'x'; ventulusd::constants::VALIDATION_MAX_SESSION_BYTES as usize + 1],
+    )
+    .unwrap();
+    std::fs::write(&corrupt, b"{ not json").unwrap();
+
+    store::prune(tmp.path(), 5);
+
+    assert!(
+        !oversized.exists(),
+        "an unreadable oversized session must be reclaimed, or it occupies the \
+         state directory permanently"
+    );
+    assert!(
+        corrupt.exists(),
+        "a merely unparseable session must NOT be deleted — a serde slip or a \
+         transient read error would otherwise destroy every retained session"
+    );
+}
+
+/// `prune` re-stats before removing, so a file that became readable between the
+/// scan and the delete is spared.
+///
+/// Without this, a flush landing in that window could have its smaller, valid
+/// replacement deleted — taking a live recording with it and leaving
+/// `sweep_interrupted` nothing to mark `interrupted`, which is the one property
+/// §15 requires the store to guarantee. Raised by the security review.
+#[test]
+fn prune_spares_a_file_that_became_readable_since_the_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = sized_session("shrunk", 1, "hwmon:k10temp:Tctl");
+    s.state = "completed".into();
+    s.samples.clear();
+    // A readable file at a path prune was told is oversized: the state prune
+    // reaches when a flush lands between its scan and its delete.
+    store::save_to(tmp.path(), &s).unwrap();
+    store::prune(tmp.path(), 5);
+    assert!(
+        store::load_from(tmp.path(), "val-shrunk")
+            .unwrap()
+            .is_some(),
+        "a readable session must never be pruned as oversized"
+    );
+}
+
+// ── [HOST-a / DEC-326] the driver's full-speed alias ─────────────────
+//
+// `it87.c:3612` reports `pwm_enable == 0` ("full speed") whenever the duty
+// register holds 0xff — on every header of a chip without `FEAT_FANCTL_ONOFF`,
+// and on `pwm4+` of every ITE chip. A member curve reaching 100% under load is
+// exactly what a validation session exists to observe, so before this the
+// session recorded `control_reclaimed` and published the
+// `bios_ec_control_reclaim` finding on a machine where nothing reclaimed
+// anything.
+
+fn fan_at(
+    id: &str,
+    commanded: Option<u8>,
+    readback: Option<u8>,
+    enable: Option<u8>,
+) -> ventulusd::health::state::HwmonFanState {
+    ventulusd::health::state::HwmonFanState {
+        id: id.into(),
+        rpm: Some(1436),
+        last_commanded_pwm: readback,
+        pwm_readback_pct: readback,
+        pwm_commanded_pct: commanded,
+        alarm: Some(false),
+        pwm_enable_mode: enable,
+        updated_at: std::time::Instant::now(),
+    }
+}
+
+/// The CALL-SITE test. `pwm::is_full_speed_alias` has its own unit coverage;
+/// this drives the real `tick` and asserts on the events it actually recorded,
+/// because "extracting a rule into a testable function does NOT test the call
+/// site" is this project's most-repeated lesson.
+#[test]
+fn a_member_reaching_full_speed_is_not_recorded_as_a_bios_reclaim() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let pump = "hwmon:it87:pwm2:PUMP";
+    let (ctx, ctrl) = context_with_controller(&[pump]);
+
+    // Tick 1 — the daemon holds the header in manual mode at 60%.
+    ctrl.command(pump, 60);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(60), Some(60), Some(1))]);
+    engine.start(unique_session("alias"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // Tick 2 — the curve reaches 100%. The write fully succeeded; the driver
+    // now synthesises mode 0 from the duty register.
+    ctrl.command(pump, 100);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(0))]);
+    engine.tick(&ctx);
+
+    let s = engine.snapshot().unwrap();
+    assert!(
+        !s.events.iter().any(|e| e.kind == EV_CONTROL_RECLAIMED),
+        "the header accepted our own 100% write; recording a reclaim would be \
+         a false BIOS accusation. events: {:?}",
+        s.events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    // The sample must agree with the event stream, not contradict it.
+    assert_eq!(
+        s.samples.last().unwrap().members[0].ownership,
+        OWNERSHIP_DAEMON,
+        "a suppressed reclaim and an `external` ownership stamp cannot both be right"
+    );
+
+    let done = engine.stop().unwrap();
+    let findings = summary::summarise(&done);
+    assert_ne!(
+        find(&findings, F_BIOS_RECLAIM).state,
+        RESULT_OBSERVED,
+        "no reclaim was observed, so the session must not report one"
+    );
+}
+
+/// The opposite branch — without it a predicate stuck at "always alias" would
+/// pass the test above, and the daemon would stop reporting real reclaims.
+#[test]
+fn a_member_genuinely_losing_manual_mode_is_still_recorded_as_a_reclaim() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let pump = "hwmon:it87:pwm2:PUMP";
+    let (ctx, ctrl) = context_with_controller(&[pump]);
+
+    ctrl.command(pump, 60);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(60), Some(60), Some(1))]);
+    engine.start(unique_session("realreclaim"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // Mode 2 (automatic) at full duty: a real reclaim, not the alias.
+    ctrl.command(pump, 100);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(2))]);
+    engine.tick(&ctx);
+
+    let s = engine.snapshot().unwrap();
+    assert!(
+        s.events.iter().any(|e| e.kind == EV_CONTROL_RECLAIMED),
+        "mode 2 is a genuine loss of control and must still be recorded"
+    );
+}
+
+/// [DEC-326 remediation, `concurrency-reviewer` finding 2] The exemption reads
+/// the CONTROLLER's `last_commanded_pct`, not the cache's `pwm_commanded_pct` —
+/// the cache field is carried forward indefinitely and is never cleared when the
+/// daemon stops driving a header, so a stale "we commanded 100" would suppress a
+/// REAL reclaim on a header we no longer own.
+#[test]
+fn a_stale_cached_command_cannot_suppress_a_reclaim_on_a_header_we_lost() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let pump = "hwmon:it87:pwm2:PUMP";
+    let (ctx, ctrl) = context_with_controller(&[pump]);
+
+    ctrl.command(pump, 100);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(1))]);
+    engine.start(unique_session("stale"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // The daemon releases the header. The CACHE still says we commanded 100%
+    // (nothing ever clears it), but the controller has forgotten — which is the
+    // difference this test exists to pin.
+    ctrl.ctrl.lock().on_lease_released();
+    assert_eq!(
+        ctx.cache.snapshot().hwmon_fans[pump].pwm_commanded_pct,
+        Some(100),
+        "precondition: the cache must still carry the stale command, or this \
+         test proves nothing"
+    );
+
+    // Firmware now takes it to full speed.
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(0))]);
+    engine.tick(&ctx);
+
+    let s = engine.snapshot().unwrap();
+    assert!(
+        s.events.iter().any(|e| e.kind == EV_CONTROL_RECLAIMED),
+        "the daemon no longer owns this header, so mode 0 is a real reclaim and \
+         must be recorded. events: {:?}",
+        s.events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+}
+
+/// A context whose controller genuinely reports `last_commanded_pct`, which the
+/// full-speed-alias predicate reads. `test_context()` leaves `hwmon_controller`
+/// as `None`, and the predicate then (correctly) refuses to exempt anything —
+/// with no controller the daemon is driving nothing, so there is no duty of ours
+/// to recognise. Exercising the exemption therefore needs a real one.
+///
+/// The writer is a stub: nothing here asserts on sysfs, only on what the
+/// controller remembers having commanded.
+struct NullWriter;
+impl ventulusd::hwmon::pwm_control::SysfsWriter for NullWriter {
+    fn write_file(&mut self, _p: &str, _v: &str) -> Result<(), ventulusd::error::HwmonError> {
+        Ok(())
+    }
+    fn read_file(&self, _p: &str) -> Result<String, ventulusd::error::HwmonError> {
+        Ok("1\n".to_string())
+    }
+}
+
+fn header(id: &str) -> ventulusd::hwmon::pwm_discovery::PwmHeaderDescriptor {
+    ventulusd::hwmon::pwm_discovery::PwmHeaderDescriptor {
+        id: id.to_string(),
+        label: "TEST".into(),
+        chip_name: "it8696".into(),
+        pwm_index: 1,
+        supports_enable: true,
+        pwm_path: "/dev/null".into(),
+        enable_path: Some("/dev/null".into()),
+        max_pwm_percent: 100,
+        is_writable: true,
+        ..Default::default()
+    }
+}
+
+/// Build a context and drive `ctrl.set_pwm` so `last_commanded_pct` is real.
+fn context_with_controller(ids: &[&str]) -> (RecorderContext, ControllerHandle) {
+    let mut ctx = test_context();
+    let mut lease_mgr = ventulusd::hwmon::lease::LeaseManager::new();
+    let lease = lease_mgr
+        .take_lease(ventulusd::hwmon::lease::HwmonWriter::Engine)
+        .unwrap();
+    let ctrl = ventulusd::hwmon::pwm_control::HwmonPwmController::new(
+        ids.iter().map(|i| header(i)).collect(),
+        lease_mgr,
+        Box::new(NullWriter),
+        ctx.cache.clone(),
+    );
+    let ctrl = std::sync::Arc::new(parking_lot::Mutex::new(ctrl));
+    ctx.hwmon_controller = Some(ctrl.clone());
+    (
+        ctx,
+        ControllerHandle {
+            ctrl,
+            lease_id: lease.lease_id,
+        },
+    )
+}
+
+struct ControllerHandle {
+    ctrl: std::sync::Arc<parking_lot::Mutex<ventulusd::hwmon::pwm_control::HwmonPwmController>>,
+    lease_id: String,
+}
+
+impl ControllerHandle {
+    /// Command a duty for real, so the controller remembers it.
+    fn command(&self, id: &str, pct: u8) {
+        self.ctrl.lock().set_pwm(id, pct, &self.lease_id).unwrap();
+    }
+}
+
+/// [DEC-326 remediation, `concurrency-reviewer` finding 1] The two tests above
+/// both STOP at the aliased tick, so neither can see this: suppressing the
+/// reclaim is not enough if the watermark still advances, because the descent
+/// back below 100% then pushes a phantom `EV_CONTROL_RESTORED`.
+#[test]
+fn descending_from_full_speed_pushes_no_phantom_restore() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let pump = "hwmon:it87:pwm2:PUMP";
+    let (ctx, ctrl) = context_with_controller(&[pump]);
+
+    ctrl.command(pump, 60);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(60), Some(60), Some(1))]);
+    engine.start(unique_session("descend"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // Up to full speed — the driver aliases the mode to 0.
+    ctrl.command(pump, 100);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(100), Some(100), Some(0))]);
+    engine.tick(&ctx);
+
+    // ...and back down. The mode reads 1 again because the duty left 0xff.
+    ctrl.command(pump, 40);
+    ctx.cache
+        .update_hwmon_fans(vec![fan_at(pump, Some(40), Some(40), Some(1))]);
+    engine.tick(&ctx);
+
+    let s = engine.snapshot().unwrap();
+    let kinds: Vec<&str> = s.events.iter().map(|e| e.kind.as_str()).collect();
+    assert!(
+        !kinds.contains(&EV_CONTROL_RESTORED),
+        "nothing was ever reclaimed, so nothing may be 'restored'. events: {kinds:?}"
+    );
+    assert!(!kinds.contains(&EV_CONTROL_RECLAIMED));
+}
+
+/// The consequence the phantom restore actually has, asserted on the published
+/// finding rather than on the event: `summary::control_restoration` counts
+/// reclaims and restores GLOBALLY, so one member riding 100%→40% could satisfy
+/// a DIFFERENT member's genuine, never-restored reclaim and turn FAIL into PASS.
+#[test]
+fn one_members_full_speed_ride_cannot_mask_anothers_real_reclaim() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let a = "hwmon:it87:pwm2:PUMP"; // takes a genuine reclaim, never restored
+    let b = "hwmon:it87:pwm3:RAD1"; // merely rides up to 100% and back
+    let (ctx, ctrl) = context_with_controller(&[a, b]);
+
+    ctrl.command(a, 60);
+    ctrl.command(b, 60);
+    ctx.cache.update_hwmon_fans(vec![
+        fan_at(a, Some(60), Some(60), Some(1)),
+        fan_at(b, Some(60), Some(60), Some(1)),
+    ]);
+    engine.start(unique_session("mask"), &ctx).unwrap();
+    engine.tick(&ctx);
+
+    // A is genuinely reclaimed to automatic; B goes to full speed.
+    ctrl.command(b, 100);
+    ctx.cache.update_hwmon_fans(vec![
+        fan_at(a, Some(60), Some(60), Some(2)),
+        fan_at(b, Some(100), Some(100), Some(0)),
+    ]);
+    engine.tick(&ctx);
+
+    // A stays reclaimed; B comes back down.
+    ctrl.command(b, 40);
+    ctx.cache.update_hwmon_fans(vec![
+        fan_at(a, Some(60), Some(60), Some(2)),
+        fan_at(b, Some(40), Some(40), Some(1)),
+    ]);
+    engine.tick(&ctx);
+
+    let done = engine.stop().unwrap();
+    // Precondition: the window this test claims to exercise really happened.
+    assert!(
+        done.events
+            .iter()
+            .any(|e| e.kind == EV_CONTROL_RECLAIMED && e.member_id.as_deref() == Some(a)),
+        "A's genuine reclaim must be recorded, or this test asserts nothing"
+    );
+    let findings = summary::summarise(&done);
+    assert_eq!(
+        find(&findings, F_CONTROL_RESTORATION).state,
+        RESULT_FAIL,
+        "control was never restored to A; B's ride to 100% must not pay for it"
+    );
+}
+
+// ── AIO Phase 8 Batch 3a (DEC-335) ──────────────────────────────────────────
+//
+// These live here rather than in a file of their own because the validation
+// harness — `temp_state_dir`, `test_context`, `unique_session` — is defined
+// above, and a second copy of it in a sibling integration test would be free to
+// drift from the fixtures the rest of this file asserts against.
+
+/// **§3.6: the operator always wins.** This is the load-bearing property of the
+/// opt-in startup auto-record, and the reason it is acceptable for the daemon to
+/// open a session with nobody watching.
+///
+/// Without pre-emption, enabling `[startup] record_startup` would make
+/// `POST /validation/session` return `409 already_recording` for the first two
+/// minutes after every boot — a background diagnostic blocking a human.
+#[test]
+fn an_operator_session_pre_empts_the_startup_auto_record() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    let mut auto = unique_session("preempt-auto");
+    auto.auto_started = true;
+    auto.kind = KIND_LIFECYCLE.into();
+    engine.start(auto, &ctx).unwrap();
+    engine.tick(&ctx);
+    assert!(
+        engine.is_recording(),
+        "precondition: the auto-record is live"
+    );
+
+    let mut operator = unique_session("preempt-operator");
+    operator.auto_started = false;
+    let started = engine
+        .start(operator, &ctx)
+        .expect("an operator must never be refused by a background recording");
+
+    assert_eq!(
+        engine.recording_session_id().as_deref(),
+        Some(started.session_id.as_str()),
+        "the operator's session must hold the slot"
+    );
+
+    // And the pre-empted recording was FINALISED, not discarded: up to two
+    // minutes of real evidence about this boot may already be in it.
+    // The engine writes through `store::save`, i.e. into `{state_dir}/validation`.
+    let saved = store::load_from(&temp_state_dir().join("validation"), "val-preempt-auto")
+        .expect("the session file must be readable")
+        .expect("the superseded auto-record must still be on disk");
+    assert_eq!(saved.state, STATE_COMPLETED);
+    assert_eq!(
+        saved.interrupted_reason.as_deref(),
+        Some("superseded by an operator-started session")
+    );
+    assert!(
+        saved.findings.iter().any(|f| f.id == F_STEADY_STATE),
+        "a finalised session carries its derived findings, however short"
+    );
+}
+
+/// The opposite branch, and it is what makes the test above mean anything: a
+/// `start` that always succeeded would satisfy it too. An operator's session is
+/// still single-flight against another operator's.
+#[test]
+fn an_operator_session_does_not_pre_empt_another_operator_session() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    let first = unique_session("no-preempt-first");
+    engine.start(first, &ctx).unwrap();
+
+    let second = unique_session("no-preempt-second");
+    assert_eq!(
+        engine.start(second, &ctx).unwrap_err(),
+        ventulusd::validation::recorder::StartError::AlreadyRecording,
+        "only an auto-record may be pre-empted"
+    );
+}
+
+/// Auto-records are retained in their own slot, so a machine that reboots
+/// repeatedly cannot evict hand-made sessions one boot at a time.
+#[test]
+fn pruning_never_lets_auto_records_evict_operator_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let keep = ventulusd::constants::VALIDATION_MAX_RETAINED_SESSIONS;
+
+    // `keep` operator sessions, then twice as many auto-records, all newer.
+    for i in 0..keep {
+        let mut s = session();
+        s.session_id = format!("val-op-{i}");
+        s.state = STATE_COMPLETED.into();
+        s.started_unix_ms = 1_000 + i as u64;
+        store::save_to(dir.path(), &s).unwrap();
+    }
+    for i in 0..(keep * 2) {
+        let mut s = session();
+        s.session_id = format!("val-auto-{i}");
+        s.state = STATE_COMPLETED.into();
+        s.auto_started = true;
+        s.started_unix_ms = 100_000 + i as u64;
+        store::save_to(dir.path(), &s).unwrap();
+    }
+
+    store::prune(dir.path(), keep);
+
+    let left = store::list_from(dir.path());
+    let operators = left.iter().filter(|s| !s.auto_started).count();
+    let autos = left.iter().filter(|s| s.auto_started).count();
+    assert_eq!(
+        operators, keep,
+        "every operator session must survive a flood of auto-records"
+    );
+    assert_eq!(
+        autos,
+        ventulusd::constants::VALIDATION_MAX_RETAINED_AUTO_SESSIONS,
+        "auto-records are bounded to their own slot"
+    );
+}
+
+/// **§1: a high startup RPM is NOT a PWM control failure** when command and
+/// readback agree. The spec states this as a prohibition, so it is asserted as
+/// one: the interpretation must be the benign token, and the finding must not be
+/// a failure state.
+#[test]
+fn a_startup_override_with_a_honoured_duty_is_not_a_control_failure() {
+    let mut s = session();
+    let id = s.metadata.members[0].member_id.clone();
+    let kind = s.metadata.members[0].member_kind.clone();
+    s.metadata.members.truncate(1);
+
+    // 3400 RPM at a commanded 35% for 50 s, settling to ~1040 — §1's own worked
+    // example. Command and readback agree throughout, which is the whole point.
+    s.samples = (0..120u64)
+        .map(|i| {
+            let rpm = if i < 50 { 3400 } else { 1040 };
+            sample_at(
+                i * 1000,
+                vec![member_sample(&id, &kind, Some(35), Some(35), Some(rpm))],
+            )
+        })
+        .collect();
+
+    summary::derive_analysis(&mut s);
+    let f = s
+        .startup_fingerprints
+        .first()
+        .expect("a fingerprint must be derived");
+
+    assert!(f.override_observed);
+    assert_eq!(
+        f.interpretation, STARTUP_DEVICE_OVERRIDE,
+        "a honoured duty means the device ramped, not that control failed"
+    );
+    assert_eq!(f.peak_rpm, Some(3400));
+    assert_eq!(f.post_override_rpm, Some(1040));
+    assert_eq!(f.requested_pct_during, Some(35));
+    assert_eq!(f.readback_pct_during, Some(35));
+    assert_eq!(f.override_duration_ms, Some(50_000));
+
+    let findings = summary::summarise(&s);
+    let startup = find(&findings, F_STARTUP_BEHAVIOUR);
+    assert_eq!(startup.state, RESULT_OBSERVED);
+    assert_ne!(startup.state, RESULT_FAIL, "§1 forbids a failure verdict");
+    // The evidence that rules the fault out must reach the reader, not just the
+    // RPM that raises the question.
+    let detail = startup.detail.clone().unwrap_or_default();
+    assert!(detail.contains("35%"), "the duty must be stated: {detail}");
+    assert!(detail.contains(STARTUP_DEVICE_OVERRIDE), "got: {detail}");
+}
+
+/// The other branch of the same rule: when the readback does NOT match the
+/// command, the benign reading is not asserted. Still not a failure verdict —
+/// it says the evidence does not support the benign reading, which is a
+/// different claim from asserting a fault.
+#[test]
+fn a_startup_override_with_a_mismatched_readback_is_not_called_benign() {
+    let mut s = session();
+    let id = s.metadata.members[0].member_id.clone();
+    let kind = s.metadata.members[0].member_kind.clone();
+    s.metadata.members.truncate(1);
+    s.samples = (0..120u64)
+        .map(|i| {
+            let rpm = if i < 50 { 3400 } else { 1040 };
+            // Commanded 35, reading back 100 — the device is not honouring it.
+            sample_at(
+                i * 1000,
+                vec![member_sample(&id, &kind, Some(35), Some(100), Some(rpm))],
+            )
+        })
+        .collect();
+
+    summary::derive_analysis(&mut s);
+    let f = s.startup_fingerprints.first().unwrap();
+    assert_eq!(f.interpretation, STARTUP_COMMAND_MISMATCH);
+
+    let findings = summary::summarise(&s);
+    assert_ne!(
+        find(&findings, F_STARTUP_BEHAVIOUR).state,
+        RESULT_FAIL,
+        "even a mismatch is reported observationally, never as a fault"
+    );
+}
+
+/// A fan that simply runs at a steady speed has no startup override, and must
+/// not be given one. Without this, a fingerprint that always reported
+/// `override_observed` would pass both tests above.
+#[test]
+fn a_steady_fan_reports_no_startup_override() {
+    let mut s = session();
+    let id = s.metadata.members[0].member_id.clone();
+    let kind = s.metadata.members[0].member_kind.clone();
+    s.metadata.members.truncate(1);
+    s.samples = (0..60u64)
+        .map(|i| {
+            sample_at(
+                i * 1000,
+                vec![member_sample(&id, &kind, Some(40), Some(40), Some(1200))],
+            )
+        })
+        .collect();
+
+    summary::derive_analysis(&mut s);
+    let f = s.startup_fingerprints.first().unwrap();
+    assert!(!f.override_observed);
+    assert_eq!(f.interpretation, STARTUP_NONE_OBSERVED);
+    assert_eq!(f.peak_rpm, None, "there was no override to have a peak");
+}
+
+/// §3 as a finding: observational, and `not_established` is a statement about
+/// the observation rather than a verdict on the cooler.
+#[test]
+fn the_steady_state_finding_is_never_a_failure() {
+    // Rising throughout: never settles.
+    let mut rising = session();
+    rising.samples = (0..900u64)
+        .map(|i| {
+            let mut smp = sample_at(i * 1000, vec![]);
+            smp.temperature_c = Some(40.0 + (i as f64 / 60.0) * 0.5);
+            smp
+        })
+        .collect();
+    summary::derive_analysis(&mut rising);
+    let f = find(&summary::summarise(&rising), F_STEADY_STATE).clone();
+    assert_eq!(f.state, RESULT_NOT_OBSERVED);
+    assert_ne!(f.state, RESULT_FAIL);
+    // §3 requires the criterion be reported alongside the verdict.
+    assert!(
+        f.detail.unwrap_or_default().contains("criterion:"),
+        "the rule that produced the verdict must travel with it"
+    );
+
+    // No temperature at all is `not_tested`, never a pass and never a failure.
+    let mut blind = session();
+    blind.samples = (0..900u64)
+        .map(|i| {
+            let mut smp = sample_at(i * 1000, vec![]);
+            smp.temperature_c = None;
+            smp
+        })
+        .collect();
+    summary::derive_analysis(&mut blind);
+    assert!(blind.steady_state.is_none());
+    assert_eq!(
+        find(&summary::summarise(&blind), F_STEADY_STATE).state,
+        RESULT_NOT_TESTED
+    );
+}
+
+/// DEC-320: adding fields to a sample must move the derived cap, and the cap
+/// must still bound the REALISED file rather than a re-derivation of production's
+/// own arithmetic.
+#[test]
+fn the_sample_cap_still_bounds_the_realised_document_with_the_power_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = session();
+    s.session_id = "val-cap-power".into();
+    s.state = STATE_COMPLETED.into();
+
+    let cap = fill_to_cap(&mut s);
+    store::save_to(dir.path(), &s).unwrap();
+
+    let path = dir.path().join("val-cap-power.json");
+    let realised = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        realised <= ventulusd::constants::VALIDATION_MAX_SESSION_BYTES,
+        "a session filled to its own derived cap must still be readable back: \
+         {realised} bytes over a {} byte read cap, at {cap} samples",
+        ventulusd::constants::VALIDATION_MAX_SESSION_BYTES
+    );
+    // And it really round-trips — the read cap is the thing that matters.
+    assert!(
+        store::load_from(dir.path(), "val-cap-power")
+            .expect("readable")
+            .is_some(),
+        "the document must load back"
+    );
+}
+
+// ── DEC-336 / `P8-r`: `record_startup` is documented in the file that reads it ──
+
+/// [SAFETY] `[startup] record_startup` belongs to **`daemon.toml`** and is not a
+/// `runtime.toml` key — and following documentation that says otherwise removes
+/// a user's pump protection.
+///
+/// The v2.41.0 release note named `runtime.toml`. `RuntimeStartup` carries
+/// `delay_secs` alone under `#[serde(deny_unknown_fields)]`, so the key there
+/// fails the section parse, `load_from` degrades the **whole file** to defaults,
+/// and the defaults carry no `header_roles` — dropping the 30 % pump floor, the
+/// stop exemption and pump-safe identify on exactly the label-less boards this
+/// programme exists for.
+///
+/// Asserted as a **relationship between the two loaders on one input**, not as a
+/// pair of literals: the same TOML fragment is fed to both, and the test says
+/// which one must accept it. A doc fix alone would have left nothing pinning
+/// this, which is how the note shipped.
+#[test]
+fn record_startup_is_a_daemon_toml_key_and_poisons_runtime_toml() {
+    const FRAGMENT: &str = "[startup]\nrecord_startup = true\n";
+
+    // The file that reads it accepts it.
+    let cfg = ventulusd::config::DaemonConfig::from_toml(FRAGMENT)
+        .expect("record_startup must parse in daemon.toml");
+    assert!(cfg.startup.record_startup);
+
+    // The file the note named does not — and, crucially, does not merely ignore
+    // the key: it drops everything else in the file with it.
+    let dir = tempfile::tempdir().unwrap();
+    let rt = dir.path().join("runtime.toml");
+    std::fs::write(
+        &rt,
+        format!("{FRAGMENT}\n[hardware]\nheader_roles = {{ \"hwmon:x:y:pwm1:H\" = \"pump\" }}\n"),
+    )
+    .unwrap();
+    let (loaded, degraded) = ventulusd::runtime_config::RuntimeConfig::load_from_reporting(
+        &rt,
+        ventulusd::runtime_config::LoadPhase::Startup,
+    );
+    assert!(
+        degraded.is_some(),
+        "runtime.toml accepted record_startup — if this ever becomes true, the \
+         documentation in packaging/daemon.toml.example must be revisited"
+    );
+    // The [SAFETY] consequence, asserted rather than described: the pump role
+    // the same file carried is GONE.
+    assert!(
+        loaded
+            .hardware
+            .as_ref()
+            .map(|h| h.header_roles.is_empty())
+            .unwrap_or(true),
+        "header_roles survived the degradation, so the safety consequence this \
+         test exists to pin is no longer real"
+    );
+
+    // Precondition: that same file, WITHOUT the poisoning key, really does keep
+    // its header_roles. Without this the assertion above passes for a loader
+    // that never reads header_roles at all.
+    let ok = dir.path().join("ok.toml");
+    std::fs::write(
+        &ok,
+        "[hardware]\nheader_roles = { \"hwmon:x:y:pwm1:H\" = \"pump\" }\n",
+    )
+    .unwrap();
+    let (good, no_degrade) = ventulusd::runtime_config::RuntimeConfig::load_from_reporting(
+        &ok,
+        ventulusd::runtime_config::LoadPhase::Startup,
+    );
+    assert!(no_degrade.is_none());
+    assert_eq!(
+        good.hardware.as_ref().map(|h| h.header_roles.len()),
+        Some(1),
+        "the control file lost its header_roles too, so the test is blind"
+    );
+}
+
+/// The shipped example config documents the key, in the section that reads it.
+///
+/// `packaging/daemon.toml.example` is the file `daemon/README.md` sends users
+/// to, and `record_startup` being absent from it is half of why the release note
+/// sent people to the wrong file. Pinned so the line cannot be dropped silently.
+#[test]
+fn the_example_config_documents_record_startup_under_startup() {
+    const EXAMPLE: &str = include_str!("../../packaging/daemon.toml.example");
+    // Matched in TABLE-HEADER position, not as a substring: the file's own
+    // preamble lists "[startup]  delay_secs" in a comment, and a substring split
+    // lands there instead — the same trap the project rulebook § Hard-won lessons records
+    // for a source-scanning guard matching its own explanation.
+    let startup = EXAMPLE
+        .split("\n[startup]\n")
+        .nth(1)
+        .expect("the example config must have a [startup] section");
+    let section = startup.split("\n[").next().unwrap();
+    assert!(
+        section.contains("record_startup"),
+        "[startup] section does not mention record_startup:\n{section}"
+    );
+    // And the commented form must be the real key, so uncommenting it works.
+    assert!(
+        section.contains("# record_startup = false"),
+        "the documented default is not a directly uncommentable line:\n{section}"
+    );
+}
+
+/// The `P8-az` hop's id fence, asserted directly rather than through the wire.
+///
+/// The hop calls `stop_if` and not `stop` because an operator can stop their
+/// session and start another between the last diagnostic and the finalise — and
+/// the unfenced `stop()` finalises whatever is in the slot, which would be
+/// *their new session*, seconds after it began, from a task belonging to a
+/// session that has already ended.
+///
+/// Driven through the engine directly: no server, no timing, no sleeps. The
+/// integration test proves the hop fires; this proves the call it makes cannot
+/// hit the wrong session, which is the half a wire test cannot force
+/// deterministically. Recommended by the concurrency review.
+#[test]
+fn the_terminal_hop_cannot_finalise_a_session_that_replaced_ours() {
+    use ventulusd::validation::recorder::ValidationEngine;
+
+    let _tmp = temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+
+    let a = engine
+        .start(unique_session("hopfence-a"), &ctx)
+        .expect("A must start");
+    assert_eq!(a.session_id, "val-hopfence-a");
+    // The operator stops A and starts B — exactly the window the fence covers.
+    engine.stop().expect("A must stop");
+    let b = engine
+        .start(unique_session("hopfence-b"), &ctx)
+        .expect("B must start");
+    assert!(
+        b.is_recording(),
+        "B must be recording, or this asserts nothing"
+    );
+
+    // A's orchestration task now reaches its terminal hop, late.
+    assert!(
+        engine.stop_if("val-hopfence-a").is_none(),
+        "A's late hop finalised something — with `stop()` this would have been B"
+    );
+
+    let live = engine
+        .snapshot()
+        .expect("a session must still be installed");
+    assert_eq!(
+        live.session_id, "val-hopfence-b",
+        "the slot no longer holds B"
+    );
+    assert!(
+        live.is_recording(),
+        "B was finalised by a hop belonging to a session that had already ended"
+    );
+
+    // The opposite branch, or a `stop_if` stuck at `None` would pass the above.
+    assert!(
+        engine.stop_if("val-hopfence-b").is_some(),
+        "`stop_if` refuses its OWN session, so the fence above proves nothing"
+    );
+}
+
+// ── `P8-v`: `start` must not take the power mutex under the slot guard ───
+
+/// A FIFO whose reader blocks in `open(2)` until this test opens the write end.
+///
+/// The wedge has to be a genuine kernel-level block, not a `sleep`: the project rulebook
+/// records that DEC-278's three tests all passed while modelling a wedge the way
+/// their author imagined it rather than the way it happens. A `power1_average`
+/// parked on the amdgpu SMU lock blocks in the kernel, and so does this.
+struct FifoWedge {
+    path: std::path::PathBuf,
+    writer: Option<std::os::fd::OwnedFd>,
+}
+
+/// How long the watchdog below waits before releasing the wedge unconditionally.
+/// Far beyond `engage`'s own 5 s deadline and the 2 s observation window, so it
+/// never fires on a healthy run.
+const WEDGE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl FifoWedge {
+    fn new(path: std::path::PathBuf) -> Self {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+
+        // The watchdog, and it is not belt-and-braces — it is the release for
+        // the path `engage` cannot cover. If `engage` times out (a loaded runner
+        // where the recorder thread reaches `open(2)` after its 5 s deadline) it
+        // returns `false` having opened nothing, so `release()` has no writer to
+        // drop and the reader blocks forever: `ticker.join()` never returns, the
+        // `assert!(engaged, …)` is never reached, and a test that should be RED
+        // becomes a hung CI job. That is the project rulebook's tokio trap 3 arriving
+        // through the fixture instead of the runtime, and the sibling wedge in
+        // `api/handlers/discovery.rs` already had a timed writer for it. Found by
+        // the concurrency review.
+        //
+        // Opening the write end releases a reader parked in `open(2)`; dropping
+        // it gives EOF only once EVERY writer has closed, so this cannot cut a
+        // healthy run's wedge short while the test still holds its own.
+        let guarded = path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(WEDGE_WATCHDOG);
+            let _ = std::fs::OpenOptions::new().write(true).open(&guarded);
+        });
+
+        Self { path, writer: None }
+    }
+
+    /// Block until a reader is inside `open(2)` on the FIFO, then hold the write
+    /// end open.
+    ///
+    /// This is the precondition detector AND the thing that keeps the wedge
+    /// wedged. `open(O_WRONLY|O_NONBLOCK)` on a FIFO fails `ENXIO` while no
+    /// reader is present and succeeds the moment one is — so a success proves
+    /// the reader got in. It also releases that reader from `open`, which is
+    /// why the fd is then **held**: with a writer attached and no bytes queued,
+    /// the reader blocks again in `read(2)`.
+    ///
+    /// Returns `false` if no reader arrived before the deadline, so the caller
+    /// fails loudly instead of asserting nothing.
+    fn engage(&mut self, deadline: std::time::Duration) -> bool {
+        use std::os::fd::FromRawFd;
+        let c = std::ffi::CString::new(self.path.as_os_str().as_encoded_bytes()).unwrap();
+        let until = std::time::Instant::now() + deadline;
+        while std::time::Instant::now() < until {
+            // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+            let fd = unsafe { libc::open(c.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+            if fd >= 0 {
+                // SAFETY: `fd` is a fresh, open, owned descriptor.
+                self.writer = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// Let the wedged reader go: closing the last writer gives it EOF, so
+    /// `read_to_string` returns `""` and discovery carries on normally.
+    fn release(&mut self) {
+        self.writer.take();
+    }
+}
+
+/// [P8-v] `start()` completes while `tick()` holds the power sampler across a
+/// wedged sysfs read.
+///
+/// `start` used to clear `self.power` **under the slot guard**, and `tick` holds
+/// that same mutex across blocking sysfs I/O. So a read parked in the kernel —
+/// canonically an amdgpu `power1_average` during a GPU reset — stalled `start`
+/// underneath `slot`, and with it every `slot` reader: `GET /validation/session`,
+/// `recording_session_id()`, `stop_if()` and the shutdown flush, all
+/// non-cancellable `parking_lot` acquisitions.
+///
+/// The assertion is deliberately made **while the wedge is still held** and only
+/// reported after it is released: releasing first would let a defective `start`
+/// finish late and pass.
+#[test]
+fn start_completes_while_a_wedged_power_read_holds_the_sampler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    temp_state_dir();
+    let engine = Arc::new(ValidationEngine::new());
+
+    // The recorder tick reads power only for a RECORDING session, so one has to
+    // be live before the wedge can engage.
+    let ctx = test_context();
+    engine
+        .start(unique_session("p8v-a"), &ctx)
+        .expect("the first session starts");
+
+    // A CPU chip whose power attribute is the wedge. `name` is a real file, so
+    // discovery resolves the source and `detect_amd_gpus` classifies the chip —
+    // both without touching the FIFO. It is `PowerSampler::sample`'s read of
+    // `power1_input` that blocks, which is the per-tick read the register names
+    // (an amdgpu `power1_average` on the SMU lock) rather than the one-off walk.
+    //
+    // Read exactly ONCE, deliberately: a wedge on `name` would be re-entered by
+    // the GPU scan after release and hang the test rather than fail it.
+    let sysfs = tempfile::tempdir().unwrap();
+    let chip = sysfs.path().join("hwmon/hwmon0");
+    std::fs::create_dir_all(&chip).unwrap();
+    std::fs::write(chip.join("name"), "k10temp\n").unwrap();
+    let mut wedge = FifoWedge::new(chip.join("power1_input"));
+    let mut wedged_ctx = test_context();
+    wedged_ctx.hwmon_root = sysfs.path().join("hwmon");
+    wedged_ctx.powercap_root = sysfs.path().join("powercap");
+
+    // T: wedges inside `SessionPower::discover`, holding the power mutex.
+    let t_engine = engine.clone();
+    let ticker = std::thread::spawn(move || {
+        t_engine.tick(&wedged_ctx);
+    });
+
+    let engaged = wedge.engage(std::time::Duration::from_secs(5));
+
+    // With the sampler held, close the live session and start a second one. The
+    // stop is what lets `start` past its `AlreadyRecording` early return and on
+    // to the installation sequence that used to touch `self.power`.
+    engine.stop().expect("the first session stops");
+
+    let started = Arc::new(AtomicBool::new(false));
+    let s_engine = engine.clone();
+    let s_flag = started.clone();
+    let starter = std::thread::spawn(move || {
+        let ctx = test_context();
+        s_engine
+            .start(unique_session("p8v-b"), &ctx)
+            .expect("the second session starts");
+        s_flag.store(true, Ordering::SeqCst);
+    });
+
+    // Observed WHILE the wedge is held. With the defect this stays false: the
+    // starter is parked on `power.lock()` with `slot` in hand.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !started.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let start_completed_under_the_wedge = started.load(Ordering::SeqCst);
+
+    // Release, join, THEN assert — so a failure does not leave two blocked
+    // threads and an undeletable fixture behind.
+    wedge.release();
+    ticker.join().expect("the recorder tick thread");
+    starter.join().expect("the start thread");
+
+    assert!(
+        engaged,
+        "the wedge never engaged, so this test asserted nothing about `start`"
+    );
+    assert!(
+        start_completed_under_the_wedge,
+        "`start` blocked while `tick` held the power sampler — it is taking that \
+         mutex under the slot guard again (`P8-v`)"
+    );
+}
+
+/// [P8-v] Keying the sampler by session id still gives each session a FRESH RAPL
+/// baseline.
+///
+/// This is the guarantee that `start`'s `*self.power.lock() = None` used to
+/// provide, and moving it is only safe if it still holds: a sampler carried
+/// across sessions charges the whole idle gap between them to the second
+/// session's first sample. RAPL is a cumulative counter, so "fresh" is directly
+/// observable — the first sample of a session must be `None` (one reading of a
+/// counter is not a power), and only a *rediscovered* sampler reports `None`
+/// again for session B.
+///
+/// It is also why `try_lock`-and-skip on the old clear was rejected as the fix:
+/// under contention it would have silently published that inflated wattage.
+#[test]
+fn each_session_gets_a_fresh_power_baseline_without_start_touching_the_sampler() {
+    temp_state_dir();
+
+    // A powercap package zone whose counter this test advances by hand.
+    let sysfs = tempfile::tempdir().unwrap();
+    let zone = sysfs.path().join("powercap/intel-rapl:0");
+    std::fs::create_dir_all(&zone).unwrap();
+    std::fs::create_dir_all(sysfs.path().join("hwmon")).unwrap();
+    std::fs::write(zone.join("name"), "package-0\n").unwrap();
+    std::fs::write(zone.join("max_energy_range_uj"), "65532610987\n").unwrap();
+    let energy = zone.join("energy_uj");
+    let mut counter: u64 = 1_000_000;
+    std::fs::write(&energy, format!("{counter}\n")).unwrap();
+
+    let mut ctx = test_context();
+    ctx.hwmon_root = sysfs.path().join("hwmon");
+    ctx.powercap_root = sysfs.path().join("powercap");
+
+    // Long enough that `elapsed_us` cannot round to a wattage the plausibility
+    // cap rejects; the assertions below are on `Some`/`None`, never on timing.
+    let settle = std::time::Duration::from_millis(50);
+    let advance = |counter: &mut u64| {
+        std::thread::sleep(settle);
+        *counter += 100_000;
+        std::fs::write(&energy, format!("{counter}\n")).unwrap();
+    };
+
+    let engine = ValidationEngine::new();
+
+    // ── Session A ────────────────────────────────────────────────────
+    engine
+        .start(unique_session("p8v-fresh-a"), &ctx)
+        .expect("session A starts");
+    engine.tick(&ctx); // primes the counter
+    advance(&mut counter);
+    engine.tick(&ctx); // first real wattage
+
+    let a = engine.snapshot().expect("A is installed");
+    assert_eq!(a.samples.len(), 2, "A recorded two samples");
+    assert!(
+        a.samples[0].package_power_w.is_none(),
+        "A's first sample primed the counter, so it cannot be a wattage"
+    );
+    // The presence half, asserted BEFORE the absence it makes meaningful: if the
+    // fixture never produced a wattage at all, B's `None` below would prove
+    // nothing.
+    assert!(
+        a.samples[1].package_power_w.is_some(),
+        "the fixture never produced a wattage, so this test cannot detect a \
+         carried-over baseline"
+    );
+
+    engine.stop().expect("session A stops");
+
+    // ── Session B ────────────────────────────────────────────────────
+    engine
+        .start(unique_session("p8v-fresh-b"), &ctx)
+        .expect("session B starts");
+    advance(&mut counter);
+    engine.tick(&ctx);
+
+    let b = engine.snapshot().expect("B is installed");
+    assert_eq!(b.samples.len(), 1, "B recorded one sample");
+    assert!(
+        b.samples[0].package_power_w.is_none(),
+        "B's first sample reported a wattage, so it inherited A's sampler — the \
+         session-id key is not resetting the RAPL baseline (`P8-v`)"
+    );
+}
+
+/// DEC-481: no session starts while an OpenFan firmware update holds the
+/// controller — decided under the recorder's slot lock — and one may once it
+/// has handed the controller back.
+#[test]
+fn a_session_is_refused_while_an_openfan_firmware_update_holds_the_controller() {
+    temp_state_dir();
+    let engine = ValidationEngine::new();
+    let ctx = test_context();
+    ctx.cache
+        .set_openfan_link(ventulusd::health::state::OpenFanLink::Connected);
+    ctx.cache
+        .try_begin_openfan_maintenance("r1", "preparing")
+        .unwrap();
+    let err = engine
+        .start(unique_session("during-update"), &ctx)
+        .unwrap_err();
+    assert_eq!(
+        err,
+        ventulusd::validation::recorder::StartError::OpenFanMaintenance
+    );
+    assert!(!engine.is_recording());
+    ctx.cache.end_openfan_maintenance("r1", None);
+    assert!(engine.start(unique_session("after-update"), &ctx).is_ok());
+}

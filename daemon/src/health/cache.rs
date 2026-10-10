@@ -1,0 +1,3158 @@
+//! In-memory cache with batch updates and consistent snapshot reads.
+//!
+//! Uses `RwLock` for concurrent access: multiple readers, exclusive writer.
+//! Updates are atomic at the batch boundary.
+
+use parking_lot::RwLock;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::health::state::*;
+
+/// Fallback hwmon poll interval when nothing has published the real one
+/// (DEC-267) — matches `StalenessConfig::default()` and the shipped
+/// `polling.poll_interval_ms` default.
+const DEFAULT_HWMON_POLL_INTERVAL_MS: u64 = 1000;
+
+/// The most unanswered probes kept as silent-board evidence (DEC-484): far
+/// more serial devices than a machine has, so a bus of strangers cannot grow
+/// the list without end.
+pub const OPENFAN_UNANSWERED_CAP: usize = 16;
+
+/// Multiple of the poll interval past which a CPU reading is treated as no
+/// longer current (DEC-267).
+///
+/// Five intervals is the same multiplier `health::staleness` uses for its `Crit`
+/// boundary — a reading the health rollup would already call critically stale is
+/// not one to run the thermal ladder on. Deliberately not tighter: at 2x (the
+/// `Warn` boundary) an ordinary scheduling hiccup would drop the sensor.
+///
+/// DEC-269: the two are **not** identical, and the earlier claim that they
+/// "match" was wrong. This budget is floored at [`DEFAULT_HWMON_POLL_INTERVAL_MS`]
+/// and the rollup's is not, so below a 1 s poll interval the rollup calls hwmon
+/// `crit` while the safety rule still trusts the reading. That asymmetry is the
+/// safe direction — more headroom means fewer false fallbacks — and is kept
+/// deliberately.
+const CPU_TEMP_STALE_INTERVALS: u32 = 5;
+
+/// Hard ceiling on the staleness budget, however the poll interval is configured
+/// (DEC-269).
+///
+/// [SAFETY] `polling.poll_interval_ms` is validated only as `>= 100`; the
+/// 250–2000 ms clamp lives on the API route, not on the config file. So an admin
+/// typo of `poll_interval_ms = 3600000` would otherwise hand the thermal-emergency rule a
+/// five-hour staleness budget — silently disabling the protection with no
+/// signal anywhere. Defence in depth under the DEC-253 trusted-local posture.
+///
+/// DEC-270: this used to say the daemon stops trusting a temperature older than
+/// the ceiling *regardless* of the interval. That is no longer true, and taken
+/// literally it was not safe either. Once the cadence passes this ceiling the
+/// budget is *shorter than one poll period*, so every reading is stale on
+/// arrival, `hottest_cpu_reading` never returns `Fresh`, and the thermal ladder —
+/// which runs only on a fresh reading — is disabled entirely. The floor in
+/// [`StateCache::cpu_temp_stale_after`] now makes that impossible at any
+/// cadence, and `apply_runtime_overlay` keeps the cadence low enough that this
+/// ceiling never even binds. So this constant is no longer self-standing: do not
+/// remove either guard on the strength of it.
+pub(crate) const CPU_TEMP_STALE_CEILING_MS: u64 = 30_000;
+
+/// The slowest poll cadence this daemon can actually supervise, derived from the
+/// two constants above rather than written down twice (DEC-270).
+///
+/// [SAFETY] Above this, `interval * CPU_TEMP_STALE_INTERVALS` exceeds
+/// [`CPU_TEMP_STALE_CEILING_MS`], so the budget stops tracking the cadence and
+/// the 5x headroom this design promises erodes towards 1x — by a ~15 s cadence a
+/// single missed poll already reads as stale, and at the 30 s ceiling there is no
+/// margin left at all. Past 30 s it inverts outright: the budget is shorter than
+/// one poll period, every reading is stale on arrival, the thermal ladder is
+/// silently disabled and fans pin at NO_SENSOR_SAFE_PCT. Rather than pick a
+/// failure direction, refuse the cadence:
+/// `apply_runtime_overlay` clamps to this and logs a warning, so the daemon still
+/// starts (a fan controller that will not boot over a config typo is worse than
+/// one that polls faster than it was told) and still supervises temperature.
+pub const MAX_SUPERVISABLE_POLL_INTERVAL_MS: u64 =
+    CPU_TEMP_STALE_CEILING_MS / CPU_TEMP_STALE_INTERVALS as u64;
+
+// `MAX_SUPERVISABLE_POLL_INTERVAL_MS` is what `apply_runtime_overlay` clamps the
+// cadence *down to*, so the danger is it becoming absurdly small: raising
+// `CPU_TEMP_STALE_INTERVALS` far enough drives it below the API's own 250 ms
+// floor, and past `CEILING` it reaches 0 — which would clamp the interval to
+// zero and panic `tokio::time::interval` in the hwmon poll loop, killing the only
+// writer of the sensor map the thermal-emergency rule reads.
+//
+// Asserting `MAX * INTERVALS <= CEILING` instead would be vacuous: `MAX` is
+// *derived* by that division, so it holds for every input.
+const _: () = assert!(MAX_SUPERVISABLE_POLL_INTERVAL_MS >= 250);
+
+/// One tick's safety publication (DEC-443) — see
+/// [`StateCache::record_engine_safety`].
+#[derive(Debug, Clone)]
+pub struct EngineSafetyReport<'a> {
+    pub thermal_state: &'a str,
+    pub trigger_c: f64,
+    pub causes: Vec<&'static str>,
+    pub coolant_limit_c: Option<f64>,
+    pub coolant_release_c: Option<f64>,
+}
+
+/// Clamp a coolant limit into the settable range (DEC-443). The one definition
+/// the cache, `main`'s config merge and the API's config report share.
+pub fn clamp_coolant_limit_c(limit_c: u8) -> u8 {
+    limit_c.clamp(
+        crate::constants::COOLANT_LIMIT_MIN_C,
+        crate::constants::COOLANT_LIMIT_MAX_C,
+    )
+}
+
+/// Thread-safe in-memory cache for daemon state.
+///
+/// All IPC responses should read from this cache rather than polling
+/// hardware directly.
+pub struct StateCache {
+    inner: RwLock<DaemonState>,
+    /// Set by the polling loop when a system suspend/resume is detected
+    /// (CLOCK_BOOTTIME gap). Checked and cleared by HwmonPwmController
+    /// on the next set_pwm() call to force re-establishing manual mode.
+    pub resume_detected: AtomicBool,
+    /// Monotonic counter bumped on every `POST /profile/activate` (DEC-188).
+    /// The profile-engine loop tracks the last value it observed and re-anchors
+    /// all cross-tick state when it changes, so re-activating the *same* profile
+    /// id (the "tweak the active curve and re-apply" path) takes effect on the
+    /// next tick instead of being suppressed by the 2°C deadband (DEC-096).
+    /// Bumped and read under the `active_profile` mutex so the tick that first
+    /// observes a swapped profile also observes the new epoch (no extra tick).
+    profile_activation_epoch: AtomicU64,
+    /// The hwmon poll loop's configured interval, in ms (DEC-267).
+    ///
+    /// [SAFETY] Published here so the profile engine can tell a *stale* CPU
+    /// reading from a current one. The engine's thermal-emergency rule reads
+    /// `sensors_snapshot()`, which has no freshness filter of its own — so if
+    /// the poll loop dies the last temperature is returned forever, the rule
+    /// never crosses its threshold, and the no-sensor fallback never engages
+    /// because the sensor is not *missing*, merely frozen. See
+    /// `profile_engine::hottest_fresh_cpu_c`.
+    ///
+    /// Set from the same `polling.poll_interval_ms` that builds
+    /// `StalenessConfig`, and deliberately set next to it in `main.rs` so the
+    /// two derivations cannot drift. `poll_interval_ms` runs from 100 ms to
+    /// [`MAX_SUPERVISABLE_POLL_INTERVAL_MS`] (DEC-270 clamps the admin file; the
+    /// API route is tighter still at 250-2000), which is why this is configured
+    /// rather than a constant: a fixed budget would permanently mark a
+    /// legitimately slow-polling system stale and pin its fans at
+    /// `NO_SENSOR_SAFE_PCT`.
+    hwmon_poll_interval_ms: AtomicU64,
+    /// The OpenFan poll loop's interval, published by the loop (`OFAN-a`); the
+    /// calibration derives its shortest hold from it.
+    openfan_poll_interval_ms: AtomicU64,
+    /// How many OpenFan polls have started: the number of the newest, which its
+    /// readings carry as [`OpenFanState::poll_seq`] (`OFAN-a`).
+    openfan_polls_started: AtomicU64,
+    /// Serialises GPU fan writes between the profile engine and
+    /// `POST /gpu/{id}/fan/reset` (DEC-255).
+    ///
+    /// [SAFETY] GPU writes hold no per-device lock by design (DEC-045), which was
+    /// fine while every write was a single value. A PMFW curve write is not: it
+    /// is N point writes followed by a `"c"` commit, and `reset_to_auto` is
+    /// `"r"`+`"c"` then `"1"`+`"c"`. Two of those interleaving can commit a curve
+    /// that is neither the profile's nor firmware-auto — a corrupt state no
+    /// later tick reconciles, because the reset relinquishes the fan and the
+    /// engine then skips it. The last-moment relinquish re-check narrows that
+    /// race; only mutual exclusion removes it.
+    ///
+    /// Deliberately ONE lock rather than one per GPU: writes are 1 Hz and
+    /// coalesced, machines carry one or two GPUs, and serialising them costs
+    /// nothing measurable while a keyed map costs a lookup and more surface.
+    ///
+    /// `tokio::sync::Mutex`, not `parking_lot`: it is held across
+    /// `spawn_blocking`. Lock order — strictly OUTSIDE `inner`; the write path
+    /// takes `inner` briefly beneath it and no path holds `inner` across a GPU
+    /// write, so no inversion is possible.
+    gpu_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The PMFW cards the daemon has written a curve to and not yet put back on
+    /// firmware auto (DEC-435) — what every stop resets, and nothing else.
+    ///
+    /// Here because each producer already reaches the cache: the engine's GPU
+    /// write, `fan/verify` and `fan/reset`. An `Arc` so `main` can hand the panic
+    /// hook its own reference; it has its own lock, apart from `inner`.
+    gpu_handback: Arc<crate::hwmon::gpu_fan::PmfwHandBack>,
+    /// Monotonic counter bumped whenever the OpenFanController's *device-side*
+    /// duty state may no longer match what we last commanded (DEC-256).
+    ///
+    /// `FanController` coalesces a write away when it equals `last_commanded_pct`,
+    /// which is only sound while that cache reflects the device. Two events break
+    /// that and neither was signalled: a system resume, and a serial reconnect —
+    /// the poll loop swaps the transport underneath the controller after a USB
+    /// re-enumeration, leaving per-channel state describing a device that may have
+    /// come back at its power-on default. Every subsequent identical command was
+    /// then coalesced into silence, so the fan sat at the firmware default with
+    /// the daemon reporting the commanded value.
+    ///
+    /// A counter rather than a flag because `take_resume_flag` is a *swap*: the
+    /// first consumer to call it clears it for everyone, and hwmon already owns
+    /// that one. Each consumer compares against its own last-seen value instead —
+    /// the same shape as `profile_activation_epoch`.
+    openfan_write_generation: AtomicU64,
+    /// Monotonic count of observed system resumes (AIO-MB Phase 5).
+    ///
+    /// A third consumer of the resume signal, and it needs its own counter for
+    /// the reason spelled out above: `take_resume_flag` is a swap that hwmon
+    /// already owns, so a second caller would steal the event from it. Reusing
+    /// `openfan_write_generation` would be wrong for a different reason — that
+    /// one is *also* bumped on serial reconnect, so it answers "may the device
+    /// have been reset?", not "did the system resume?".
+    ///
+    /// The validation recorder compares this against its own last-seen value to
+    /// emit a `resume` event marker, and never mutates it.
+    resume_generation: AtomicU64,
+    /// systemd's notification channel, attached once by `main` (DEC-387).
+    ///
+    /// Held here because the engine's completion guard already reaches the
+    /// cache, and the watchdog keep-alive is that guard's completion stamp
+    /// exported to systemd. Empty in tests and when the daemon is run by hand,
+    /// which makes [`Self::watchdog_tick`] a no-op there.
+    notifier: std::sync::OnceLock<Arc<crate::sd_notify::Notifier>>,
+    /// The exit floor in force right now (DEC-388), in percent.
+    ///
+    /// Here rather than in the frozen `running_config` because it applies live:
+    /// `POST /config/exit-floor` and a SIGHUP both update it, and the shutdown
+    /// reads it at the moment of the stop. Seeded by `main` from the effective
+    /// config; the default only covers tests and a cache nothing configured.
+    exit_floor_pct: std::sync::atomic::AtomicU8,
+    /// The coolant limit in force (DEC-443), in whole °C. Written by `main` from
+    /// the effective config, by a SIGHUP reload and by `POST /config/coolant-limit`;
+    /// read by the profile engine every tick. Always within
+    /// `COOLANT_LIMIT_MIN_C..=COOLANT_LIMIT_MAX_C` — the setter clamps.
+    coolant_limit_c: std::sync::atomic::AtomicU8,
+    /// [SAFETY] `PTR-ae`: hwmon headers a diagnostic wrote and then abandoned
+    /// without running its restore — in practice a panic inside the run.
+    /// Recorded by `characterization::RestoreGuard`'s `Drop`, which writes
+    /// nothing (DEC-455); read by `HwmonPwmController`, which releases such a
+    /// header with no mode switch as DEC-451 releases one the engine held,
+    /// once the write-pause ends. A header with a mode switch needs none of
+    /// this: its take is recorded, and DEC-382 hands it back. Such a header's
+    /// record is inert — every reader filters it out, so nothing clears it —
+    /// and the set stays bounded at one entry per header.
+    ///
+    /// Its own lock, apart from `inner`. Lock order: taken under the hwmon
+    /// controller's mutex, never held while taking it.
+    abandoned_by_diagnostic: parking_lot::Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl StateCache {
+    /// Create a new empty cache.
+    pub fn new() -> Self {
+        Self {
+            inner: RwLock::new(DaemonState::default()),
+            resume_detected: AtomicBool::new(false),
+            profile_activation_epoch: AtomicU64::new(0),
+            hwmon_poll_interval_ms: AtomicU64::new(DEFAULT_HWMON_POLL_INTERVAL_MS),
+            openfan_poll_interval_ms: AtomicU64::new(DEFAULT_HWMON_POLL_INTERVAL_MS),
+            openfan_polls_started: AtomicU64::new(0),
+            gpu_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            gpu_handback: Arc::default(),
+            openfan_write_generation: AtomicU64::new(0),
+            resume_generation: AtomicU64::new(0),
+            notifier: std::sync::OnceLock::new(),
+            exit_floor_pct: std::sync::atomic::AtomicU8::new(
+                crate::constants::DEFAULT_EXIT_FLOOR_PCT,
+            ),
+            coolant_limit_c: std::sync::atomic::AtomicU8::new(
+                crate::constants::DEFAULT_COOLANT_LIMIT_C,
+            ),
+            abandoned_by_diagnostic: parking_lot::Mutex::default(),
+        }
+    }
+
+    /// Record that a diagnostic wrote `header_id` and ended without its restore
+    /// (`PTR-ae`). Memory only — no hardware is touched — so it is safe from a
+    /// `Drop` during unwinding.
+    pub fn note_abandoned_by_diagnostic(&self, header_id: &str) {
+        self.abandoned_by_diagnostic
+            .lock()
+            .insert(header_id.to_string());
+    }
+
+    /// The headers [`Self::note_abandoned_by_diagnostic`] recorded and no
+    /// release has cleared yet, sorted.
+    pub fn abandoned_by_diagnostic(&self) -> Vec<String> {
+        self.abandoned_by_diagnostic
+            .lock()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// True when `header_id` is recorded as abandoned by a diagnostic.
+    pub fn is_abandoned_by_diagnostic(&self, header_id: &str) -> bool {
+        self.abandoned_by_diagnostic.lock().contains(header_id)
+    }
+
+    /// Forget `header_id`'s record: it has been released.
+    pub fn clear_abandoned_by_diagnostic(&self, header_id: &str) {
+        self.abandoned_by_diagnostic.lock().remove(header_id);
+    }
+
+    /// The coolant limit in force now (DEC-443), in whole °C.
+    pub fn coolant_limit_c(&self) -> u8 {
+        self.coolant_limit_c.load(Ordering::Relaxed)
+    }
+
+    /// Set the coolant limit in force (DEC-443), clamped into
+    /// `COOLANT_LIMIT_MIN_C..=COOLANT_LIMIT_MAX_C`.
+    ///
+    /// [SAFETY] Clamped here, where it is relied on, as well as at each setter:
+    /// a hand-edited `runtime.toml` reaches this without the API's validation,
+    /// and a limit of 0 would latch the emergency on every machine with a
+    /// coolant sensor while 255 would switch the trigger off.
+    pub fn set_coolant_limit_c(&self, limit_c: u8) {
+        self.coolant_limit_c
+            .store(clamp_coolant_limit_c(limit_c), Ordering::Relaxed);
+    }
+
+    /// The exit floor in force now (DEC-388) — read by the shutdown path.
+    pub fn exit_floor_pct(&self) -> u8 {
+        self.exit_floor_pct.load(Ordering::Relaxed)
+    }
+
+    /// Set the exit floor in force (DEC-388), clamped to 100.
+    pub fn set_exit_floor_pct(&self, pct: u8) {
+        self.exit_floor_pct.store(pct.min(100), Ordering::Relaxed);
+    }
+
+    /// Attach systemd's notification channel (DEC-387). Called once, from `main`;
+    /// returns `false` if one was already attached, which is a wiring bug.
+    pub fn attach_notifier(&self, notifier: Arc<crate::sd_notify::Notifier>) -> bool {
+        self.notifier.set(notifier).is_ok()
+    }
+
+    /// Send systemd its watchdog keep-alive (DEC-387). Called from the engine's
+    /// `TickCompletion::drop` and nowhere else; a no-op with nothing attached.
+    pub fn watchdog_tick(&self) {
+        if let Some(notifier) = self.notifier.get() {
+            notifier.watchdog_tick();
+        }
+    }
+
+    /// Publish the hwmon poll loop's configured interval (DEC-267).
+    ///
+    /// Called once at startup from the same value that builds
+    /// `StalenessConfig`. Idempotent and lock-free.
+    pub fn set_hwmon_poll_interval_ms(&self, ms: u64) {
+        self.hwmon_poll_interval_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Publish the OpenFan poll loop's interval (`OFAN-a`). Called by the loop
+    /// as it starts, like [`Self::set_hwmon_poll_interval_ms`].
+    pub fn set_openfan_poll_interval_ms(&self, ms: u64) {
+        self.openfan_poll_interval_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The OpenFan poll loop's interval; the 1 s default until a loop has
+    /// published one.
+    pub fn openfan_poll_interval(&self) -> Duration {
+        Duration::from_millis(self.openfan_poll_interval_ms.load(Ordering::Relaxed))
+    }
+
+    /// Number the OpenFan poll about to start, BEFORE it reads the controller,
+    /// and return its number for the readings it caches (`OFAN-a`).
+    pub fn begin_openfan_poll(&self) -> u64 {
+        self.openfan_polls_started.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The number of the newest OpenFan poll to have started. A reading whose
+    /// [`OpenFanState::poll_seq`] is greater came from a poll that started
+    /// after this call.
+    pub fn openfan_polls_started(&self) -> u64 {
+        self.openfan_polls_started.load(Ordering::SeqCst)
+    }
+
+    /// How old a CPU temperature reading may be before the safety rule must
+    /// treat it as absent rather than current (DEC-267).
+    ///
+    /// [SAFETY] This is what converts "the poll loop died" into "no CPU sensor",
+    /// which is a state the daemon already handles correctly and has tested
+    /// (DEC-132's 5-cycle fallback, and a latched emergency held while blind —
+    /// DEC-190, then DEC-386). Without
+    /// it a dead poll loop freezes the last reading, the thermal ladder is
+    /// evaluated forever against a temperature that can no longer rise, and
+    /// `/status` reports a healthy engine throughout — because the engine *is*
+    /// ticking, on stale data.
+    pub fn cpu_temp_stale_after(&self) -> Duration {
+        let interval = self
+            .hwmon_poll_interval_ms
+            .load(Ordering::Relaxed)
+            .max(DEFAULT_HWMON_POLL_INTERVAL_MS);
+        // `saturating_mul`, not `*`: a wrapping multiply would produce a *tiny*
+        // budget — permanent false-stale, every fan pinned at NO_SENSOR_SAFE_PCT
+        // — which is the worst possible direction to fail in (DEC-269).
+        let budget = interval
+            .saturating_mul(u64::from(CPU_TEMP_STALE_INTERVALS))
+            .min(CPU_TEMP_STALE_CEILING_MS)
+            // [SAFETY] Never below one poll period. The ceiling above is what
+            // stops a mistyped interval buying an unbounded trust window, but
+            // applied alone it fails the *other* way: with the cadence slower
+            // than the ceiling, every reading is older than its budget the
+            // moment it lands, so the thermal ladder — which only runs on a
+            // `Fresh` reading — is permanently disabled and fans sit at
+            // NO_SENSOR_SAFE_PCT on healthy hardware, with `/status` reporting a
+            // ticking engine throughout. `apply_runtime_overlay` clamps the
+            // interval to `MAX_SUPERVISABLE_POLL_INTERVAL_MS` so this floor is
+            // unreachable in practice; it is kept because this atomic is
+            // publicly settable and the invariant belongs where it is relied on,
+            // not only where it currently happens to hold.
+            .max(interval);
+        Duration::from_millis(budget)
+    }
+
+    /// Bump the profile-activation epoch (DEC-188). Called by
+    /// `activate_profile_handler` immediately after swapping `active_profile`,
+    /// while still holding that mutex, so the engine sees the swap and the bump
+    /// atomically. `SeqCst` is belt-and-braces over the mutex's own ordering.
+    pub fn bump_profile_activation_epoch(&self) {
+        self.profile_activation_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Read the current profile-activation epoch (DEC-188). The engine loop
+    /// reads this under the `active_profile` mutex and re-anchors its cross-tick
+    /// state whenever the value differs from the previous tick's.
+    pub fn profile_activation_epoch(&self) -> u64 {
+        self.profile_activation_epoch.load(Ordering::SeqCst)
+    }
+
+    /// Get a consistent snapshot of the current state.
+    ///
+    /// The returned `DaemonState` is a clone — no torn reads are possible.
+    pub fn snapshot(&self) -> DaemonState {
+        let state = self.inner.read();
+        state.clone()
+    }
+
+    /// Run `f` against the live state under a shared read guard, returning its
+    /// result without cloning the whole `DaemonState`.
+    ///
+    /// EFF-1: the read-only response builders (`build_*`, `compute_health`) only
+    /// borrow `&DaemonState`. `/poll` and `/status` are the most frequent
+    /// requests (the GUI polls at 1 Hz); calling `snapshot()` for them clones
+    /// the entire state (five `HashMap`s + owned `String`s) just to read it.
+    /// `read_with` lets those builders run under the guard with no intermediate
+    /// clone. `f` must NOT call back into `self` (the parking_lot read guard is
+    /// not reentrant) — keep it to pure reads of the borrowed `&DaemonState`.
+    pub fn read_with<R>(&self, f: impl FnOnce(&DaemonState) -> R) -> R {
+        let state = self.inner.read();
+        f(&state)
+    }
+
+    /// Clone only the sensor map. The profile engine's curve evaluation and
+    /// thermal-safety scan read sensors but none of the fan/AIO state, so this
+    /// avoids cloning the rest of `DaemonState` on every tick.
+    pub fn sensors_snapshot(&self) -> HashMap<String, CachedSensorReading> {
+        self.inner.read().sensors.clone()
+    }
+
+    /// Clone only the GPU-fan map, used by the profile engine's GPU
+    /// write-suppression check. Typically 0–1 entries — far cheaper than a
+    /// full snapshot.
+    pub fn gpu_fans_snapshot(&self) -> HashMap<String, AmdGpuFanState> {
+        self.inner.read().gpu_fans.clone()
+    }
+
+    /// Update all OpenFanController fan readings as a batch.
+    ///
+    /// Preserves `last_commanded_pwm` from existing entries when the incoming
+    /// state doesn't carry one (the RPM poll can't read the commanded value
+    /// from the controller) — mirroring `update_gpu_fans`, so the poll loop
+    /// no longer needs a full `snapshot()` clone every second just to copy
+    /// this one field forward (DEC-146 P3-7).
+    /// Returns how many already-known channels this batch did **not** cover
+    /// (OFS-b) — for the poll loop's short-frame log, not for the stamp.
+    ///
+    /// The stamp below stays unconditional on purpose. It answers *liveness*
+    /// ("a `ReadAllRpm` returned Ok"), which a short frame does not falsify, and
+    /// gating it on coverage would leave it meaning neither liveness nor
+    /// freshness. Freshness is answered separately by `poll_subsystem_health`,
+    /// which reduces over each channel's own `updated_at` — a channel this batch
+    /// skipped keeps its old timestamp and ages on its own, so partial coverage
+    /// surfaces there with nothing needing to detect it.
+    ///
+    /// The count is still worth returning, because a *log line* is exactly the
+    /// thing that needs the detection: before this, a short frame produced no
+    /// journal evidence at all.
+    pub fn update_openfan_fans(&self, fans: Vec<OpenFanState>) -> usize {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        let covered: std::collections::HashSet<u8> = fans.iter().map(|f| f.channel).collect();
+        // F6: count only channels a poll has actually MEASURED. `force_all_with_floor` writes
+        // `0..NUM_CHANNELS` unconditionally, so one thermal emergency mints an entry
+        // for every channel the firmware does not report; those can never be
+        // covered by a later frame, so counting them would latch the short-frame
+        // warning on for the process lifetime and never emit the recovery line.
+        let uncovered = state
+            .openfan_fans
+            .values()
+            .filter(|f| f.rpm_polled && !covered.contains(&f.channel))
+            .count();
+        for mut fan in fans {
+            if fan.last_commanded_pwm.is_none() {
+                if let Some(existing) = state.openfan_fans.get(&fan.channel) {
+                    fan.last_commanded_pwm = existing.last_commanded_pwm;
+                }
+            }
+            state.openfan_fans.insert(fan.channel, fan);
+        }
+        state.subsystem_timestamps.openfan = Some(now);
+        state.snapshot_at = now;
+        uncovered
+    }
+
+    /// Update all hwmon fan readings as a batch.
+    /// Forget the duty the write path last commanded for hwmon header `id`
+    /// (DEC-382).
+    ///
+    /// Called when the daemon gives a header back to firmware. `pwm_commanded_pct`
+    /// has exactly one producer — the write path — and [`Self::update_hwmon_fans`]
+    /// carries a `None` forward rather than clearing it, so without this a header
+    /// firmware now drives would go on reporting the last duty the daemon asked
+    /// for, and the Hardware page would show a request nobody is making.
+    pub fn clear_hwmon_commanded(&self, id: &str) {
+        let mut state = self.inner.write();
+        state.hwmon_diagnostic_commanded.remove(id);
+        if let Some(fan) = state.hwmon_fans.get_mut(id) {
+            fan.pwm_commanded_pct = None;
+        }
+    }
+
+    /// Publish the write path's refresh of hwmon header `fan.id`, recording who
+    /// commanded it (`PTR-ag`): `by_diagnostic` for a write under a `Verify`
+    /// lease, stamped with the current `verify_epoch`; any other write forgets
+    /// the record. One lock with the refresh, so no reader sees a diagnostic's
+    /// duty without its record.
+    pub fn record_hwmon_command(&self, fan: HwmonFanState, by_diagnostic: bool) {
+        let mut state = self.inner.write();
+        if by_diagnostic {
+            let epoch = state.verify_epoch;
+            state
+                .hwmon_diagnostic_commanded
+                .insert(fan.id.clone(), epoch);
+        } else {
+            state.hwmon_diagnostic_commanded.remove(&fan.id);
+        }
+        merge_hwmon_fan(&mut state, fan);
+        state.snapshot_at = Instant::now();
+    }
+
+    /// Publish hwmon header `id`'s duty-reconciliation record (DEC-406). The
+    /// write path is its only producer.
+    pub fn set_hwmon_duty_reconciliation(&self, id: &str, record: DutyReconciliation) {
+        self.inner
+            .write()
+            .hwmon_duty_reconciliation
+            .insert(id.to_string(), record);
+    }
+
+    /// Clear the `not_holding` flag on every header in `ids` (DEC-406), keeping
+    /// each header's correction count, which is since boot.
+    ///
+    /// Called where the controller forgets a header's write state — a hand-back,
+    /// a profile deactivation — because the flag describes a header the engine
+    /// is commanding, and after either of those it is not.
+    pub fn clear_hwmon_duty_not_holding<'a>(&self, ids: impl IntoIterator<Item = &'a str>) {
+        let mut state = self.inner.write();
+        for id in ids {
+            if let Some(r) = state.hwmon_duty_reconciliation.get_mut(id) {
+                r.not_holding = false;
+            }
+        }
+    }
+
+    pub fn update_hwmon_fans(&self, fans: Vec<HwmonFanState>) {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        for fan in fans {
+            merge_hwmon_fan(&mut state, fan);
+        }
+        state.snapshot_at = now;
+        // hwmon fan timestamps roll into the hwmon subsystem timestamp
+    }
+
+    /// Update all sensor readings as a batch, computing rate and min/max.
+    pub fn update_sensors(&self, readings: Vec<CachedSensorReading>) {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        for mut reading in readings {
+            // Compute rate of change and update min/max from previous reading
+            if let Some(prev) = state.sensors.get(&reading.id) {
+                let elapsed = now.duration_since(prev.updated_at).as_secs_f64();
+                if elapsed > 0.1 {
+                    let raw_rate = (reading.value_c - prev.value_c) / elapsed;
+                    // Exponential moving average for smoothing
+                    let alpha = 0.3;
+                    let smoothed = match prev.rate_c_per_s {
+                        Some(prev_rate) => alpha * raw_rate + (1.0 - alpha) * prev_rate,
+                        None => raw_rate,
+                    };
+                    reading.rate_c_per_s = Some((smoothed * 100.0).round() / 100.0);
+                }
+                // Track session min/max
+                let prev_min = prev.session_min_c.unwrap_or(reading.value_c);
+                let prev_max = prev.session_max_c.unwrap_or(reading.value_c);
+                reading.session_min_c = Some(prev_min.min(reading.value_c));
+                reading.session_max_c = Some(prev_max.max(reading.value_c));
+            } else {
+                // First reading for this sensor
+                reading.session_min_c = Some(reading.value_c);
+                reading.session_max_c = Some(reading.value_c);
+            }
+            state.sensors.insert(reading.id.clone(), reading);
+        }
+        state.subsystem_timestamps.hwmon = Some(now);
+        state.snapshot_at = now;
+    }
+
+    /// Record that the profile engine reached this tick's safety decision:
+    /// publish the thermal safety override state and stamp the engine liveness
+    /// heartbeat.
+    ///
+    /// Unconditional write under the write lock (CONC-3, 2026-07-21 audit).
+    /// An earlier fast path (EFF-4) took a read lock to compare-and-skip
+    /// first — lossless only while the engine tick stayed the sole writer,
+    /// an invariant no type enforces and a read→write TOCTOU if it ever
+    /// broke. The engine calls this once per 1 Hz tick with a short string;
+    /// an uncontended `parking_lot` write at that rate is noise, so the
+    /// invariant-free form wins.
+    ///
+    /// DEC-249: the two writes are deliberately one call under one lock rather
+    /// than two independent setters. The heartbeat's whole purpose is to tell a
+    /// client whether `thermal_state` is still being published, so it must be
+    /// stamped at exactly the point that publishes it — bound together, an early
+    /// `continue` added above this line freezes both, and the heartbeat reports
+    /// the outage. Two separate call sites could drift, leaving the heartbeat
+    /// claiming health while the safety state went stale: the exact failure this
+    /// surface exists to catch.
+    /// `trigger_c` is the trip point the rule ACTED on this tick, published in
+    /// the same write as the state it produced (DEC-308). Same write on purpose:
+    /// DEC-292's invariant is that what `/diagnostics/hardware` reports equals
+    /// what the rule acts on, and since DEC-308 that value is per-machine rather
+    /// than a constant the handler could read for itself.
+    pub fn record_engine_tick(&self, thermal_state: &str, trigger_c: f64) {
+        self.record_engine_safety(&EngineSafetyReport {
+            thermal_state,
+            trigger_c,
+            causes: Vec::new(),
+            coolant_limit_c: None,
+            coolant_release_c: None,
+        });
+    }
+
+    /// The engine's per-tick safety publication (DEC-443): everything
+    /// [`Self::record_engine_tick`] writes, plus which rules are forcing and the
+    /// coolant thresholds acted on — in ONE write, so `/status` can never pair a
+    /// state with another tick's causes. The profile engine calls this;
+    /// `record_engine_tick` is the form for callers with no coolant rule.
+    pub fn record_engine_safety(&self, report: &EngineSafetyReport<'_>) {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        state.thermal_override_state = Some(report.thermal_state.to_string());
+        state.thermal_emergency_trigger_c = Some(report.trigger_c);
+        state.emergency_causes = report.causes.clone();
+        state.coolant_limit_c = report.coolant_limit_c;
+        state.coolant_release_c = report.coolant_release_c;
+        state.subsystem_timestamps.engine_started = Some(now);
+    }
+
+    /// Try to claim the single hardware-verify slot, pausing the profile
+    /// engine's write phase for the verify's lifetime. Returns the claimed
+    /// **epoch**, or `None` if a verify is genuinely in progress (the caller
+    /// must reject with 409) — this single-flight guard stops two concurrent
+    /// verifies from clobbering each other's pause or lease (DEC-165).
+    ///
+    /// `window` is a deadman backstop, and DEC-296 made it two-sided. It always
+    /// bounded the ENGINE half: [`Self::verify_active`] expires against
+    /// `verify_active_until`, so the engine resumes writing after `window` even
+    /// if the guard leaks. It did **not** bound the SLOT half — nothing cleared
+    /// `verify_in_progress` on expiry, so a single leaked guard made every later
+    /// verify *and* calibration return 409 for the rest of the process lifetime.
+    /// An expired window now counts as free.
+    ///
+    /// That alone would be unsafe, which is why the epoch exists: a claimant
+    /// whose window expired may still be alive (DEC-290 moved the guard inside a
+    /// `spawn_blocking` task, so a wedged sysfs write holds it), and when it
+    /// finally returns its `Drop` must not release the *successor's* pause
+    /// mid-test-write. See [`Self::end_verify`].
+    pub fn try_begin_verify(&self, window: Duration) -> Option<u64> {
+        let mut state = self.inner.write();
+        // DEC-481: a firmware update owns the OpenFan controller, and every
+        // claimant of this slot is refused for its whole run. Under this same
+        // write guard, so an update and a diagnostic can never both start.
+        if state.openfan_maintenance_running() {
+            return None;
+        }
+        let now = Instant::now();
+        let genuinely_held = state.verify_in_progress
+            && state
+                .verify_active_until
+                .is_some_and(|deadline| now < deadline);
+        if genuinely_held {
+            return None;
+        }
+        if state.verify_in_progress {
+            // DEC-296: we are STEALING an expired claim, not taking a free one.
+            // Log it: the previous holder may still be alive and about to fail
+            // its restore, and `force_take_lease` logs the eviction that causes
+            // without logging the supersession that explains it.
+            log::warn!(
+                "verify slot: claiming a slot whose deadman elapsed (epoch {} superseded). \
+                 The previous holder did not release it; if it is still running, its \
+                 restore may fail.",
+                state.verify_epoch
+            );
+        }
+        // `wrapping_add` to be non-panicking rather than because wrapping is
+        // reachable: at one increment per verify, u64 does not wrap.
+        state.verify_epoch = state.verify_epoch.wrapping_add(1);
+        state.verify_in_progress = true;
+        state.verify_active_until = Some(now + window);
+        Some(state.verify_epoch)
+    }
+
+    /// Release the hardware-verify slot (the engine resumes writing next tick),
+    /// but **only if `epoch` is still the current claim** (DEC-296).
+    ///
+    /// A stranded claimant that returns after its deadman expired no longer owns
+    /// the slot; releasing unconditionally would clear a *successor's* pause
+    /// while that successor is mid-test-write, letting the engine overwrite its
+    /// test duty and making its verdict false. Ignoring the stale release is the
+    /// whole reason the claim returns a token.
+    pub fn end_verify(&self, epoch: u64) -> bool {
+        let mut state = self.inner.write();
+        if state.verify_epoch != epoch {
+            log::warn!(
+                "verify slot: ignoring a release from superseded epoch {epoch} \
+                 (current {}) — its deadman elapsed and another diagnostic owns the slot",
+                state.verify_epoch
+            );
+            return false;
+        }
+        state.verify_in_progress = false;
+        state.verify_active_until = None;
+        true
+    }
+
+    /// Extend this claim's deadman, but only while `epoch` still owns the slot
+    /// (DEC-296). Returns `false` if it has been superseded.
+    ///
+    /// The deadman measures **liveness**, not total duration. Without this a
+    /// claimant that is merely slow — the hwmon verify's post-settle `read_state`
+    /// is plain `fs::read_to_string` on sysfs and can block — is superseded at
+    /// the window, its lease is force-taken by the successor, and its restore
+    /// then fails with an opaque `InvalidLease`, stranding the header at the test
+    /// duty. A claimant that reaches a checkpoint proves it is alive and keeps
+    /// its slot; one that never reaches one is genuinely wedged and is correctly
+    /// superseded.
+    pub fn renew_verify(&self, epoch: u64, window: Duration) -> bool {
+        let mut state = self.inner.write();
+        if state.verify_epoch != epoch {
+            return false;
+        }
+        state.verify_active_until = Some(Instant::now() + window);
+        true
+    }
+
+    /// Test-only: stamp the live claim's deadman as already elapsed, so the
+    /// next [`try_begin_verify`](Self::try_begin_verify) takes the DEC-296
+    /// steal branch instead of returning `None`.
+    ///
+    /// The steal is the only way two characterisation runs can ever coexist,
+    /// and coexistence is the only thing that exercises the `run_id` fence in
+    /// `hwmon_ctl.rs` — the fence that stops a superseded run publishing its
+    /// points and its terminal state over the run that replaced it. The real
+    /// window is [`VERIFY_PAUSE_DEADMAN`](crate::constants::VERIFY_PAUSE_DEADMAN)
+    /// (30 s), which no test can wait out, and integration tests live in a
+    /// separate crate so `#[cfg(test)]` is invisible to them. Register row
+    /// `AUD2-i`.
+    ///
+    /// Deliberately narrower than making the window itself configurable: no
+    /// production read path changes, and the constant stays a constant at all
+    /// three of its call sites.
+    ///
+    /// **What a stray call would actually do — stated precisely, because an
+    /// earlier version of this comment understated it in both directions and a
+    /// wrong safety argument is the only thing guarding an ungated `pub fn`.**
+    /// It has two effects, not one. (1) [`verify_active`](Self::verify_active)
+    /// goes false immediately, which **un-pauses the profile engine's write
+    /// phase with no competitor involved at all** — the engine would then
+    /// overwrite a live diagnostic's test duty and falsify its verdict.
+    /// (2) The slot becomes stealable. The `run_id` fence makes that safe *only
+    /// for characterisation*: `hwmon_verify_handler` and the GPU verify share
+    /// this same slot and have no run id to fence on (OpenFan calibration fences
+    /// only what it publishes, DEC-452), so a steal
+    /// there force-takes their lease and can strand a header at a test duty.
+    ///
+    /// Neither reduces the thermal emergency's reach: `force_all_with_floor`
+    /// runs at `profile_engine/mod.rs:1247` and `continue`s well before the
+    /// `verify_active()` gate at `:1360`, so the pause never gated the ladder
+    /// (DEC-297), and un-pausing early only returns the engine to writing
+    /// sooner. It sets no state a subsequent claim does not overwrite, and the
+    /// `verify_in_progress` guard makes a call with no live claim a no-op.
+    ///
+    /// It is called only from `daemon/tests/ipc_integration.rs`, which
+    /// `the_verify_deadman_test_seam_has_no_production_caller` enforces rather
+    /// than merely asks for.
+    #[doc(hidden)]
+    pub fn expire_verify_claim_for_test(&self) {
+        let mut state = self.inner.write();
+        if state.verify_in_progress {
+            state.verify_active_until = Some(Instant::now());
+        }
+    }
+
+    /// True while a hardware verify is in progress — held for the verify's
+    /// entire lifetime by the handler's RAII guard, and bounded by the deadman
+    /// backstop so a leaked guard cannot pause the engine indefinitely.
+    pub fn verify_active(&self) -> bool {
+        // `WIRE-n`: delegate rather than restate. `/status` and `/poll` publish
+        // this same predicate from inside `read_with`, where they cannot call
+        // this method without re-entering the read lock, so the rule lives on
+        // `DaemonState` and both readers evaluate the one copy.
+        self.inner.read().verify_active_at(Instant::now())
+    }
+
+    // ── OpenFan link and firmware maintenance (DEC-481) ─────────────────
+
+    /// Publish what the OpenFan poll loop observed of its link.
+    ///
+    /// Called after every poll, so the unchanged case takes only a read guard.
+    /// `Connected` also ends a failed update's `NeedsRecovery`: the board is
+    /// answering again, so OpenFan writes resume.
+    pub fn set_openfan_link(&self, link: OpenFanLink) {
+        {
+            let state = self.inner.read();
+            let ends_recovery = link == OpenFanLink::Connected
+                && matches!(
+                    state.openfan_maintenance,
+                    Some(OpenFanMaintenance::NeedsRecovery { .. })
+                );
+            if state.openfan_link == Some(link) && !ends_recovery {
+                return;
+            }
+        }
+        let mut state = self.inner.write();
+        state.openfan_link = Some(link);
+        if link != OpenFanLink::Connected {
+            return;
+        }
+        if let Some(OpenFanMaintenance::NeedsRecovery { run_id, outcome }) =
+            &state.openfan_maintenance
+        {
+            log::info!(
+                "OpenFan controller is answering again after firmware update {run_id} \
+                 ({outcome}) — OpenFan writes resume"
+            );
+            state.openfan_maintenance = None;
+        }
+    }
+
+    pub fn openfan_link(&self) -> Option<OpenFanLink> {
+        self.inner.read().openfan_link
+    }
+
+    /// Record the device path the controller was adopted on.
+    /// The node the OpenFan controller answers on — set at each adoption,
+    /// reconnect and hand-back. A board that answers there is not silent, so
+    /// any probe evidence that it did not answer goes (DEC-484).
+    pub fn set_openfan_port(&self, path: &str) {
+        let mut state = self.inner.write();
+        if state.openfan_port.as_deref() != Some(path) {
+            state.openfan_port = Some(path.to_string());
+        }
+        state.openfan_unanswered.retain(|(p, _)| p != path);
+    }
+
+    pub fn openfan_port(&self) -> Option<String> {
+        self.inner.read().openfan_port.clone()
+    }
+
+    /// Claim the OpenFan controller for a firmware update — one decision under
+    /// the write guard [`Self::try_begin_verify`] takes, so an update and a
+    /// diagnostic can never both start.
+    ///
+    /// Refuses where a diagnostic would steal: a pause whose deadman lapsed but
+    /// was never released still counts as held (`verify_in_progress` alone, not
+    /// [`DaemonState::verify_active_at`]), because its owner may still be
+    /// driving hardware (DEC-296).
+    ///
+    /// OpenFan writes go on until [`Self::suspend_openfan_writes`]: while the
+    /// run only reads, the profile and the thermal force still reach every
+    /// channel.
+    pub fn try_begin_openfan_maintenance(
+        &self,
+        run_id: &str,
+        first_stage: &'static str,
+    ) -> Result<(), MaintenanceRefusal> {
+        let mut state = self.inner.write();
+        if state.openfan_maintenance_running() {
+            return Err(MaintenanceRefusal::MaintenanceActive);
+        }
+        if state.openfan_link != Some(OpenFanLink::Connected) {
+            return Err(MaintenanceRefusal::LinkNotReady(state.openfan_link));
+        }
+        // Never over a board the last run left needing recovery. The link can
+        // still read `connected` then: the poll loop marks it lost only when it
+        // handles the loan's end, and a run that panicked dropped its claim
+        // before its loan (as does a hand-back the loop did not settle in
+        // time). The loop's first good poll clears the recovery, and a start is
+        // accepted again.
+        if matches!(
+            state.openfan_maintenance,
+            Some(OpenFanMaintenance::NeedsRecovery { .. })
+        ) {
+            return Err(MaintenanceRefusal::RecoveryPending);
+        }
+        if state.verify_in_progress {
+            return Err(MaintenanceRefusal::DiagnosticActive);
+        }
+        if state.thermal_override_state.as_deref() == Some("emergency") {
+            return Err(MaintenanceRefusal::ThermalEmergency);
+        }
+        state.openfan_maintenance = Some(OpenFanMaintenance::Running {
+            run_id: run_id.to_string(),
+            stage: first_stage,
+            stage_deadline: None,
+            writes_suspended: false,
+        });
+        Ok(())
+    }
+
+    /// Claim the OpenFan controller for an update of a board that does not
+    /// answer (DEC-484) — under the same write guard as
+    /// [`Self::try_begin_openfan_maintenance`], so an update and a diagnostic can
+    /// never both start.
+    ///
+    /// Unlike a connected board's update, this needs no working link — the
+    /// board's silence is the point — and it may replace a recovery the last
+    /// run left, which is returned so a run that changes nothing can put it back
+    /// ([`Self::end_openfan_maintenance_restoring`]). It refuses while the poll
+    /// loop reports `Connected`: a controller that answers is updated as a
+    /// connected board, parked first.
+    ///
+    /// [SAFETY] OpenFan writes are suspended from the claim. Nothing reaches a
+    /// board that does not answer, so the suspension costs the thermal force no
+    /// reach; it keeps the engine from failing a write a second on a port that
+    /// is gone.
+    pub fn try_begin_silent_openfan_maintenance(
+        &self,
+        run_id: &str,
+        first_stage: &'static str,
+    ) -> Result<Option<(String, &'static str)>, MaintenanceRefusal> {
+        let mut state = self.inner.write();
+        if state.openfan_maintenance_running() {
+            return Err(MaintenanceRefusal::MaintenanceActive);
+        }
+        if state.openfan_link == Some(OpenFanLink::Connected) {
+            return Err(MaintenanceRefusal::BoardAnswers);
+        }
+        if state.verify_in_progress {
+            return Err(MaintenanceRefusal::DiagnosticActive);
+        }
+        if state.thermal_override_state.as_deref() == Some("emergency") {
+            return Err(MaintenanceRefusal::ThermalEmergency);
+        }
+        let prior = match state.openfan_maintenance.take() {
+            Some(OpenFanMaintenance::NeedsRecovery { run_id, outcome }) => Some((run_id, outcome)),
+            _ => None,
+        };
+        state.openfan_maintenance = Some(OpenFanMaintenance::Running {
+            run_id: run_id.to_string(),
+            stage: first_stage,
+            stage_deadline: None,
+            writes_suspended: true,
+        });
+        Ok(prior)
+    }
+
+    /// Suspend OpenFan writes for the run that owns the controller, from the
+    /// moment it parks the channels. `false` if `run_id` no longer owns it.
+    ///
+    /// [SAFETY] Takes effect for the engine's next channel write, whichever
+    /// way the race goes: every engine and thermal-force write re-checks this
+    /// while holding the controller lock (DEC-191), and the run's own parking
+    /// writes take that lock after this returns — so a write that checked
+    /// before this lands before the parking write to its channel, never after.
+    pub fn suspend_openfan_writes(&self, run_id: &str) -> bool {
+        let mut state = self.inner.write();
+        match &mut state.openfan_maintenance {
+            Some(OpenFanMaintenance::Running {
+                run_id: id,
+                writes_suspended,
+                ..
+            }) if id == run_id => {
+                if !*writes_suspended {
+                    *writes_suspended = true;
+                    log::info!(
+                        "OpenFan firmware update {run_id}: OpenFan writes suspended while the \
+                         update holds the controller"
+                    );
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Move a running update to its next stage. `false` if `run_id` no longer
+    /// owns the controller.
+    pub fn set_openfan_maintenance_stage(
+        &self,
+        run_id: &str,
+        next: &'static str,
+        deadline: Option<Instant>,
+    ) -> bool {
+        let mut state = self.inner.write();
+        match &mut state.openfan_maintenance {
+            Some(OpenFanMaintenance::Running {
+                run_id: id,
+                stage,
+                stage_deadline,
+                ..
+            }) if id == run_id => {
+                *stage = next;
+                *stage_deadline = deadline;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Lift the write suspension of a running update: the poll loop has the
+    /// port back, so the engine and the thermal force may write again.
+    pub fn resume_openfan_writes(&self, run_id: &str) -> bool {
+        let mut state = self.inner.write();
+        match &mut state.openfan_maintenance {
+            Some(OpenFanMaintenance::Running {
+                run_id: id,
+                writes_suspended,
+                ..
+            }) if id == run_id => {
+                if *writes_suspended {
+                    *writes_suspended = false;
+                    log::info!(
+                        "OpenFan firmware update {run_id}: OpenFan writes resume — the poll loop \
+                         has the controller back"
+                    );
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Release a running update's claim. `needs_recovery` names the outcome of
+    /// a run that left the board outside normal control: writes then stay
+    /// suspended until the link reports `Connected` (see
+    /// [`Self::set_openfan_link`]). Idempotent; a stale `run_id` is ignored.
+    pub fn end_openfan_maintenance(&self, run_id: &str, needs_recovery: Option<&'static str>) {
+        let mut state = self.inner.write();
+        let Some(OpenFanMaintenance::Running {
+            run_id: id,
+            writes_suspended,
+            ..
+        }) = &state.openfan_maintenance
+        else {
+            return;
+        };
+        if id != run_id {
+            return;
+        }
+        let was_suspended = *writes_suspended;
+        match needs_recovery {
+            Some(outcome) => {
+                log::warn!(
+                    "OpenFan firmware update {run_id} ended with the board outside normal control \
+                     ({outcome}) — OpenFan writes stay suspended until the controller answers again"
+                );
+                state.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+                    run_id: run_id.to_string(),
+                    outcome,
+                });
+            }
+            None => {
+                if was_suspended {
+                    log::info!("OpenFan firmware update {run_id} ended — OpenFan writes resume");
+                }
+                state.openfan_maintenance = None;
+            }
+        }
+    }
+
+    /// Release a silent board's update that changed nothing (DEC-484), putting
+    /// back the recovery its claim replaced: the board is as the last run left
+    /// it. One decision under the guard, so OpenFan writes are never resumed in
+    /// between. A stale `run_id` is ignored.
+    pub fn end_openfan_maintenance_restoring(&self, run_id: &str, prior: (String, &'static str)) {
+        let mut state = self.inner.write();
+        if !matches!(
+            &state.openfan_maintenance,
+            Some(OpenFanMaintenance::Running { run_id: id, .. }) if id == run_id
+        ) {
+            return;
+        }
+        log::warn!(
+            "OpenFan firmware update {run_id} changed nothing — the board still needs the \
+             recovery firmware update {} left it needing ({})",
+            prior.0,
+            prior.1
+        );
+        state.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+            run_id: prior.0,
+            outcome: prior.1,
+        });
+    }
+
+    /// Note a serial device an adoption probe opened that did not answer the
+    /// identity handshake, and the node it was (DEC-484). One entry per path,
+    /// the latest node; at most [`OPENFAN_UNANSWERED_CAP`], oldest first out.
+    pub fn record_openfan_unanswered(&self, path: &str, node: crate::serial::adoption::NodeId) {
+        let mut state = self.inner.write();
+        let list = &mut state.openfan_unanswered;
+        list.retain(|(p, _)| p != path);
+        list.push((path.to_string(), node));
+        let excess = list.len().saturating_sub(OPENFAN_UNANSWERED_CAP);
+        list.drain(..excess);
+    }
+
+    /// The probe evidence, oldest first.
+    pub fn openfan_unanswered(&self) -> Vec<(String, crate::serial::adoption::NodeId)> {
+        self.inner.read().openfan_unanswered.clone()
+    }
+
+    /// Drop the evidence `keep` rejects — a node that went away or now names
+    /// another device.
+    pub fn retain_openfan_unanswered(
+        &self,
+        keep: impl Fn(&str, crate::serial::adoption::NodeId) -> bool,
+    ) {
+        let mut state = self.inner.write();
+        state.openfan_unanswered.retain(|(p, n)| keep(p, *n));
+    }
+
+    /// Publish the silent board, or none (DEC-484). Takes only a read guard
+    /// when nothing changed.
+    pub fn set_openfan_silent_board(&self, board: Option<SilentBoardEntry>) {
+        if self.inner.read().openfan_silent_board == board {
+            return;
+        }
+        let mut state = self.inner.write();
+        // The port, never the serial: a support bundle carries this log whole,
+        // and the board's serial is kept out of it (DEC-483).
+        match (&state.openfan_silent_board, &board) {
+            (None, Some(b)) => log::warn!(
+                "An OpenFAN board on USB port {} does not answer Ventulus — its firmware can \
+                 be updated from the Hardware page",
+                b.usb_port
+            ),
+            (Some(b), None) => {
+                log::info!(
+                    "The OpenFAN board on USB port {} no longer reads as silent",
+                    b.usb_port
+                )
+            }
+            _ => {}
+        }
+        state.openfan_silent_board = board;
+    }
+
+    pub fn openfan_silent_board(&self) -> Option<SilentBoardEntry> {
+        self.inner.read().openfan_silent_board.clone()
+    }
+
+    /// At startup, for a run this start found interrupted after it had asked
+    /// the board to enter its bootloader: report the board as needing recovery
+    /// until the poll loop next reports `Connected`. Never replaces a run.
+    pub fn restore_openfan_recovery(&self, run_id: &str, outcome: &'static str) {
+        let mut state = self.inner.write();
+        if state.openfan_maintenance.is_none() {
+            state.openfan_maintenance = Some(OpenFanMaintenance::NeedsRecovery {
+                run_id: run_id.to_string(),
+                outcome,
+            });
+        }
+    }
+
+    pub fn openfan_maintenance(&self) -> Option<OpenFanMaintenance> {
+        self.inner.read().openfan_maintenance.clone()
+    }
+
+    /// See [`DaemonState::openfan_maintenance_running`].
+    pub fn openfan_maintenance_running(&self) -> bool {
+        self.inner.read().openfan_maintenance_running()
+    }
+
+    /// See [`DaemonState::openfan_writes_suspended`]. The thermal force's gate.
+    pub fn openfan_writes_suspended(&self) -> bool {
+        self.inner.read().openfan_writes_suspended()
+    }
+
+    /// The gate for every OpenFan write the engine makes outside the thermal
+    /// force: the diagnostic pause or a firmware update, read under one guard.
+    pub fn openfan_writes_paused(&self) -> bool {
+        let state = self.inner.read();
+        state.verify_active_at(Instant::now()) || state.openfan_writes_suspended()
+    }
+
+    /// Relinquish a GPU fan to firmware-auto: the profile engine stops writing
+    /// it, so a `POST /gpu/{id}/fan/reset` is durable under an active profile
+    /// instead of being re-asserted on the next tick. Cleared on the next
+    /// profile activation (DEC-165).
+    /// Returns `true` if **this call** claimed the fan, `false` if it was
+    /// already relinquished (DEC-255).
+    ///
+    /// The caller must roll back only when it claimed: an unconditional rollback
+    /// lets a second, failing reset clear the flag a first, *successful* reset
+    /// owns — handing the fan back to the engine after the API told the user it
+    /// was reset. That needs no concurrency at all, just two clicks.
+    #[must_use]
+    pub fn relinquish_gpu_fan(&self, fan_id: &str) -> bool {
+        self.inner
+            .write()
+            .relinquished_gpu_fans
+            .insert(fan_id.to_string())
+    }
+
+    /// Stamp the engine's tick-*completed* timestamp (DEC-259).
+    ///
+    /// Called from a drop guard in the engine loop so it fires on every exit
+    /// path. Together with the started stamp this lets `compute_health` tell a
+    /// slow tick (busy — report it, do not alarm) from a stopped one (the sole
+    /// PWM writer is gone — alarm).
+    pub fn record_engine_tick_complete(&self) {
+        self.inner.write().subsystem_timestamps.engine_completed = Some(Instant::now());
+    }
+
+    /// Record whether a backend write is still outstanding (DEC-289).
+    ///
+    /// Edge-triggered: the stamp is set on the first stalled tick and left alone
+    /// while the stall persists, so it answers "since when", not "as of when" —
+    /// which is what `engine_health` needs to tell a slow write from a wedged
+    /// one. Cleared the moment a write lands again.
+    pub fn record_engine_write_stall(&self, outstanding: bool) {
+        let mut state = self.inner.write();
+        let stamp = &mut state.subsystem_timestamps.engine_writes_stalled_since;
+        match (outstanding, *stamp) {
+            (true, None) => *stamp = Some(Instant::now()),
+            (true, Some(_)) => {}
+            (false, _) => *stamp = None,
+        }
+    }
+
+    /// Acquire exclusive access to the GPU fan write path (DEC-255).
+    ///
+    /// Returns an **owned** guard so it can be moved into the `spawn_blocking`
+    /// task that performs the writes. That matters for more than ergonomics: if
+    /// the HTTP client disconnects, the handler's future is dropped, and a
+    /// borrowed guard would be released while the blocking write was still in
+    /// flight — re-opening the very window this closes.
+    pub async fn lock_gpu_writes(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gpu_write_lock.clone().lock_owned().await
+    }
+
+    /// Acquire the GPU write lock, or give up after `within`.
+    ///
+    /// `fan/reset` uses this rather than an unbounded wait. Both of the other
+    /// producers hold the lock for very different spans: an engine tick holds
+    /// it for a few milliseconds, so a reset should simply wait that out, but a
+    /// `fan/verify` holds it for its whole multi-second window, and blocking
+    /// there would strand the caller past the GUI's 5 s timeout with no
+    /// explanation. A bounded wait distinguishes the two — wait out a tick,
+    /// report a conflict for a verify.
+    pub async fn lock_gpu_writes_soon(
+        &self,
+        within: std::time::Duration,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        tokio::time::timeout(within, self.gpu_write_lock.clone().lock_owned())
+            .await
+            .ok()
+    }
+
+    /// Un-relinquish a single GPU fan — the rollback for a reset that claimed
+    /// the flag up-front and then failed (DEC-254).
+    ///
+    /// `POST /gpu/{id}/fan/reset` sets the flag *before* writing firmware-auto,
+    /// so the engine is already standing off while the write is in flight. If
+    /// that write then fails, leaving the flag set would strand the fan: not
+    /// reset, and no longer driven by the engine either. Distinct from
+    /// [`Self::clear_relinquished_gpu_fans`], which clears every fan on profile
+    /// activation and would also undo an unrelated, successful reset.
+    pub fn unrelinquish_gpu_fan(&self, fan_id: &str) {
+        self.inner.write().relinquished_gpu_fans.remove(fan_id);
+    }
+
+    /// Clear all relinquished GPU fans so a freshly-activated profile resumes
+    /// controlling them.
+    pub fn clear_relinquished_gpu_fans(&self) {
+        self.inner.write().relinquished_gpu_fans.clear();
+    }
+
+    /// The PMFW cards the daemon drove (DEC-435) — see the field.
+    pub fn gpu_handback(&self) -> &Arc<crate::hwmon::gpu_fan::PmfwHandBack> {
+        &self.gpu_handback
+    }
+
+    /// True if the given GPU fan has been relinquished to firmware-auto.
+    pub fn is_gpu_fan_relinquished(&self, fan_id: &str) -> bool {
+        self.inner.read().relinquished_gpu_fans.contains(fan_id)
+    }
+
+    /// Forget OpenFan `channel`'s commanded duty (`TS-ad`): a write whose reply
+    /// failed may or may not have landed, so the daemon no longer knows it.
+    /// The OpenFan twin of [`Self::clear_hwmon_commanded`]. Like
+    /// [`Self::set_openfan_commanded_pwm`] it leaves `updated_at` alone — that
+    /// is when the RPM was last read (OFS-i).
+    pub fn clear_openfan_commanded_pwm(&self, channel: u8) {
+        if let Some(fan) = self.inner.write().openfan_fans.get_mut(&channel) {
+            fan.last_commanded_pwm = None;
+        }
+    }
+
+    /// Publish the duty an OpenFanController write landed, if the device has not
+    /// been invalidated since the writer observed `generation` — the value of
+    /// [`Self::openfan_write_generation`] its write was issued against. Returns
+    /// whether it published.
+    ///
+    /// `TS-ad`: the generation is compared UNDER the write guard, and that is the
+    /// whole point of taking it as a parameter. [`Self::invalidate_openfan_writes`]
+    /// bumps the counter and only then takes the guard to clear, so a writer
+    /// holding the guard either sees the bump and publishes nothing, or publishes
+    /// before the clear, which then removes it. A check made before taking the
+    /// guard (the first shape of this fix) left a window in which an invalidation
+    /// cleared the cache and the write then republished the duty the device may
+    /// have lost — on a channel nothing commands again, for the life of the
+    /// process. There is deliberately no unconditional setter, so no caller can
+    /// reintroduce that shape.
+    pub fn set_openfan_commanded_pwm(&self, channel: u8, pwm: u8, generation: u64) -> bool {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        if self.openfan_write_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        if let Some(fan) = state.openfan_fans.get_mut(&channel) {
+            fan.last_commanded_pwm = Some(pwm);
+            // OFS-i: deliberately does NOT touch `updated_at`. That field is when
+            // this channel's RPM was last READ, and `build_fan_entries` publishes
+            // it as the reading's `age_ms`. Refreshing it here made a *command*
+            // present as fresh *telemetry*: the fan reported `age_ms` near zero
+            // beside an `rpm` frozen at whatever the last real poll saw, and
+            // `stall_detected` was then computed from that frozen value. Widest
+            // exactly where it matters — a thermal `force_all_with_floor` writes every
+            // channel, and a ~10-byte `SetPwm` completes on a degraded link far
+            // more readily than an ~80-byte `ReadAllRpm`, so "poll dead, writes
+            // still acking" showed every fan FRESH while nothing was measuring.
+        } else {
+            state.openfan_fans.insert(
+                channel,
+                OpenFanState {
+                    channel,
+                    rpm: 0,
+                    last_commanded_pwm: Some(pwm),
+                    updated_at: now,
+                    rpm_polled: false,
+                    poll_seq: 0,
+                },
+            );
+        }
+        state.snapshot_at = now;
+        true
+    }
+
+    /// Update AMD GPU fan readings as a batch.
+    ///
+    /// Preserves `last_commanded_pct` from existing entries when the polling
+    /// update doesn't include one (polling sets it to None since it can't
+    /// read the commanded value from sysfs).
+    pub fn update_gpu_fans(&self, fans: Vec<AmdGpuFanState>) {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        for mut fan in fans {
+            if fan.last_commanded_pct.is_none() {
+                if let Some(existing) = state.gpu_fans.get(&fan.id) {
+                    fan.last_commanded_pct = existing.last_commanded_pct;
+                }
+            }
+            state.gpu_fans.insert(fan.id.clone(), fan);
+        }
+        state.snapshot_at = now;
+    }
+
+    /// Update the last commanded speed for an AMD GPU fan.
+    ///
+    /// Creates a default `AmdGpuFanState` entry if the GPU has not been
+    /// seen yet (e.g. first write before polling has run).
+    pub fn set_gpu_fan_commanded_pct(&self, gpu_id: &str, pct: u8) {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        let fan = state
+            .gpu_fans
+            .entry(gpu_id.to_string())
+            .or_insert_with(|| AmdGpuFanState {
+                id: gpu_id.to_string(),
+                rpm: None,
+                last_commanded_pct: None,
+                duty_pct: None,
+                updated_at: now,
+            });
+        fan.last_commanded_pct = Some(pct);
+        // OFS-k: deliberately does NOT touch `updated_at` — byte-for-byte the same
+        // rule DEC-302 (OFS-i) established for `set_openfan_commanded_pwm` one
+        // function above, and this was the surviving instance of it. That field is
+        // when this GPU's fan telemetry was last READ, and `build_fan_entries`
+        // publishes it as the reading's `age_ms`. Refreshing it here made a
+        // *command* present as fresh *telemetry*: the fan reported an `age_ms`
+        // near zero beside an `rpm`/`duty_pct` frozen at whatever the last real
+        // poll saw. The insert arm below still stamps it, which is correct — a
+        // GPU seen for the first time by a write has no prior reading, and its
+        // `rpm: None` says so honestly.
+        state.snapshot_at = now;
+    }
+
+    /// Forget the last commanded speed for an AMD GPU fan: nothing commands it
+    /// now (DEC-448 — the engine handed it back to firmware auto).
+    ///
+    /// `None` rather than 0 so the next command is always written: a 0 would
+    /// coalesce away a later command under `GPU_COALESCE_DELTA_PCT`, leaving the
+    /// card on firmware auto while a profile names it. A verify reads `None` as
+    /// "on auto" and restores to auto, as it does 0. Like the setter above, it
+    /// leaves `updated_at` alone — that stamps telemetry, not commands.
+    pub fn clear_gpu_fan_commanded_pct(&self, gpu_id: &str) {
+        let mut state = self.inner.write();
+        if let Some(fan) = state.gpu_fans.get_mut(gpu_id) {
+            fan.last_commanded_pct = None;
+        }
+        state.snapshot_at = Instant::now();
+    }
+
+    /// Update AIO pump state.
+    pub fn update_aio(&self, aio: AioPumpState) {
+        let now = Instant::now();
+        let mut state = self.inner.write();
+        state.aio = aio;
+        state.subsystem_timestamps.aio = Some(now);
+        state.snapshot_at = now;
+    }
+
+    /// Replace the set of present-but-unreadable sensors (DEC-193) and evict any
+    /// stale cached reading for the listed ids.
+    ///
+    /// Without the eviction, a sensor that was readable and then went
+    /// permanently unreadable (e.g. WiFi soft-blocked → `ENETDOWN`) would linger
+    /// in `sensors` at its last value forever — served as a live temperature and
+    /// even usable as a curve input. Listing it here removes that stale entry;
+    /// when it recovers, the next successful `update_sensors` re-inserts it and
+    /// the poll loop drops it from this set.
+    ///
+    /// The common case (nothing unavailable, nothing previously unavailable)
+    /// takes only a shared read lock and returns — the poll loop calls this every
+    /// tick.
+    /// The ids currently quarantined (DEC-193): evicted from the live sensors,
+    /// so the engine's memory-id resolver (DEC-492) can still count them.
+    pub fn unavailable_sensor_ids(&self) -> Vec<String> {
+        let state = self.inner.read();
+        state
+            .unavailable_sensors
+            .iter()
+            .map(|u| u.id.clone())
+            .collect()
+    }
+
+    pub fn update_unavailable_sensors(&self, unavailable: Vec<UnavailableSensor>) {
+        // Deliberate double-checked shape: the fast-path read guard is dropped
+        // before the write lock is taken, so another caller can interleave
+        // between check and write. That race is harmless — the write path is
+        // idempotent (re-removing absent ids / re-assigning an equal list), so
+        // the worst case is duplicated work. Do not "fix" it by holding a
+        // single lock across the whole function; the fast path exists so the
+        // every-tick common case never contends for the write lock.
+        if unavailable.is_empty() && self.inner.read().unavailable_sensors.is_empty() {
+            return;
+        }
+        let mut state = self.inner.write();
+        for u in &unavailable {
+            state.sensors.remove(&u.id);
+        }
+        state.unavailable_sensors = unavailable;
+    }
+
+    /// Replace the set of controls the engine cannot resolve (273-i).
+    ///
+    /// Called by the engine tick on EVERY tick, including the early-return paths
+    /// — see the call sites. That unconditional discipline is the point: a
+    /// control listed here is "not being commanded right now", and a list that
+    /// froze because an early `continue` skipped the publish would keep asserting
+    /// that about a control the engine has since resumed, or has stopped
+    /// evaluating entirely. DEC-249 is the same lesson one surface over.
+    ///
+    /// Unlike [`Self::update_unavailable_sensors`] this evicts nothing: a skipped
+    /// control's *fans* are still real and still reporting RPM. What is unknown
+    /// is only whether anything is commanding them, which is exactly what this
+    /// list says.
+    ///
+    /// The common case (nothing skipped, nothing previously skipped) takes only a
+    /// shared read lock and returns — the engine calls this at 1 Hz.
+    pub fn update_skipped_controls(&self, skipped: Vec<SkippedControl>) {
+        // Same deliberate double-checked shape as `update_unavailable_sensors`:
+        // the fast-path read guard is dropped before the write lock is taken, and
+        // the interleaving is harmless because the write is idempotent. The fast
+        // path exists so the every-tick common case never contends for the write
+        // lock; do not collapse it into a single lock.
+        if skipped.is_empty() && self.inner.read().skipped_controls.is_empty() {
+            return;
+        }
+        self.inner.write().skipped_controls = skipped;
+    }
+
+    /// Publish the engine's cooling-watch state for this tick (DEC-443): the
+    /// pumps under a stall response, and the advisories in force. One write,
+    /// from `TickCompletion::drop`, so every exit from a tick publishes it.
+    pub fn update_cooling_watch(
+        &self,
+        pump_stalls: Vec<crate::health::state::PumpStallRecord>,
+        advisories: Vec<crate::health::state::CoolingAdvisoryRecord>,
+    ) {
+        if pump_stalls.is_empty() && advisories.is_empty() {
+            let snap = self.inner.read();
+            if snap.pump_stalls.is_empty() && snap.cooling_advisories.is_empty() {
+                return;
+            }
+        }
+        let mut state = self.inner.write();
+        state.pump_stalls = pump_stalls;
+        state.cooling_advisories = advisories;
+    }
+
+    /// Publish the engine's per-tick control state — which controls are skipped
+    /// (273-i) and what output each evaluated control applied (277-k) — in **one
+    /// write**.
+    ///
+    /// Called on EVERY tick from the single publish point in
+    /// `TickCompletion::drop`, including the early-`continue` paths. An output is
+    /// a *level*, and a level that froze because a `continue` skipped the publish
+    /// would keep reporting a duty the engine has since stopped applying.
+    /// Publishing empty is meaningful, not a gap — it says no control is being
+    /// evaluated right now (no profile, or a thermal force driving the fans
+    /// directly), which is exactly when a card must stop showing a number.
+    ///
+    /// **The two fields must move together, which is why this is one method and
+    /// not two.** They were separate `write()` takes for a while, and each was
+    /// individually atomic, but the *pair* was not: on a resolvability transition
+    /// a control leaves `tick_outputs` as it enters the skip list, so a `/poll`
+    /// landing in the gap saw the new skip entry beside the stale output and
+    /// listed one control on both surfaces when it belongs on exactly one. Both
+    /// readers take them together — `status_handler` and `poll_handler` build
+    /// both inside a single `read_with` — so one guard closes the window
+    /// completely. `docs/08` states that absence from `control_outputs` is
+    /// *meaningful*, so a torn read there contradicts the contract published in
+    /// the same release that introduced the field.
+    ///
+    /// It is also cheaper: with a profile active `control_outputs` is non-empty
+    /// every tick, so the two-call shape took the write lock twice per tick where
+    /// this takes it once.
+    ///
+    /// Same deliberate double-checked fast path as [`Self::update_skipped_controls`],
+    /// now spanning both fields: the read guard is dropped before the write lock
+    /// is taken, and the interleaving is harmless because the write is idempotent.
+    /// It exists so the common no-profile case never contends for the write lock
+    /// at 1 Hz; do not collapse it into a single lock.
+    pub fn update_control_state(&self, skipped: Vec<SkippedControl>, outputs: Vec<ControlOutput>) {
+        if skipped.is_empty() && outputs.is_empty() {
+            let snap = self.inner.read();
+            if snap.skipped_controls.is_empty() && snap.control_outputs.is_empty() {
+                return;
+            }
+        }
+        let mut state = self.inner.write();
+        state.skipped_controls = skipped;
+        state.control_outputs = outputs;
+    }
+
+    /// Drop cached readings for sensors that no longer exist.
+    ///
+    /// [SAFETY] DEC-272 (register row 01-c). [`update_sensors`] only ever
+    /// *inserts*, so a descriptor that disappears — a module unload, a rescan
+    /// that no longer finds it — left its last reading in this map forever. The
+    /// DEC-193 quarantine does not cover it: the failure tracker deliberately
+    /// *forgets* a descriptor that has genuinely unbound, so such a sensor is
+    /// never listed unavailable and so never evicted by
+    /// [`update_unavailable_sensors`]. Its reading therefore aged into
+    /// `CpuReading::Stale` and stayed there for the life of the process — which
+    /// is why DEC-190's `Absent` branch was largely dead for the very scenario it
+    /// was written for, and why a vanished CPU sensor could hold a fan output
+    /// rather than fall to the no-sensor floor.
+    ///
+    /// `live` MUST be the union of the poll loop's current descriptor set and the
+    /// ids it actually read this tick. Descriptors alone is wrong: NVML
+    /// temperatures (DEC-204) are merged into the readings without a descriptor
+    /// of their own, so retaining on the descriptor set would evict every NVIDIA
+    /// sensor on every tick.
+    ///
+    /// A present-but-*failing* descriptor stays in the descriptor set, so it is
+    /// retained here and continues through the quarantine path unchanged. This
+    /// evicts the vanished, not the unreadable — for descriptor-BEARING sensors.
+    /// NVML temps (see above) have no descriptor at all, so one that a tick could
+    /// not read is simply absent from `live` and is evicted; it returns on the
+    /// next good read with its session min/max reset. That is a monitoring wart on
+    /// an off-by-default experimental path, not a control-path defect: GPU temps
+    /// are excluded from the thermal ladder by design (DEC-130).
+    ///
+    /// The caller is responsible for only passing a COMPLETE `live` set. A
+    /// discovery pass that skipped an unreadable chip returns a partial descriptor
+    /// list, and evicting on that evidence took a live CPU sensor to
+    /// `CpuReading::Absent` — see the guard at the `polling.rs` call site
+    /// ([SAFETY] DEC-272 round 2).
+    /// Evict hwmon fan entries that nothing has refreshed within `max_age`
+    /// (OFS-m).
+    ///
+    /// The sibling of [`Self::retain_sensors`] for the fan map, and it keys on age
+    /// rather than on a live-id set for a reason specific to this map: the poll
+    /// loop's PWM header set is built once at startup (`polling.rs`, `Arc::new`)
+    /// and never re-enumerated — `/hwmon/rescan` refreshes sensor descriptors, not
+    /// this — so "the currently-discovered header set" never shrinks and retaining
+    /// against it would evict nothing, ever. Age is the only signal that actually
+    /// distinguishes a header still being read from one that has gone silent.
+    ///
+    /// Both writers refresh `updated_at`: the poll loop on a successful read, and
+    /// `HwmonPwmController::set_pwm` on every engine write (it reads the header's
+    /// own RPM). So an entry is evicted only when *neither* has touched it —
+    /// which is exactly the frozen-forever state this exists to remove, and is why
+    /// an actively-commanded fan cannot be evicted from under a running profile.
+    ///
+    /// Nothing on the control or safety path consumes this map — the engine reads
+    /// headers from `HwmonPwmController`, not from here — so eviction cannot
+    /// affect fan control. It changes `/fans` and `/poll` only.
+    pub fn retain_fresh_hwmon_fans(&self, max_age: std::time::Duration) {
+        let now = Instant::now();
+        // Fast path, mirroring `retain_sensors`: the steady-state tick evicts
+        // nothing and must not take the write lock to discover that.
+        //
+        // `retain_sensors` documents that its read-then-write gap is safe only
+        // because it has a single writer, and warns that a second one would
+        // require a re-check under the write lock. **This map genuinely has two
+        // writers** — the poll loop and `HwmonPwmController::set_pwm` — so that
+        // warning applies here, and is satisfied rather than inherited: the
+        // predicate below is re-evaluated against each entry's own `updated_at`
+        // while holding the write lock, not against an id set captured during the
+        // read. An entry inserted in the gap is therefore judged on its real age
+        // and survives. `now` is sampled before the read, so a slow acquisition
+        // makes ages look *smaller* — the conservative direction, since the worst
+        // outcome is deferring an eviction by one tick.
+        if self
+            .inner
+            .read()
+            .hwmon_fans
+            .values()
+            .all(|f| now.saturating_duration_since(f.updated_at) <= max_age)
+        {
+            return;
+        }
+        let mut state = self.inner.write();
+        state
+            .hwmon_fans
+            .retain(|_, f| now.saturating_duration_since(f.updated_at) <= max_age);
+    }
+
+    pub fn retain_sensors(&self, live: &HashSet<String>) {
+        // Fast path mirrors `update_unavailable_sensors`: the steady-state tick
+        // evicts nothing and must not take the write lock to discover that.
+        //
+        // The read guard is dropped before the write is taken, so the two are NOT
+        // atomic together. What makes that harmless is the single-writer
+        // invariant, not a re-check: the poll loop is the only production writer
+        // of `state.sensors` (the other `update_sensors` callers are #[cfg(test)]),
+        // and it is also the only caller of this method, so nothing can insert a
+        // sensor into the gap. If a second writer is ever added, this needs a
+        // re-check under the write lock — it does not have one today.
+        if self.inner.read().sensors.keys().all(|id| live.contains(id)) {
+            return;
+        }
+        let mut state = self.inner.write();
+        state.sensors.retain(|id, _| live.contains(id));
+    }
+}
+
+impl Default for StateCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StateCache {
+    /// Check if a system resume was detected and clear the flag atomically.
+    pub fn take_resume_flag(&self) -> bool {
+        self.resume_detected.swap(false, Ordering::Relaxed)
+    }
+
+    /// Signal that a system resume was detected.
+    /// Read the OpenFan write generation (DEC-256). `FanController` compares this
+    /// against its own last-seen value and drops its coalescing cache on a change.
+    pub fn openfan_write_generation(&self) -> u64 {
+        self.openfan_write_generation.load(Ordering::SeqCst)
+    }
+
+    /// Declare that the OpenFanController's device-side duty may no longer match
+    /// what we last commanded, so the next write for each channel must actually
+    /// reach the wire (DEC-256). Called on serial reconnect and on resume.
+    ///
+    /// `TS-ad`: the published `last_commanded_pwm` goes with it. The controller
+    /// forgets its duties on the generation bump; the wire must not go on
+    /// reporting them for the channels nothing commands again. The counter MUST
+    /// move before the guard is taken: [`Self::set_openfan_commanded_pwm`]
+    /// compares it under the guard, which is what stops a write that completes
+    /// across this call from republishing a duty it cleared.
+    pub fn invalidate_openfan_writes(&self) {
+        self.openfan_write_generation.fetch_add(1, Ordering::SeqCst);
+        let mut state = self.inner.write();
+        for fan in state.openfan_fans.values_mut() {
+            fan.last_commanded_pwm = None;
+        }
+    }
+
+    /// Read the resume counter (AIO-MB Phase 5). Non-consuming, unlike
+    /// `take_resume_flag` — any number of observers may watch it.
+    pub fn resume_generation(&self) -> u64 {
+        self.resume_generation.load(Ordering::SeqCst)
+    }
+
+    pub fn set_resume_detected(&self) {
+        // A resume invalidates OpenFan's coalescing cache for the same reason it
+        // clears hwmon's manual-mode flags: the device may have been reset
+        // underneath us (DEC-256).
+        self.invalidate_openfan_writes();
+        self.resume_generation.fetch_add(1, Ordering::SeqCst);
+        self.resume_detected.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Merge one hwmon fan refresh into the state — the poll's or the write
+/// path's — keeping what only the other producer samples (DEC-316).
+fn merge_hwmon_fan(state: &mut DaemonState, mut fan: HwmonFanState) {
+    // Merge, do not replace, the fields only the POLL samples (DEC-316).
+    //
+    // `HwmonPwmController::set_pwm` constructs a whole `HwmonFanState`
+    // on every engine tick — including its coalesce fast path, which
+    // skips sysfs but still refreshes the cache — and has no cheap way
+    // to re-read these. A bare `insert` therefore erased the poll's
+    // answer at ~1 Hz, making both fields permanently absent for any
+    // header under an active profile: exactly the header whose fan
+    // alarm matters most. Mirrors `update_openfan_fans`, which carries
+    // `last_commanded_pwm` forward for the same reason.
+    //
+    // `pwm_readback_pct` joined this list in AIO-MB Phase 5 for exactly
+    // the same reason: the poll is its only producer, so without the
+    // merge a controlled header — the one a validation session cares
+    // about — would report no readback at all.
+    //
+    // `pwm_commanded_pct` (AIO-MB Phase 6) is the same rule pointing the
+    // OTHER way, and is why this block is a merge rather than a list of
+    // poll-only fields. Its only producer is the write path, so it is
+    // the POLL that must not erase it: without the carry-forward every
+    // 1 Hz poll would blank the command for a controlled header — again,
+    // exactly the header whose requested-vs-readback split the Hardware
+    // page exists to show. Each producer writes `None` for the other's
+    // field, so one "if none, keep what is there" rule serves both.
+    if fan.alarm.is_none()
+        || fan.pwm_enable_mode.is_none()
+        || fan.pwm_readback_pct.is_none()
+        || fan.pwm_commanded_pct.is_none()
+    {
+        if let Some(existing) = state.hwmon_fans.get(&fan.id) {
+            if fan.alarm.is_none() {
+                fan.alarm = existing.alarm;
+            }
+            if fan.pwm_enable_mode.is_none() {
+                fan.pwm_enable_mode = existing.pwm_enable_mode;
+            }
+            if fan.pwm_readback_pct.is_none() {
+                fan.pwm_readback_pct = existing.pwm_readback_pct;
+            }
+            if fan.pwm_commanded_pct.is_none() {
+                fan.pwm_commanded_pct = existing.pwm_commanded_pct;
+            }
+        }
+    }
+    // DEC-458: every producer's RPM reading counts — the poll's and a
+    // write's — so a fan seen turning once is remembered for good.
+    if fan.rpm.is_some_and(|rpm| rpm > 0) {
+        state.hwmon_seen_spinning.insert(fan.id.clone());
+    }
+    state.hwmon_fans.insert(fan.id.clone(), fan);
+}
+
+#[cfg(test)]
+mod tests {
+    // ── DEC-255 / release review 2026-08-10: bounded GPU-write acquisition ──
+
+    #[tokio::test]
+    async fn a_free_gpu_write_lock_is_acquired_immediately() {
+        let cache = StateCache::new();
+        let got = cache
+            .lock_gpu_writes_soon(std::time::Duration::from_millis(200))
+            .await;
+        assert!(got.is_some(), "an uncontended lock must be granted");
+    }
+
+    #[tokio::test]
+    async fn a_held_gpu_write_lock_times_out_rather_than_blocking() {
+        // This is what lets `fan/reset` tell an engine tick (milliseconds) apart
+        // from a `fan/verify` (multiple seconds) and report a conflict instead
+        // of hanging past the GUI's 5 s client timeout.
+        let cache = StateCache::new();
+        let _held = cache.lock_gpu_writes().await;
+
+        let got = cache
+            .lock_gpu_writes_soon(std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            got.is_none(),
+            "a held lock must time out, not block forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_grantable_again_once_released() {
+        let cache = StateCache::new();
+        let held = cache.lock_gpu_writes().await;
+        drop(held);
+        assert!(
+            cache
+                .lock_gpu_writes_soon(std::time::Duration::from_millis(200))
+                .await
+                .is_some(),
+            "releasing must actually free the lock"
+        );
+    }
+
+    use super::*;
+    use crate::hwmon::types::SensorKind;
+
+    fn make_openfan(channel: u8, rpm: u16) -> OpenFanState {
+        OpenFanState {
+            channel,
+            rpm,
+            last_commanded_pwm: None,
+            updated_at: Instant::now(),
+            rpm_polled: true,
+            poll_seq: 0,
+        }
+    }
+
+    fn make_sensor(id: &str, value_c: f64) -> CachedSensorReading {
+        CachedSensorReading {
+            id: id.to_string(),
+            kind: SensorKind::CpuTemp,
+            label: "test".into(),
+            value_c,
+            source: DeviceLabel::Hwmon,
+            updated_at: Instant::now(),
+            rate_c_per_s: None,
+            session_min_c: None,
+            session_max_c: None,
+            chip_name: "k10temp".into(),
+            temp_type: None,
+            thresholds: None,
+        }
+    }
+
+    #[test]
+    fn empty_cache_snapshot() {
+        let cache = StateCache::new();
+        let snap = cache.snapshot();
+        assert!(snap.openfan_fans.is_empty());
+        assert!(snap.hwmon_fans.is_empty());
+        assert!(snap.sensors.is_empty());
+        assert!(!snap.aio.detected);
+    }
+
+    #[test]
+    fn update_openfan_fans_preserves_commanded_pwm_on_none() {
+        // DEC-146 P3-7: the RPM poll can't read the commanded value from the
+        // controller, so a poll update carrying None must not erase what a
+        // write recorded — mirroring update_gpu_fans.
+        let cache = StateCache::new();
+        let mut written = make_openfan(0, 800);
+        written.last_commanded_pwm = Some(40);
+        cache.update_openfan_fans(vec![written]);
+
+        // Poll cycle: rpm refreshed, commanded value unknown (None).
+        cache.update_openfan_fans(vec![make_openfan(0, 820)]);
+        let snap = cache.snapshot();
+        assert_eq!(snap.openfan_fans[&0].last_commanded_pwm, Some(40));
+        assert_eq!(snap.openfan_fans[&0].rpm, 820);
+
+        // A new write overrides the preserved value.
+        let mut rewritten = make_openfan(0, 830);
+        rewritten.last_commanded_pwm = Some(60);
+        cache.update_openfan_fans(vec![rewritten]);
+        let snap = cache.snapshot();
+        assert_eq!(snap.openfan_fans[&0].last_commanded_pwm, Some(60));
+    }
+
+    #[test]
+    fn read_with_observes_live_state_without_snapshot() {
+        // EFF-1: read_with runs a closure against the live state under a shared
+        // read guard and returns a derived value, with no full DaemonState
+        // clone. It must observe exactly what snapshot() would.
+        let cache = StateCache::new();
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        cache.update_sensors(vec![]);
+
+        let via_read_with = cache.read_with(|s| s.thermal_override_state.clone());
+        let via_snapshot = cache.snapshot().thermal_override_state;
+        assert_eq!(via_read_with, via_snapshot);
+        assert_eq!(via_read_with.as_deref(), Some("emergency"));
+    }
+
+    #[test]
+    fn set_thermal_override_state_applies_changes_and_is_idempotent() {
+        // The engine calls this every tick (unconditional write since CONC-3
+        // dropped the EFF-4 compare-and-skip fast path). A redundant write
+        // must stay value-correct and a genuine change MUST land — this
+        // guards against any future fast-path dropping real transitions.
+        let cache = StateCache::new();
+        assert_eq!(cache.snapshot().thermal_override_state, None);
+
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("normal")
+        );
+
+        // Redundant write — value stays correct.
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("normal")
+        );
+
+        // Genuine change must be applied, not skipped.
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("emergency")
+        );
+        cache.record_engine_tick("recovery", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        assert_eq!(
+            cache.snapshot().thermal_override_state.as_deref(),
+            Some("recovery")
+        );
+    }
+
+    #[test]
+    fn record_engine_tick_stamps_the_heartbeat_with_the_thermal_state() {
+        // DEC-249: the heartbeat exists to tell a client whether `thermal_state`
+        // is still being published, so the two must move together. A fresh cache
+        // has never ticked — that is what makes a dead-on-arrival engine visible.
+        let cache = StateCache::new();
+        assert!(
+            cache
+                .snapshot()
+                .subsystem_timestamps
+                .engine_started
+                .is_none(),
+            "a cache that has seen no tick must not look alive"
+        );
+
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        let first = cache
+            .snapshot()
+            .subsystem_timestamps
+            .engine_started
+            .expect("tick must stamp the heartbeat");
+
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        let snap = cache.snapshot();
+        assert!(
+            snap.subsystem_timestamps.engine_started.unwrap() >= first,
+            "heartbeat must advance monotonically"
+        );
+        assert_eq!(
+            snap.thermal_override_state.as_deref(),
+            Some("emergency"),
+            "the same call must publish the thermal state"
+        );
+    }
+
+    #[tokio::test]
+    async fn gpu_write_lock_actually_excludes() {
+        // DEC-255: the property the whole GPU-race fix now rests on. A PMFW
+        // curve write is N point writes plus a commit and a reset is "r"+"c";
+        // if these are not mutually exclusive they can interleave into a curve
+        // that is neither the profile's nor firmware-auto, which no later tick
+        // reconciles.
+        let cache = Arc::new(StateCache::new());
+        let held = cache.lock_gpu_writes().await;
+
+        let contender = cache.clone();
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(50), async move {
+            contender.lock_gpu_writes().await
+        })
+        .await;
+        assert!(blocked.is_err(), "a second GPU writer must wait");
+
+        drop(held);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                cache.lock_gpu_writes(),
+            )
+            .await
+            .is_ok(),
+            "and must proceed once the first releases"
+        );
+    }
+
+    #[test]
+    fn relinquish_reports_whether_this_call_claimed() {
+        // DEC-255: the bool is what makes the rollback ownership-aware. Without
+        // it a second, failing reset clears the flag a first, successful reset
+        // owns — no concurrency required, just two clicks.
+        let cache = StateCache::new();
+        assert!(
+            cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0"),
+            "first claim"
+        );
+        assert!(
+            !cache.relinquish_gpu_fan("amd_gpu:0000:03:00.0"),
+            "second call must report that it did NOT claim"
+        );
+    }
+
+    #[test]
+    fn profile_activation_epoch_starts_zero_and_increments() {
+        // DEC-188: the profile engine re-anchors its cross-tick state whenever
+        // this value changes, so a fresh cache must start at 0 and every bump
+        // (one per `POST /profile/activate`) must advance it monotonically.
+        let cache = StateCache::new();
+        assert_eq!(cache.profile_activation_epoch(), 0);
+        cache.bump_profile_activation_epoch();
+        assert_eq!(cache.profile_activation_epoch(), 1);
+        cache.bump_profile_activation_epoch();
+        assert_eq!(cache.profile_activation_epoch(), 2);
+    }
+
+    #[test]
+    fn update_openfan_fans_batch() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(0, 1200), make_openfan(1, 1100)]);
+
+        let snap = cache.snapshot();
+        assert_eq!(snap.openfan_fans.len(), 2);
+        assert_eq!(snap.openfan_fans[&0].rpm, 1200);
+        assert_eq!(snap.openfan_fans[&1].rpm, 1100);
+        assert!(snap.subsystem_timestamps.openfan.is_some());
+    }
+
+    #[test]
+    fn update_openfan_overwrites_existing() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(0, 1200)]);
+        cache.update_openfan_fans(vec![make_openfan(0, 1500)]);
+
+        let snap = cache.snapshot();
+        assert_eq!(snap.openfan_fans.len(), 1);
+        assert_eq!(snap.openfan_fans[&0].rpm, 1500);
+    }
+
+    #[test]
+    fn update_sensors_batch() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![
+            make_sensor("hwmon:k10temp:0000:00:18.3:Tctl", 55.0),
+            make_sensor("hwmon:amdgpu:0000:03:00.0:edge", 42.0),
+        ]);
+
+        let snap = cache.snapshot();
+        assert_eq!(snap.sensors.len(), 2);
+        assert!(
+            (snap.sensors["hwmon:k10temp:0000:00:18.3:Tctl"].value_c - 55.0).abs() < f64::EPSILON
+        );
+        assert!(snap.subsystem_timestamps.hwmon.is_some());
+    }
+
+    #[test]
+    fn update_hwmon_fans() {
+        let cache = StateCache::new();
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "it8696:fan1".into(),
+            rpm: Some(800),
+            last_commanded_pwm: None,
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            updated_at: Instant::now(),
+            alarm: None,
+            pwm_enable_mode: None,
+        }]);
+
+        let snap = cache.snapshot();
+        assert_eq!(snap.hwmon_fans.len(), 1);
+        assert_eq!(snap.hwmon_fans["it8696:fan1"].rpm, Some(800));
+    }
+
+    /// OFS-k: a COMMAND must not make stale telemetry look fresh.
+    ///
+    /// The GPU twin of DEC-302's `set_openfan_commanded_pwm` fix, and the instance
+    /// that survived it. `build_fan_entries` publishes `updated_at` as the
+    /// reading's `age_ms`, so refreshing it on a write reported an age near zero
+    /// beside an `rpm` frozen at whatever the last real poll saw.
+    #[test]
+    fn a_gpu_command_does_not_refresh_the_telemetry_timestamp() {
+        let cache = StateCache::new();
+        cache.update_gpu_fans(vec![AmdGpuFanState {
+            id: "amd_gpu:0000:2d:00.0".into(),
+            rpm: Some(1200),
+            last_commanded_pct: None,
+            duty_pct: Some(40),
+            updated_at: Instant::now() - std::time::Duration::from_secs(30),
+        }]);
+        let before = cache.gpu_fans_snapshot()["amd_gpu:0000:2d:00.0"].updated_at;
+
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:2d:00.0", 75);
+
+        let snap = cache.gpu_fans_snapshot();
+        let after = &snap["amd_gpu:0000:2d:00.0"];
+        assert_eq!(
+            after.updated_at, before,
+            "a command must leave the READING's timestamp alone — the rpm beside \
+             it is still 30s old, and age_ms is computed from this field"
+        );
+        assert_eq!(
+            after.last_commanded_pct,
+            Some(75),
+            "precondition: the command itself must still have been recorded, or \
+             this test would pass against a no-op"
+        );
+    }
+
+    /// OFS-k, the other half: a GPU seen for the first time BY a write has no
+    /// prior reading, so stamping `updated_at` on insert is correct. `rpm: None`
+    /// is what says "nothing measured this".
+    #[test]
+    fn a_first_ever_gpu_command_still_stamps_the_new_entry() {
+        let cache = StateCache::new();
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:2d:00.0", 60);
+        let snap = cache.gpu_fans_snapshot();
+        let fan = &snap["amd_gpu:0000:2d:00.0"];
+        assert!(fan.rpm.is_none(), "nothing has measured this fan");
+        assert!(
+            Instant::now().saturating_duration_since(fan.updated_at)
+                < std::time::Duration::from_secs(5),
+            "a newly-created entry is not stale — there is no older reading to \
+             misrepresent"
+        );
+    }
+
+    /// OFS-m: an entry nothing refreshes is evicted, and one something DOES
+    /// refresh survives.
+    ///
+    /// The second half is the load-bearing one. `HwmonPwmController::set_pwm`
+    /// refreshes this map on every engine write, so an eviction rule that keyed on
+    /// poll failures alone would drop a fan that is being actively commanded and
+    /// re-insert it on the next write — flapping it in and out of `/fans` at 1 Hz
+    /// under a running profile.
+    #[test]
+    fn a_frozen_hwmon_fan_is_evicted_and_a_refreshed_one_is_not() {
+        let cache = StateCache::new();
+        let stale = std::time::Duration::from_secs(60);
+        cache.update_hwmon_fans(vec![
+            HwmonFanState {
+                id: "it8696:pwm1".into(),
+                rpm: Some(800),
+                last_commanded_pwm: Some(40),
+                pwm_readback_pct: None,
+                pwm_commanded_pct: None,
+                updated_at: Instant::now() - stale,
+                alarm: None,
+                pwm_enable_mode: None,
+            },
+            HwmonFanState {
+                id: "it8696:pwm2".into(),
+                rpm: Some(900),
+                last_commanded_pwm: Some(50),
+                pwm_readback_pct: None,
+                pwm_commanded_pct: None,
+                updated_at: Instant::now(),
+                alarm: None,
+                pwm_enable_mode: None,
+            },
+        ]);
+
+        cache.retain_fresh_hwmon_fans(std::time::Duration::from_secs(5));
+
+        let fans = cache.snapshot().hwmon_fans;
+        assert!(
+            !fans.contains_key("it8696:pwm1"),
+            "a header nothing has refreshed for 60s must not keep being published \
+             with an age_ms that climbs forever"
+        );
+        assert!(
+            fans.contains_key("it8696:pwm2"),
+            "a header something IS refreshing must survive — this is the write-path \
+             case a poll-failure streak would have flapped"
+        );
+    }
+
+    /// OFS-m: the steady-state tick evicts nothing and must not take the write
+    /// lock to discover that — the same fast-path contract as `retain_sensors`.
+    /// DEC-316 regression. The poll is the only sampler of `alarm` and
+    /// `pwm_enable_mode`; `set_pwm` rebuilds the whole `HwmonFanState` on every
+    /// engine tick with both `None`, including on its coalesce fast path. With
+    /// a wholesale `insert` that erased the poll's answer at ~1 Hz, so
+    /// `fan_alarm` was absent for exactly the headers under active control —
+    /// the ones whose failing fan matters most. It made the field decoration.
+    ///
+    /// Asserts the MERGE, not merely that a value survives one write: the
+    /// second update also carries a genuinely newer `rpm`, so a fix that simply
+    /// dropped the later entry would fail here too.
+    #[test]
+    fn an_engine_write_does_not_erase_the_polls_alarm_or_enable_mode() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1200),
+            last_commanded_pwm: Some(40),
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            alarm: Some(true),
+            pwm_enable_mode: Some(1),
+            updated_at: now,
+        }]);
+
+        // What `HwmonPwmController::set_pwm` publishes on every tick.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1350),
+            last_commanded_pwm: Some(45),
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        let fans = cache.snapshot().hwmon_fans;
+        let fan = &fans["hwmon:it8696:isa-0a40:pwm5:PUMP"];
+        assert_eq!(
+            fan.alarm,
+            Some(true),
+            "the poll's alarm must survive an engine write"
+        );
+        assert_eq!(fan.pwm_enable_mode, Some(1), "so must the live enable mode");
+        // The engine's own fields still win — this is a merge, not a skip.
+        assert_eq!(fan.rpm, Some(1350));
+        assert_eq!(fan.last_commanded_pwm, Some(45));
+    }
+
+    /// AIO-MB Phase 5: the same merge, for the readback.
+    ///
+    /// Its own test rather than a third assertion on the one above, because the
+    /// two fields fail differently: alarm and enable-mode are absent from the
+    /// write path because it cannot cheaply re-read them, while
+    /// `pwm_readback_pct` is absent because the write path has no readback to
+    /// report — it knows what it COMMANDED. Losing the merge would make the
+    /// readback permanently absent for exactly the headers under active control,
+    /// which are the only ones a validation session records.
+    #[test]
+    fn an_engine_write_does_not_erase_the_polls_pwm_readback() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        // The poll: readback and command happen to agree here, as they do
+        // whenever writes are landing.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1200),
+            last_commanded_pwm: Some(40),
+            pwm_readback_pct: Some(40),
+            pwm_commanded_pct: None,
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        // The engine commands 45%. It has no readback to publish, so it sends
+        // `None` — which must NOT erase the poll's answer.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1350),
+            last_commanded_pwm: Some(45),
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        let fans = cache.snapshot().hwmon_fans;
+        let fan = &fans["hwmon:it8696:isa-0a40:pwm5:PUMP"];
+        assert_eq!(
+            fan.pwm_readback_pct,
+            Some(40),
+            "the poll's readback must survive an engine write"
+        );
+        // The engine's own fields still win — a merge, not a skip.
+        assert_eq!(fan.last_commanded_pwm, Some(45));
+        assert_eq!(fan.rpm, Some(1350));
+    }
+
+    /// And the other direction: a later poll reporting a genuinely CHANGED
+    /// readback must be able to move it. A merge that carried the old value
+    /// forward unconditionally would freeze the readback at its first sample.
+    #[test]
+    fn a_later_poll_updates_the_pwm_readback() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        for pct in [40u8, 55] {
+            cache.update_hwmon_fans(vec![HwmonFanState {
+                id: "h1".into(),
+                rpm: Some(1000),
+                last_commanded_pwm: Some(pct),
+                pwm_readback_pct: Some(pct),
+                pwm_commanded_pct: None,
+                alarm: None,
+                pwm_enable_mode: None,
+                updated_at: now,
+            }]);
+        }
+        assert_eq!(cache.snapshot().hwmon_fans["h1"].pwm_readback_pct, Some(55));
+    }
+
+    /// AIO-MB Phase 6: the mirror image, and the one that actually bites.
+    ///
+    /// `pwm_commanded_pct` has exactly one producer — the write path — so it is
+    /// the POLL that threatens it, and the poll runs at 1 Hz forever. Without
+    /// the carry-forward the command would be blanked within a second of every
+    /// engine write, leaving the Hardware page unable to show requested and
+    /// readback as separate numbers for precisely the headers under control.
+    #[test]
+    fn a_poll_does_not_erase_the_engines_pwm_command() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        // The engine commands 45%. It has no readback to publish.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1350),
+            last_commanded_pwm: Some(45),
+            pwm_readback_pct: None,
+            pwm_commanded_pct: Some(45),
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        // The poll then reports a readback that DISAGREES — the device-override
+        // and BIOS-reclaim signature the split exists to make visible. The poll
+        // knows nothing about the command, so it sends `None`.
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "hwmon:it8696:isa-0a40:pwm5:PUMP".into(),
+            rpm: Some(1350),
+            last_commanded_pwm: Some(30),
+            pwm_readback_pct: Some(30),
+            pwm_commanded_pct: None,
+            alarm: None,
+            pwm_enable_mode: None,
+            updated_at: now,
+        }]);
+
+        let fans = cache.snapshot().hwmon_fans;
+        let fan = &fans["hwmon:it8696:isa-0a40:pwm5:PUMP"];
+        assert_eq!(
+            fan.pwm_commanded_pct,
+            Some(45),
+            "the engine's command must survive a poll refresh"
+        );
+        assert_eq!(
+            fan.pwm_readback_pct,
+            Some(30),
+            "and the poll's disagreeing readback must still land"
+        );
+        // The two axes are now genuinely independent, which is the whole point.
+        assert_ne!(fan.pwm_commanded_pct, fan.pwm_readback_pct);
+    }
+
+    /// And the other direction, so the carry-forward cannot freeze the command
+    /// at its first value — the same trap `a_later_poll_updates_the_pwm_readback`
+    /// guards for the readback.
+    #[test]
+    fn a_later_write_updates_the_pwm_command() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        for pct in [40u8, 65] {
+            cache.update_hwmon_fans(vec![HwmonFanState {
+                id: "h1".into(),
+                rpm: Some(1000),
+                last_commanded_pwm: Some(pct),
+                pwm_readback_pct: None,
+                pwm_commanded_pct: Some(pct),
+                alarm: None,
+                pwm_enable_mode: None,
+                updated_at: now,
+            }]);
+        }
+        assert_eq!(
+            cache.snapshot().hwmon_fans["h1"].pwm_commanded_pct,
+            Some(65)
+        );
+    }
+
+    /// The other direction: a later poll that genuinely reads a CLEARED alarm
+    /// must be able to clear it. A merge that carried `Some(true)` forward
+    /// unconditionally would latch a fan fault on for the process lifetime.
+    #[test]
+    fn a_later_poll_can_still_clear_an_alarm() {
+        let cache = StateCache::new();
+        let now = Instant::now();
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "h".into(),
+            rpm: Some(0),
+            last_commanded_pwm: Some(40),
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            alarm: Some(true),
+            pwm_enable_mode: Some(1),
+            updated_at: now,
+        }]);
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "h".into(),
+            rpm: Some(900),
+            last_commanded_pwm: Some(40),
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            alarm: Some(false),
+            pwm_enable_mode: Some(2),
+            updated_at: now,
+        }]);
+        let fans = cache.snapshot().hwmon_fans;
+        assert_eq!(fans["h"].alarm, Some(false));
+        assert_eq!(fans["h"].pwm_enable_mode, Some(2));
+    }
+
+    #[test]
+    fn retain_fresh_hwmon_fans_is_a_no_op_when_everything_is_fresh() {
+        let cache = StateCache::new();
+        cache.update_hwmon_fans(vec![HwmonFanState {
+            id: "it8696:pwm1".into(),
+            rpm: Some(800),
+            last_commanded_pwm: Some(40),
+            pwm_readback_pct: None,
+            pwm_commanded_pct: None,
+            updated_at: Instant::now(),
+            alarm: None,
+            pwm_enable_mode: None,
+        }]);
+        cache.retain_fresh_hwmon_fans(std::time::Duration::from_secs(5));
+        assert_eq!(cache.snapshot().hwmon_fans.len(), 1);
+    }
+
+    #[test]
+    fn update_aio() {
+        let cache = StateCache::new();
+        cache.update_aio(AioPumpState {
+            detected: true,
+            pump_rpm: Some(2400),
+            coolant_temp_c: Some(32.5),
+            ..Default::default()
+        });
+
+        let snap = cache.snapshot();
+        assert!(snap.aio.detected);
+        assert_eq!(snap.aio.pump_rpm, Some(2400));
+        assert!(snap.subsystem_timestamps.aio.is_some());
+    }
+
+    #[test]
+    fn set_gpu_fan_creates_entry_if_missing() {
+        let cache = StateCache::new();
+
+        // No GPU fans in cache initially
+        let snap = cache.snapshot();
+        assert!(snap.gpu_fans.is_empty());
+
+        // set_gpu_fan_commanded_pct should create the entry
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:2d:00.0", 75);
+
+        let snap = cache.snapshot();
+        assert_eq!(snap.gpu_fans.len(), 1);
+        let fan = &snap.gpu_fans["amd_gpu:0000:2d:00.0"];
+        assert_eq!(fan.id, "amd_gpu:0000:2d:00.0");
+        assert_eq!(fan.last_commanded_pct, Some(75));
+        assert_eq!(fan.rpm, None);
+    }
+
+    #[test]
+    fn set_gpu_fan_updates_existing_entry() {
+        let cache = StateCache::new();
+
+        // Pre-populate via update_gpu_fans
+        cache.update_gpu_fans(vec![crate::health::state::AmdGpuFanState {
+            id: "amd_gpu:0000:2d:00.0".into(),
+            rpm: Some(1800),
+            last_commanded_pct: Some(50),
+            duty_pct: None,
+            updated_at: Instant::now(),
+        }]);
+
+        // Update commanded pct
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:2d:00.0", 90);
+
+        let snap = cache.snapshot();
+        let fan = &snap.gpu_fans["amd_gpu:0000:2d:00.0"];
+        assert_eq!(fan.last_commanded_pct, Some(90));
+        // RPM should be preserved
+        assert_eq!(fan.rpm, Some(1800));
+    }
+
+    #[test]
+    fn snapshot_is_consistent_clone() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(0, 1200)]);
+
+        let snap1 = cache.snapshot();
+
+        // Mutate cache after snapshot
+        cache.update_openfan_fans(vec![make_openfan(0, 9999)]);
+
+        // snap1 should still show old value
+        assert_eq!(snap1.openfan_fans[&0].rpm, 1200);
+
+        // New snapshot shows new value
+        let snap2 = cache.snapshot();
+        assert_eq!(snap2.openfan_fans[&0].rpm, 9999);
+    }
+
+    #[test]
+    fn verify_active_lifecycle_deadman_and_single_flight() {
+        use std::time::Duration;
+        let cache = StateCache::new();
+        // Fresh cache: no verify in progress.
+        assert!(!cache.verify_active());
+        // Claiming the slot → active.
+        let e1 = cache
+            .try_begin_verify(Duration::from_secs(60))
+            .expect("free slot must be claimable");
+        assert!(cache.verify_active());
+        // Single-flight: a second concurrent claim is rejected.
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(60)).is_none(),
+            "a second concurrent verify must be rejected (single-flight)"
+        );
+        // end_verify releases the slot; it can be claimed again.
+        cache.end_verify(e1);
+        assert!(!cache.verify_active());
+        let e2 = cache
+            .try_begin_verify(Duration::from_secs(60))
+            .expect("released slot must be re-claimable");
+        cache.end_verify(e2);
+        // Deadman: even with the flag still set, an elapsed deadline reads
+        // inactive, so a leaked guard can never strand the engine paused.
+        {
+            let mut state = cache.inner.write();
+            state.verify_in_progress = true;
+            state.verify_active_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+        }
+        assert!(
+            !cache.verify_active(),
+            "an expired verify deadman must read inactive even with the flag set"
+        );
+        // DEC-296: the half this test did NOT cover, which is why the defect
+        // survived it. The assertion above is the ENGINE half — the pause reads
+        // inactive. The SLOT half was never checked, and nothing cleared
+        // `verify_in_progress`, so with the state left exactly as above every
+        // later verify and calibration was rejected for the process lifetime.
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(60)).is_some(),
+            "an expired deadman must free the SLOT too, not only the pause"
+        );
+    }
+
+    /// DEC-296: the deadman frees the slot, using an already-elapsed window so
+    /// the test is deterministic rather than sleeping.
+    #[test]
+    fn an_expired_verify_deadman_frees_the_slot_for_the_next_claimant() {
+        use std::time::Duration;
+        let cache = StateCache::new();
+        let _stranded = cache
+            .try_begin_verify(Duration::ZERO)
+            .expect("first claim must succeed");
+        // A zero window is already elapsed, so the claim is no longer genuinely
+        // held even though `verify_in_progress` is still set.
+        assert!(!cache.verify_active());
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(60)).is_some(),
+            "the next verify must be able to claim the slot once the deadman expired"
+        );
+        assert!(cache.verify_active(), "the new claim must pause the engine");
+    }
+
+    /// DEC-296 remediation: the deadman measures LIVENESS, not total duration.
+    ///
+    /// Found by review: "an expired window is free" alone supersedes a claimant
+    /// that is merely SLOW, not dead. The hwmon verify's post-settle `read_state`
+    /// is plain `fs::read_to_string` on sysfs with no lock held, so it can outlast
+    /// the 30 s window; the successor then force-takes the hwmon lease and the
+    /// original's restore fails, parking the header at the test duty. Renewing at
+    /// a checkpoint keeps a live claimant's slot; a wedged one never reaches the
+    /// checkpoint and is still correctly superseded.
+    #[test]
+    fn renewing_keeps_a_slow_but_live_claim_and_a_stale_renew_is_refused() {
+        use std::time::Duration;
+        let cache = StateCache::new();
+        let slow = cache
+            .try_begin_verify(Duration::ZERO)
+            .expect("first claim must succeed");
+        // Elapsed by construction — without a renew, the slot is stealable.
+        assert!(!cache.verify_active());
+        assert!(
+            cache.renew_verify(slow, Duration::from_secs(60)),
+            "the owner must be able to prove it is alive and keep its slot"
+        );
+        assert!(cache.verify_active(), "renewing must re-arm the pause");
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(60)).is_none(),
+            "a renewed claim must NOT be stealable — this is the whole point"
+        );
+
+        // A superseded claimant's renew is refused, so it can report the
+        // supersession instead of attempting a write whose lease is already gone.
+        let cache2 = StateCache::new();
+        let stranded = cache2
+            .try_begin_verify(Duration::ZERO)
+            .expect("first claim");
+        let _live = cache2
+            .try_begin_verify(Duration::from_secs(60))
+            .expect("expired slot is claimable");
+        assert!(
+            !cache2.renew_verify(stranded, Duration::from_secs(60)),
+            "a superseded claimant must not be able to re-arm the slot it lost"
+        );
+    }
+
+    /// DEC-296, and the reason the claim returns a token rather than a bool.
+    ///
+    /// The fix recorded in the register — "treat an expired deadline as free" —
+    /// is not sufficient on its own, and this test is what distinguishes the two.
+    /// A stranded claimant can still be ALIVE: DEC-290 moved the guard inside a
+    /// `spawn_blocking` task, so a wedged sysfs write holds it indefinitely. When
+    /// it finally returns, its `Drop` must not release the successor's pause —
+    /// otherwise the engine resumes writing over the successor's test duty and
+    /// that verify's verdict is silently false. That is the DEC-278
+    /// "fix to the fix" shape.
+    #[test]
+    fn a_stranded_verify_returning_late_cannot_release_its_successors_pause() {
+        use std::time::Duration;
+        let cache = StateCache::new();
+        // A claims and its deadman expires immediately.
+        let stranded = cache
+            .try_begin_verify(Duration::ZERO)
+            .expect("first claim must succeed");
+        // B claims the freed slot and holds a real window.
+        let live = cache
+            .try_begin_verify(Duration::from_secs(60))
+            .expect("expired slot must be claimable");
+        assert_ne!(stranded, live, "each claim must get a distinct epoch");
+        assert!(cache.verify_active());
+
+        // A finally returns and drops. It no longer owns the slot.
+        cache.end_verify(stranded);
+
+        assert!(
+            cache.verify_active(),
+            "a stale release must NOT clear the live claimant's pause — the engine \
+             would resume writing over its test duty and its verdict would be false"
+        );
+        // B's own release still works.
+        cache.end_verify(live);
+        assert!(!cache.verify_active());
+    }
+
+    #[test]
+    fn sensors_snapshot_returns_sensor_map() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![
+            make_sensor("hwmon:k10temp:0000:00:18.3:Tctl", 55.0),
+            make_sensor("hwmon:nct6799:isa:fan", 30.0),
+        ]);
+        let sensors = cache.sensors_snapshot();
+        assert_eq!(sensors.len(), 2);
+        assert_eq!(sensors.len(), cache.snapshot().sensors.len());
+        assert!((sensors["hwmon:k10temp:0000:00:18.3:Tctl"].value_c - 55.0).abs() < f64::EPSILON);
+    }
+
+    /// [SAFETY] DEC-272 (register row 01-c). `update_sensors` only inserts, so
+    /// without this a vanished sensor's reading lived in the map for the life of
+    /// the process, ageing into `Stale` and never reaching `Absent`.
+    #[test]
+    fn retain_sensors_evicts_only_what_is_no_longer_live() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![
+            make_sensor("hwmon:k10temp:nodev:Tctl", 55.0),
+            make_sensor("hwmon:nvme:nodev:Composite", 38.0),
+        ]);
+
+        let live: HashSet<String> = ["hwmon:k10temp:nodev:Tctl".to_string()]
+            .into_iter()
+            .collect();
+        cache.retain_sensors(&live);
+
+        let sensors = cache.sensors_snapshot();
+        assert_eq!(sensors.len(), 1, "the vanished sensor must be evicted");
+        assert!(
+            sensors.contains_key("hwmon:k10temp:nodev:Tctl"),
+            "the live sensor must survive"
+        );
+    }
+
+    /// The steady-state tick evicts nothing; that path must not mutate the map,
+    /// and in particular must not clear it when everything is live.
+    #[test]
+    fn retain_sensors_is_a_no_op_when_every_sensor_is_live() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![
+            make_sensor("hwmon:k10temp:nodev:Tctl", 55.0),
+            make_sensor("nvidia_gpu:0000:03:00.0:temp", 61.0),
+        ]);
+
+        let live: HashSet<String> = cache.sensors_snapshot().keys().cloned().collect();
+        cache.retain_sensors(&live);
+
+        assert_eq!(cache.sensors_snapshot().len(), 2);
+    }
+
+    /// An empty live set means "nothing is live", not "skip the sweep". A poll
+    /// tick that discovered nothing must not leave a full map of readings that
+    /// can no longer change.
+    #[test]
+    fn retain_sensors_with_an_empty_live_set_clears_the_map() {
+        let cache = StateCache::new();
+        cache.update_sensors(vec![make_sensor("hwmon:k10temp:nodev:Tctl", 55.0)]);
+        cache.retain_sensors(&HashSet::new());
+        assert!(cache.sensors_snapshot().is_empty());
+    }
+
+    #[test]
+    fn gpu_fans_snapshot_returns_gpu_fan_map() {
+        let cache = StateCache::new();
+        assert!(cache.gpu_fans_snapshot().is_empty());
+        cache.set_gpu_fan_commanded_pct("amd_gpu:0000:2d:00.0", 75);
+        let gpu_fans = cache.gpu_fans_snapshot();
+        assert_eq!(gpu_fans.len(), 1);
+        assert_eq!(
+            gpu_fans["amd_gpu:0000:2d:00.0"].last_commanded_pct,
+            Some(75)
+        );
+    }
+
+    #[test]
+    fn update_unavailable_sensors_evicts_stale_reading_and_recovers() {
+        // DEC-193: a sensor that was readable then goes unreadable must be
+        // evicted from `sensors` (no stale value served) and listed as
+        // unavailable; recovery clears the list and lets it re-enter `sensors`.
+        let cache = StateCache::new();
+        cache.update_sensors(vec![make_sensor("hwmon:ath12k_hwmon:phy0:temp1", 48.0)]);
+        assert!(cache
+            .snapshot()
+            .sensors
+            .contains_key("hwmon:ath12k_hwmon:phy0:temp1"));
+
+        cache.update_unavailable_sensors(vec![UnavailableSensor {
+            id: "hwmon:ath12k_hwmon:phy0:temp1".into(),
+            label: "temp1".into(),
+            reason: "read error: Network is down (os error 100)".into(),
+            since: Instant::now(),
+        }]);
+
+        let snap = cache.snapshot();
+        assert!(
+            !snap.sensors.contains_key("hwmon:ath12k_hwmon:phy0:temp1"),
+            "stale reading must be evicted while unavailable"
+        );
+        assert_eq!(snap.unavailable_sensors.len(), 1);
+        assert_eq!(snap.unavailable_sensors[0].label, "temp1");
+
+        // Recovery: an empty unavailable set clears the list; a fresh reading
+        // re-enters `sensors`.
+        cache.update_unavailable_sensors(vec![]);
+        cache.update_sensors(vec![make_sensor("hwmon:ath12k_hwmon:phy0:temp1", 50.0)]);
+        let snap = cache.snapshot();
+        assert!(snap.unavailable_sensors.is_empty());
+        assert!(snap.sensors.contains_key("hwmon:ath12k_hwmon:phy0:temp1"));
+    }
+
+    #[test]
+    fn update_unavailable_sensors_empty_is_noop_fast_path() {
+        // The poll loop calls this every tick; with nothing unavailable it must
+        // not disturb existing sensor state.
+        let cache = StateCache::new();
+        cache.update_sensors(vec![make_sensor("hwmon:k10temp:nodev:Tctl", 55.0)]);
+        cache.update_unavailable_sensors(vec![]);
+        let snap = cache.snapshot();
+        assert!(snap.unavailable_sensors.is_empty());
+        assert!(snap.sensors.contains_key("hwmon:k10temp:nodev:Tctl"));
+    }
+
+    #[test]
+    fn take_resume_flag_swaps_and_clears() {
+        // pwm_control calls take_resume_flag() once per set_pwm; it must return
+        // true exactly once after a resume is signalled, then false until the
+        // next resume. Locks the swap-and-clear semantics.
+        let cache = StateCache::new();
+        assert!(!cache.take_resume_flag(), "fresh cache: no resume pending");
+        cache.set_resume_detected();
+        assert!(cache.take_resume_flag(), "first take after resume is true");
+        assert!(!cache.take_resume_flag(), "flag cleared after take");
+    }
+
+    /// `TS-ad`: a duty written against a generation an invalidation has since
+    /// moved past is never published. The plain arm first — a stale generation
+    /// publishes nothing, the current one does (the opposite arm, so a setter
+    /// stuck at "never" fails too).
+    #[test]
+    fn a_duty_set_against_a_stale_generation_is_not_published() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(4, 900)]);
+        let stale = cache.openfan_write_generation();
+        cache.invalidate_openfan_writes();
+
+        assert!(!cache.set_openfan_commanded_pwm(4, 60, stale));
+        assert_eq!(cache.snapshot().openfan_fans[&4].last_commanded_pwm, None);
+
+        let current = cache.openfan_write_generation();
+        assert!(cache.set_openfan_commanded_pwm(4, 60, current));
+        assert_eq!(
+            cache.snapshot().openfan_fans[&4].last_commanded_pwm,
+            Some(60)
+        );
+    }
+
+    /// `TS-ad`, the INTERLEAVING the plain arm above cannot see: the generation
+    /// must be compared under the write guard. This holds the guard, lets a
+    /// writer start, then does the invalidation's first step (the counter moves
+    /// before the guard is taken, as `invalidate_openfan_writes` does) and
+    /// releases. A setter that compares under the guard sees the bump whatever
+    /// the timing. One that compares BEFORE taking the guard — the first shape of
+    /// this fix — read the old generation while it waited, and republished the
+    /// duty the invalidation had just cleared. The sleep only gives that shape
+    /// the chance to show itself; the correct shape passes without it.
+    #[test]
+    fn the_generation_is_compared_under_the_guard() {
+        let cache = Arc::new(StateCache::new());
+        cache.update_openfan_fans(vec![make_openfan(4, 900)]);
+        let observed = cache.openfan_write_generation();
+
+        let guard = cache.inner.write();
+        let writer = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || cache.set_openfan_commanded_pwm(4, 60, observed))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        cache
+            .openfan_write_generation
+            .fetch_add(1, Ordering::SeqCst);
+        drop(guard);
+
+        assert!(
+            !writer.join().expect("the writer thread did not panic"),
+            "a write issued before the invalidation published after it"
+        );
+        assert_eq!(cache.snapshot().openfan_fans[&4].last_commanded_pwm, None);
+    }
+
+    /// OFS-i. `build_fan_entries` publishes `OpenFanState.updated_at` as the
+    /// fan's telemetry `age_ms`, and `set_openfan_commanded_pwm` used to refresh
+    /// it — so a *command* made a *reading* look fresh. The rpm stayed frozen at
+    /// whatever the last real poll saw, and `stall_detected` was then computed
+    /// from that frozen value.
+    ///
+    /// **The discriminator is exact `Instant` equality, deliberately.** The first
+    /// draft asserted a published `age_ms >= 4000` against a synthetic `now`, and
+    /// the defect reproduced it at 3999 — a one-millisecond margin that is really
+    /// just the gap between two `Instant::now()` calls, so on a slower machine it
+    /// would have passed WITH the bug present. `before == after` cannot drift:
+    /// either the command moved the timestamp or it did not.
+    #[test]
+    fn a_pwm_command_does_not_make_a_stale_rpm_reading_look_fresh() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(3, 1200)]);
+        let before = cache.snapshot().openfan_fans[&3].updated_at;
+
+        // The link stops answering RPM polls, but writes still ack — a ~10-byte
+        // SetPwm completes on a degraded link where an ~80-byte ReadAllRpm does
+        // not, which is why this is the reachable shape rather than a contrived one.
+        assert!(cache.set_openfan_commanded_pwm(3, 200, cache.openfan_write_generation()));
+
+        let snap = cache.snapshot();
+        let after = snap.openfan_fans[&3].updated_at;
+        assert_eq!(
+            before, after,
+            "a command must not move the timestamp of a reading it did not take"
+        );
+
+        // The command must still have landed — otherwise this test would also
+        // pass against a `set_openfan_commanded_pwm` that did nothing at all.
+        let fans = crate::api::handlers::build_fan_entries(&snap, after);
+        let fan = fans
+            .iter()
+            .find(|f| f.id == "openfan:ch03")
+            .expect("channel 3 is cached");
+        assert_eq!(fan.last_commanded_pwm, Some(200));
+        assert_eq!(
+            fan.rpm,
+            Some(1200),
+            "the reading is unchanged — nothing new was measured"
+        );
+
+        // And the published age is sourced from that reading time, so once the
+        // poll stops the fan ages honestly instead of being held at zero.
+        let later = crate::api::handlers::build_fan_entries(
+            &snap,
+            before + std::time::Duration::from_millis(4000),
+        );
+        assert_eq!(
+            later
+                .iter()
+                .find(|f| f.id == "openfan:ch03")
+                .expect("channel 3 is cached")
+                .age_ms,
+            4000
+        );
+    }
+
+    /// OFS-b's detection half. The stamp stays unconditional on purpose (it
+    /// answers liveness, which a short frame does not falsify) — what the poll
+    /// loop needs is the *count*, so an incomplete frame can be logged at all.
+    #[test]
+    fn update_openfan_fans_reports_how_many_known_channels_a_frame_missed() {
+        let cache = StateCache::new();
+        let all: Vec<OpenFanState> = (0..10u8).map(|ch| make_openfan(ch, 900)).collect();
+        assert_eq!(
+            cache.update_openfan_fans(all),
+            0,
+            "the first full frame covers everything it knows about"
+        );
+
+        let short: Vec<OpenFanState> = (0..3u8).map(|ch| make_openfan(ch, 900)).collect();
+        assert_eq!(
+            cache.update_openfan_fans(short),
+            7,
+            "three of ten leaves seven known channels unrefreshed"
+        );
+
+        // A frame introducing a channel the cache has never seen is not a miss.
+        let cache2 = StateCache::new();
+        assert_eq!(cache2.update_openfan_fans(vec![make_openfan(0, 900)]), 0);
+    }
+
+    /// F6. A channel that only ever got WRITTEN — `force_all_with_floor` walks
+    /// `0..NUM_CHANNELS` unconditionally, so a thermal emergency mints one for every
+    /// channel the firmware does not report — must not count as uncovered.
+    ///
+    /// It can never be covered by a later frame, so counting it would latch the
+    /// short-frame warning on for the process lifetime and suppress the recovery
+    /// line forever, on exactly the hardware this change is for.
+    #[test]
+    fn a_write_created_channel_is_not_counted_as_a_missed_reading() {
+        let cache = StateCache::new();
+        cache.update_openfan_fans(vec![make_openfan(0, 900), make_openfan(1, 900)]);
+        // The thermal force writes a channel the controller never reports.
+        assert!(cache.set_openfan_commanded_pwm(9, 255, cache.openfan_write_generation()));
+        assert!(!cache.snapshot().openfan_fans[&9].rpm_polled);
+
+        assert_eq!(
+            cache.update_openfan_fans(vec![make_openfan(0, 900), make_openfan(1, 900)]),
+            0,
+            "a full frame must report zero missed even with a write-only channel cached"
+        );
+
+        // Control: a genuinely polled channel that the frame drops still counts.
+        assert_eq!(
+            cache.update_openfan_fans(vec![make_openfan(0, 900)]),
+            1,
+            "channel 1 was measured before and is missing now"
+        );
+    }
+
+    // ── DEC-481: a firmware update and the diagnostic slot ───────────
+
+    fn connected() -> StateCache {
+        let cache = StateCache::new();
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+    }
+
+    #[test]
+    fn an_update_refuses_every_diagnostic_and_a_diagnostic_refuses_an_update() {
+        let cache = connected();
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .expect("free");
+        assert!(
+            cache.try_begin_verify(Duration::from_secs(30)).is_none(),
+            "update first: the diagnostic is refused"
+        );
+        cache.end_openfan_maintenance("r1", None);
+
+        let epoch = cache
+            .try_begin_verify(Duration::from_secs(30))
+            .expect("free again");
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r2", "preparing"),
+            Err(MaintenanceRefusal::DiagnosticActive),
+            "diagnostic first: the update is refused"
+        );
+        cache.end_verify(epoch);
+        assert!(cache
+            .try_begin_openfan_maintenance("r2", "preparing")
+            .is_ok());
+    }
+
+    #[test]
+    fn an_update_refuses_a_diagnostic_claim_that_lapsed_but_was_never_released() {
+        // DEC-296: a diagnostic may steal such a claim; an update must not —
+        // the holder may still be driving hardware.
+        let cache = connected();
+        let _epoch = cache.try_begin_verify(Duration::ZERO).expect("free");
+        assert!(
+            !cache.verify_active(),
+            "precondition: its deadman has lapsed"
+        );
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r1", "preparing"),
+            Err(MaintenanceRefusal::DiagnosticActive)
+        );
+    }
+
+    #[test]
+    fn an_update_needs_a_connected_link_no_emergency_and_no_other_update() {
+        let cache = StateCache::new();
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r1", "preparing"),
+            Err(MaintenanceRefusal::LinkNotReady(None))
+        );
+        cache.set_openfan_link(OpenFanLink::Unresponsive);
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r1", "preparing"),
+            Err(MaintenanceRefusal::LinkNotReady(Some(
+                OpenFanLink::Unresponsive
+            )))
+        );
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache.record_engine_tick("emergency", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r1", "preparing"),
+            Err(MaintenanceRefusal::ThermalEmergency)
+        );
+        cache.record_engine_tick("normal", crate::constants::THERMAL_EMERGENCY_TRIGGER_C);
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r2", "preparing"),
+            Err(MaintenanceRefusal::MaintenanceActive)
+        );
+        assert_eq!(
+            cache.read_with(|st| st.openfan_link_wire()),
+            Some("maintenance")
+        );
+    }
+
+    #[test]
+    fn racing_an_update_against_a_diagnostic_never_lets_both_start() {
+        let cache = Arc::new(connected());
+        for _ in 0..200 {
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let (c, b) = (cache.clone(), barrier.clone());
+            let verify = std::thread::spawn(move || {
+                b.wait();
+                c.try_begin_verify(Duration::from_secs(30))
+            });
+            barrier.wait();
+            let update = cache
+                .try_begin_openfan_maintenance("r", "preparing")
+                .is_ok();
+            let epoch = verify.join().unwrap();
+            assert!(
+                !(update && epoch.is_some()),
+                "an update and a diagnostic both started"
+            );
+            assert!(update || epoch.is_some(), "one of them must win");
+            if update {
+                cache.end_openfan_maintenance("r", None);
+            }
+            if let Some(e) = epoch {
+                cache.end_verify(e);
+            }
+        }
+    }
+
+    #[test]
+    fn a_board_needing_recovery_is_cleared_only_by_the_link_answering() {
+        let cache = connected();
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        cache.end_openfan_maintenance("r1", Some("needs_recovery"));
+        assert!(cache.openfan_writes_suspended());
+        cache.set_openfan_link(OpenFanLink::Reconnecting);
+        cache.set_openfan_link(OpenFanLink::Unresponsive);
+        assert!(cache.openfan_writes_suspended(), "only `Connected` ends it");
+        cache.set_openfan_link(OpenFanLink::Connected);
+        assert!(!cache.openfan_writes_suspended());
+        assert!(cache.openfan_maintenance().is_none());
+        // Restored at boot, it never replaces a run.
+        cache
+            .try_begin_openfan_maintenance("r2", "preparing")
+            .unwrap();
+        cache.restore_openfan_recovery("r0", "needs_recovery");
+        assert!(cache.openfan_maintenance_running());
+    }
+
+    /// DEC-484: a controller answering on a node is not silent there — that
+    /// node's probe evidence goes, and another node's stays.
+    #[test]
+    fn a_controller_answering_on_a_node_drops_that_nodes_silent_evidence() {
+        use crate::serial::adoption::NodeId;
+        let cache = StateCache::new();
+        cache.record_openfan_unanswered("/dev/ttyACM0", NodeId { dev: 5, ino: 1 });
+        cache.record_openfan_unanswered("/dev/ttyACM1", NodeId { dev: 5, ino: 2 });
+        assert_eq!(cache.openfan_unanswered().len(), 2, "precondition");
+        cache.set_openfan_port("/dev/ttyACM0");
+        assert_eq!(
+            cache.openfan_unanswered(),
+            [("/dev/ttyACM1".to_string(), NodeId { dev: 5, ino: 2 })]
+        );
+    }
+
+    /// A run that panicked releases its claim before its loan, so it ends
+    /// needing recovery while the link still reads `connected`. A start then
+    /// would have replaced the recovery with a run of its own — and that run's
+    /// end, finding nothing wrong with itself, would have lifted the write
+    /// suspension and the critical health over a board still not answering.
+    #[test]
+    fn an_update_never_starts_over_a_board_left_needing_recovery() {
+        let cache = connected();
+        cache
+            .try_begin_openfan_maintenance("r1", "preparing")
+            .unwrap();
+        cache.end_openfan_maintenance("r1", Some("needs_recovery"));
+        assert_eq!(cache.openfan_link(), Some(OpenFanLink::Connected));
+        assert_eq!(
+            cache.try_begin_openfan_maintenance("r2", "preparing"),
+            Err(MaintenanceRefusal::RecoveryPending)
+        );
+        assert!(matches!(
+            cache.openfan_maintenance(),
+            Some(OpenFanMaintenance::NeedsRecovery { ref run_id, .. }) if run_id == "r1"
+        ));
+        // The poll loop's next good poll ends the recovery; a start is accepted.
+        cache.set_openfan_link(OpenFanLink::Connected);
+        cache
+            .try_begin_openfan_maintenance("r2", "preparing")
+            .unwrap();
+    }
+}

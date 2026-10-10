@@ -1,0 +1,79 @@
+# cargo-deny supply-chain policy for ventulusd (DEC-174).
+#
+# Primary purpose: an enforced LICENSE gate encoding DEC-043 (no LGPL — the
+# re-linking obligation is unacceptable for our statically-linked binary) and
+# DEC-155 (serialport's MPL-2.0 is accepted; see NOTICE.md). Everything not in
+# `allow` below is denied, so a future dependency that drags in a copyleft or
+# unknown license fails `cargo deny check` instead of shipping silently.
+#
+# Run at release time alongside `cargo audit` (the release-time
+# additions). Install with `cargo install cargo-deny --locked`.
+
+[advisories]
+# RustSec advisory DB (default source). Vulnerabilities fail by default; treat a
+# yanked crate as a hard failure too. Justified, specific waivers go in `ignore`.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Allow-list is the EXACT minimal set the current dependency tree resolves to
+# (verified against `cargo tree --format '{l}'`):
+#   MIT           — the bulk of the tree + our own crate
+#   Apache-2.0    — the OR-half of most dual licences + sync_wrapper (alone)
+#   BSD-3-Clause  — matchit is "MIT AND BSD-3-Clause" (needs BOTH)
+#   Unicode-3.0   — unicode-ident is "(MIT OR Apache-2.0) AND Unicode-3.0"
+#   MPL-2.0       — serialport (DEC-155, acknowledged in NOTICE.md)
+#   ISC           — libloading (DEC-204). ISC is an OSI/FSF-approved permissive
+#                   licence, functionally MIT-equivalent (a simplified 2-clause
+#                   BSD/MIT). Pulled in for runtime dlopen of libnvidia-ml.so.1
+#                   (opt-in, read-only NVIDIA telemetry). No copyleft obligation.
+#   Unlicense     — ksni (DEC-352), the StatusNotifierItem implementation behind
+#                   ventulus-tray. The Unlicense is a PUBLIC-DOMAIN DEDICATION,
+#                   i.e. the opposite of the re-linking obligation DEC-043 exists
+#                   to block: it imposes no condition of any kind, copyleft or
+#                   attribution. OSI-approved and FSF Free/Libre. Widening the
+#                   gate in this direction is a direction DEC-043 is indifferent
+#                   to, which is why it is allowed rather than waived per-crate.
+#                   ksni is the ONLY crate in the tree carrying it — verified by
+#                   reading the licence of all 38 crates the tray added; every
+#                   other one is MIT, Apache-2.0, or a dual of the two.
+# Notably ABSENT (therefore denied): every LGPL/GPL-only variant (DEC-043).
+# Scope: this gate governs the statically-linked Rust dependency tree ONLY. The
+# GUI's PySide6 (LGPL-3.0) is a separate, compliant concern — used via dynamic
+# import (LGPL §4's shared-library carve-out), not static linkage, so it never
+# falls under this Rust static-binary ban. Do not "fix" that non-violation.
+# unescaper declares the legacy "GPL-3.0/MIT" (the slash means OR); MIT
+# satisfies it, so NO GPL allowance is needed and the crate PASSES the gate.
+# cargo-deny still prints a cosmetic `parse-error` warning about the deprecated
+# `GPL-3.0` identifier in unescaper's own Cargo.toml — this is NOT a failure
+# (`cargo deny check licenses` exits 0). A `[[licenses.clarify]]` with a
+# `license-files` SHA-256 hash COULD override the string and suppress the warning,
+# but that hash must be recomputed on every unescaper bump — recurring maintenance
+# for an exit-0 cosmetic warning, not worth it. (`[[licenses.exceptions]]` can't —
+# it only adds allowed licences.) Accepted as benign noise until unescaper
+# modernises its SPDX identifier upstream (audit-2026-07-03 Cluster 7).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "ISC",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+
+# Our own unpublishable workspace crates are not subject to the license gate.
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicate semver-incompatible versions (e.g. bitflags 1.x + 2.x) are an
+# advisory smell, not a release blocker — warn, don't fail.
+multiple-versions = "warn"
+
+[sources]
+# Every dependency must come from a known registry / git source (crates.io for
+# us). An unknown source is a supply-chain red flag.
+unknown-registry = "deny"
+unknown-git = "deny"

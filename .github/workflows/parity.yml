@@ -1,0 +1,145 @@
+name: Parity oracle sync
+
+# The GUI demo-evaluator and the daemon control loop are pinned to a SHARED
+# golden files (parity_vectors.json DEC-126, role_classification.json DEC-162,
+# header_role_classification.json AUD3-c/DEC-322 — the classifier that decides
+# whether a client may offer to STOP a pump, wire_fields.json WIRE-aj/P8-cb — the
+# declared GUI<->daemon wire-field surface both sides pin against,
+# daemon_config_keys.json DEC-285/P8-cb — the declared GET /config key surface,
+# chip_name_canonical.json DEC-442 — the it87 v2.0 chip-suffix canonicaliser,
+# memory_sensor_ids.json DEC-492 — the memory-module id forms and re-key rule) —
+# one copy in each repo, required
+# byte-identical. Each repo's own tests validate against their OWN copy, so a
+# drift between the two copies is invisible to single-repo CI (the GUI's
+# byte-identity test skips when the daemon repo isn't checked out). This closes
+# that hole: whenever THIS repo's copy changes, check out the peer repo and
+# assert the two copies are byte-identical. Path-filtered, so unrelated PRs
+# never trigger it. ventulus is public, so the default token can read it.
+
+on:
+  pull_request:
+    paths:
+      - 'daemon/tests/fixtures/parity_vectors.json'
+      - 'daemon/tests/fixtures/role_classification.json'
+      - 'daemon/tests/fixtures/header_role_classification.json'
+      - 'daemon/tests/fixtures/wire_fields.json'
+      - 'daemon/tests/fixtures/daemon_config_keys.json'
+      - 'daemon/tests/fixtures/chip_name_canonical.json'
+      - 'daemon/tests/fixtures/memory_sensor_ids.json'
+  push:
+    branches: [main]
+    paths:
+      - 'daemon/tests/fixtures/parity_vectors.json'
+      - 'daemon/tests/fixtures/role_classification.json'
+      - 'daemon/tests/fixtures/header_role_classification.json'
+      - 'daemon/tests/fixtures/wire_fields.json'
+      - 'daemon/tests/fixtures/daemon_config_keys.json'
+      - 'daemon/tests/fixtures/chip_name_canonical.json'
+      - 'daemon/tests/fixtures/memory_sensor_ids.json'
+  # DEC-263: the triggers above are path-filtered to the fixtures, so a change to
+  # THIS FILE never exercises it — the guard could be broken for months and look
+  # fine. Dispatch makes it provable on demand; set wait_seconds=0 to skip the
+  # catch-up window and compare the two mains as they stand right now.
+  workflow_dispatch:
+    inputs:
+      wait_seconds:
+        description: 'Seconds to wait for the peer repo to catch up (0 = compare immediately)'
+        required: false
+        default: '900'
+
+permissions:
+  contents: read
+
+jobs:
+  byte-identical:
+    name: oracle fixtures byte-identical with GUI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Plan-B-Development/ventulus
+          path: _gui
+      - name: Compare oracle copies, waiting for the peer to catch up
+        env:
+          PEER: _gui
+          PEER_PREFIX: tests/fixtures
+          OURS_PREFIX: daemon/tests/fixtures
+          WAIT_SECONDS: ${{ github.event.inputs.wait_seconds || '900' }}
+          POLL_SECONDS: '30'
+        run: |
+          set -euo pipefail
+
+          # DEC-263: the peer is checked out at ITS main, which necessarily lags
+          # whenever a coordinated fixture change lands daemon-first — the very
+          # order the error message below mandates, which made THIS side of the
+          # pair fail by construction. At v2.17.0/v2.41.0 the daemon pushed 7
+          # minutes ahead of the GUI and this job failed on a pair of files that
+          # were already byte-identical. So the mismatch is only conclusive once
+          # the peer has had a chance to arrive: re-fetch and re-compare until the
+          # window closes, and only then call it drift. Success is immediate when
+          # the peer is already up to date; the wait is paid only on the path that
+          # used to be a false red.
+          FILES='parity_vectors.json role_classification.json header_role_classification.json wire_fields.json daemon_config_keys.json chip_name_canonical.json memory_sensor_ids.json'
+
+          dec_for() {
+            case "$1" in
+              parity_vectors.json) echo 'DEC-126' ;;
+              role_classification.json) echo 'DEC-162' ;;
+              header_role_classification.json) echo 'AUD3-c / DEC-322' ;;
+              wire_fields.json) echo 'WIRE-aj / P8-cb' ;;
+              daemon_config_keys.json) echo 'DEC-285 / P8-cb' ;;
+              chip_name_canonical.json) echo 'DEC-442' ;;
+              memory_sensor_ids.json) echo 'DEC-492' ;;
+            esac
+          }
+
+          compare() {
+            bad=''
+            for f in $FILES; do
+              if ! cmp -s "$OURS_PREFIX/$f" "$PEER/$PEER_PREFIX/$f"; then
+                bad="$bad $f"
+              fi
+            done
+            [ -z "$bad" ]
+          }
+
+          # DEC-266: `$(( ))` recursively evaluates a referenced variable's VALUE
+          # as an arithmetic expression, and an array subscript inside it runs
+          # command substitution — so an unvalidated `wait_seconds` dispatch input
+          # is a shell-injection primitive (`set -u` does not block it). Only a
+          # collaborator can supply the input and they could edit this file
+          # anyway, but the runner's git config holds the checkout AUTHORIZATION
+          # header for the peer fetch, so validate before use rather than rely on
+          # that. Non-numeric falls back to the default rather than failing the
+          # job: this guard is not the thing being tested.
+          case "$WAIT_SECONDS" in
+            ''|*[!0-9]*) echo "wait_seconds is not a plain integer — using 900"; WAIT_SECONDS=900 ;;
+          esac
+          # Force base 10. A leading zero is still all-digits, so it passes the
+          # guard above and then hits bash's octal rule inside `$(( ))`: `09`
+          # aborts the job with "value too great for base", and `010` silently
+          # means 8. Both would land on the one job whose purpose is proving this
+          # guard works.
+          WAIT_SECONDS=$((10#$WAIT_SECONDS))
+
+          deadline=$(( SECONDS + WAIT_SECONDS ))
+          attempt=0
+          while :; do
+            attempt=$(( attempt + 1 ))
+            if compare; then
+              echo "oracle copies are byte-identical (attempt $attempt)"
+              exit 0
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              for f in $bad; do
+                echo "::error::$f drifted between the daemon and GUI copies — they must be byte-identical ($(dec_for "$f")). Update both in lockstep (daemon-first)."
+              done
+              echo "Waited ${WAIT_SECONDS}s across $attempt attempts; the peer's main never matched."
+              exit 1
+            fi
+            echo "mismatch on:$bad — the peer may not have pushed yet; retrying in ${POLL_SECONDS}s ($(( deadline - SECONDS ))s of the window left)"
+            sleep "$POLL_SECONDS"
+            git -C "$PEER" fetch --depth=1 origin main
+            git -C "$PEER" checkout -q FETCH_HEAD
+          done

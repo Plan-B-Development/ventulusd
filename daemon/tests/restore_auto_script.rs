@@ -1,0 +1,589 @@
+//! `ventulus-restore-auto` — the `ExecStopPost` hand-back — run for real
+//! against a fake sysfs tree (DEC-382).
+//!
+//! The script restates `hwmon::handback`'s rules in shell, because systemd runs
+//! it after the daemon has gone. That is two copies of a safety rule, which is
+//! why this test drives the script itself rather than trusting that the copies
+//! agree: every hand-back kind the daemon can record, a header it never took,
+//! and the lines the script must refuse to act on.
+
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../packaging/ventulus-restore-auto.sh")
+}
+
+struct Tree {
+    _tmp: tempfile::TempDir,
+    sys: PathBuf,
+    run: PathBuf,
+    hwmon: PathBuf,
+}
+
+impl Tree {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("sys");
+        let run = tmp.path().join("run");
+        let hwmon = sys.join("class/hwmon/hwmon0");
+        std::fs::create_dir_all(&hwmon).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        Self {
+            _tmp: tmp,
+            sys,
+            run,
+            hwmon,
+        }
+    }
+
+    /// `pwmN` at 150 and `pwmN_enable` at 1 — a header the daemon has in manual.
+    fn header(&self, n: u8) -> (PathBuf, PathBuf) {
+        let pwm = self.hwmon.join(format!("pwm{n}"));
+        let enable = self.hwmon.join(format!("pwm{n}_enable"));
+        std::fs::write(&pwm, "150\n").unwrap();
+        std::fs::write(&enable, "1\n").unwrap();
+        (enable, pwm)
+    }
+
+    fn record(&self, lines: &[String]) {
+        let mut body = String::from("# ventulus hwmon hand-back record v1\n");
+        for l in lines {
+            body.push_str(l);
+            body.push('\n');
+        }
+        std::fs::write(self.run.join("hwmon-handback"), body).unwrap();
+    }
+
+    fn run_script(&self) -> std::process::Output {
+        self.run_script_after(None)
+    }
+
+    /// Run the script as systemd runs it after a main process that ended as
+    /// `(EXIT_CODE, EXIT_STATUS)` — `None` leaves both unset, as a run by hand
+    /// does. Never inherited from the test's own environment.
+    fn run_script_after(&self, ended: Option<(&str, &str)>) -> std::process::Output {
+        let mut cmd = Command::new("bash");
+        cmd.arg(script())
+            .env("RUNTIME_DIRECTORY", &self.run)
+            .env("VENTULUS_SYSFS_ROOT", &self.sys)
+            .env_remove("EXIT_CODE")
+            .env_remove("EXIT_STATUS");
+        if let Some((code, status)) = ended {
+            cmd.env("EXIT_CODE", code).env("EXIT_STATUS", status);
+        }
+        cmd.output()
+            .expect("bash must be available to run the ExecStopPost script")
+    }
+
+    /// Run the script with every read of `unreadable` refused, as sysfs refuses
+    /// a read-open of a `0200` attribute (`EACCES`) even to root. The script
+    /// reads through `cat`, so a `cat` earlier on `PATH` that fails for that one
+    /// path stands in for the kernel. A regular file with mode `0200` would not:
+    /// root can read it, and CI may run as root.
+    fn run_script_unable_to_read(&self, unreadable: &Path) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.run.with_file_name("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let shim = bin.join("cat");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/bash\n[ \"$1\" = '{}' ] && exit 1\nPATH='{path}' exec cat \"$@\"\n",
+                unreadable.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Command::new("bash")
+            .arg(script())
+            .env("RUNTIME_DIRECTORY", &self.run)
+            .env("VENTULUS_SYSFS_ROOT", &self.sys)
+            .env("PATH", format!("{}:{path}", bin.display()))
+            .output()
+            .expect("bash must be available to run the ExecStopPost script")
+    }
+}
+
+fn line(enable: &Path, pwm: &Path, kind: &str, value: &str) -> String {
+    format!("{}\t{}\t{kind}\t{value}", enable.display(), pwm.display())
+}
+
+fn read(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap().trim().to_string()
+}
+
+/// [SAFETY] DEC-382 (`TS-a`): each recorded header gets back exactly what it
+/// had, and nothing else is written. The script this replaced wrote `2` to every
+/// `pwm*_enable` on the machine — `h1` would read `2` here, and `h3`, which no
+/// record line names, would have been rewritten too.
+#[test]
+fn the_record_is_replayed_and_nothing_else_is_touched() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    let (en2, pwm2) = t.header(2);
+    let (en3, _) = t.header(3);
+    let (en4, pwm4) = t.header(4);
+    let (en5, pwm5) = t.header(5);
+    t.record(&[
+        line(&en1, &pwm1, "mode", "5"),
+        line(&en2, &pwm2, "manual", "77"),
+        line(&en4, &pwm4, "full", "-"),
+        line(&en5, &pwm5, "write-only", "2"),
+    ]);
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&en1), "5", "a recorded mode is written back");
+    assert_eq!(
+        (read(&en2), read(&pwm2)),
+        ("1".to_string(), "77".to_string()),
+        "a header found in manual gets its duty back"
+    );
+    assert_eq!(
+        read(&en4),
+        "0",
+        "an unrecorded mode gets fancontrol's full speed"
+    );
+    assert_eq!(
+        (read(&en5), read(&pwm5)),
+        ("2".to_string(), "150".to_string()),
+        "a write-only switch gets its recorded value, and its duty is not touched"
+    );
+    assert_eq!(
+        read(&en3),
+        "1",
+        "a header no record line names is not touched"
+    );
+}
+
+/// [SAFETY] DEC-398 (`TS-ab`): a `write-only` line is confirmed by the write
+/// alone. The switch here refuses every read, as `dell_smm`'s `0200`
+/// `pwm1_enable` does. Confirmed by reading it back instead, the refused read
+/// fails the confirmation, the fallback runs, and it leaves the switch at `1`
+/// and the duty at 255 — on `dell_smm` that `1` takes the fans back from the
+/// BIOS. The switch reading `2` afterwards is the presence half: a line the
+/// script skipped would also leave the duty alone.
+#[test]
+fn a_write_only_switch_is_confirmed_by_the_write_alone() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    t.record(&[line(&en1, &pwm1, "write-only", "2")]);
+
+    let out = t.run_script_unable_to_read(&en1);
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&en1), "2", "the switch was written");
+    assert_eq!(read(&pwm1), "150", "and no fallback took it back");
+    assert!(out.stderr.is_empty(), "{out:?}");
+}
+
+/// A write-only switch that refuses the write is not reported given back: the
+/// fallback runs, and where nothing at all can be written the script says so.
+#[test]
+fn a_write_only_switch_that_takes_no_write_is_reported() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    std::fs::remove_file(&en1).unwrap();
+    // A directory: it exists, and every write to it fails.
+    std::fs::create_dir(&en1).unwrap();
+    t.record(&[line(&en1, &pwm1, "write-only", "2")]);
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("could not give {} back", en1.display())),
+        "{stderr}"
+    );
+    assert_eq!(read(&pwm1), "150");
+}
+
+/// A line is checked before anything is written to the path it names — the
+/// record is root's, but the script is the last writer after a crash and must
+/// not be the thing that writes somewhere unexpected.
+#[test]
+fn a_line_naming_a_path_outside_sysfs_or_a_mismatched_pair_is_skipped() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    let (en2, _pwm2) = t.header(2);
+    let outside = t.run.join("pwm9_enable");
+    std::fs::write(&outside, "1\n").unwrap();
+    t.record(&[
+        // Outside the sysfs root.
+        line(&outside, &t.run.join("pwm9"), "mode", "5"),
+        // An enable file that does not belong to the pwm file named with it.
+        line(&en2, &pwm1, "mode", "5"),
+        // A kind the script does not know.
+        line(&en1, &pwm1, "rewrite", "5"),
+    ]);
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&outside), "1");
+    assert_eq!(read(&en2), "1");
+    assert_eq!(read(&en1), "1");
+}
+
+/// A record that asks for a value the driver will not keep falls back to full
+/// speed. A regular file keeps whatever it is given, so the "driver" here is a
+/// value outside the byte range, which the script treats as unrecorded.
+#[test]
+fn an_unusable_recorded_value_falls_back_to_full_speed() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    t.record(&[line(&en1, &pwm1, "mode", "300")]);
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&en1), "0");
+}
+
+/// No record — a daemon that never took a header, or one that gave every header
+/// back itself before exiting — means nothing is written and the unit does not
+/// fail.
+#[test]
+fn no_record_writes_nothing() {
+    let t = Tree::new();
+    let (en1, _) = t.header(1);
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&en1), "1");
+}
+
+/// [SAFETY] DEC-414 (`TS-aa`): a pre-RDNA3 amdgpu fan that a legacy GPU verify
+/// left in manual mode — the daemon died mid-verify — gets its original mode
+/// back from the GPU record, and a card no line names is not touched, even in
+/// manual mode (another tool's). The record is written by the daemon's own
+/// writer, so the line format the script parses is the one production writes.
+#[test]
+fn a_gpu_record_is_replayed_and_an_unrecorded_card_is_untouched() {
+    use ventulusd::hwmon::gpu_fan::{note_legacy_take, LegacyOriginal, GPU_RECORD_FILE_NAME};
+    let t = Tree::new();
+    let card = |n: u8| {
+        let dir = t.sys.join(format!("class/hwmon/hwmon{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("name"), "amdgpu\n").unwrap();
+        std::fs::write(dir.join("pwm1"), "200\n").unwrap();
+        std::fs::write(dir.join("pwm1_enable"), "1\n").unwrap();
+        dir
+    };
+    let verified = card(1);
+    let other = card(2);
+    let record = t.run.join(GPU_RECORD_FILE_NAME);
+    note_legacy_take(&record, &verified, LegacyOriginal::Mode(2));
+    // Presence first: the writer produced a line the script can see.
+    assert!(
+        std::fs::read_to_string(&record)
+            .unwrap()
+            .contains("\tmode\t2"),
+        "the verify's writer must have recorded the original mode"
+    );
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        read(&verified.join("pwm1_enable")),
+        "2",
+        "the recorded card must get its original (automatic) mode back"
+    );
+    assert_eq!(
+        read(&other.join("pwm1_enable")),
+        "1",
+        "a card no record line names must not be touched"
+    );
+}
+
+/// [SAFETY] DEC-447 (`TS-bj`): a card another tool had in manual at a duty,
+/// which the daemon died verifying, gets that duty back — not only manual mode
+/// at the verify's test speed, which a `mode 1` line used to leave it at. The
+/// line is written by the daemon's own writer from what the verify reads.
+#[test]
+fn a_gpu_found_in_manual_gets_its_duty_back_after_a_crash() {
+    use ventulusd::hwmon::gpu_fan::{note_legacy_take, LegacyOriginal, GPU_RECORD_FILE_NAME};
+    let t = Tree::new();
+    let card = t.sys.join("class/hwmon/hwmon1");
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::write(card.join("name"), "amdgpu\n").unwrap();
+    let record = t.run.join(GPU_RECORD_FILE_NAME);
+    note_legacy_take(
+        &record,
+        &card,
+        LegacyOriginal::from_read(Some(1), Some(120)),
+    );
+    // The crash left the verify's test speed on it.
+    std::fs::write(card.join("pwm1_enable"), "1\n").unwrap();
+    std::fs::write(card.join("pwm1"), "191\n").unwrap();
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&card.join("pwm1_enable")), "1", "manual, as found");
+    assert_eq!(
+        read(&card.join("pwm1")),
+        "120",
+        "the other tool's duty, not the verify's test speed"
+    );
+}
+
+/// Two RDNA3+ cards where the unit's old glob found them —
+/// `class/drm/cardN/device/gpu_od/fan_ctrl/` — each file starting `untouched`.
+fn pmfw_cards(t: &Tree) -> [(PathBuf, PathBuf); 2] {
+    [1, 2].map(|n| {
+        let ctrl = t
+            .sys
+            .join(format!("class/drm/card{n}/device/gpu_od/fan_ctrl"));
+        std::fs::create_dir_all(&ctrl).unwrap();
+        let (curve, zrp) = (ctrl.join("fan_curve"), ctrl.join("fan_zero_rpm_enable"));
+        std::fs::write(&curve, "untouched\n").unwrap();
+        std::fs::write(&zrp, "untouched\n").unwrap();
+        (curve, zrp)
+    })
+}
+
+/// [SAFETY] DEC-435 (`DC-aa`): after a crash, the card the daemon drove gets its
+/// PMFW curve reset and zero-RPM back, and a card it never wrote — one LACT or
+/// CoreCtrl manages — is not touched. The script used to reset every card on the
+/// machine. The record is written by the daemon's own writer, so the format the
+/// script parses is the one production writes.
+#[test]
+fn only_the_gpu_fans_the_daemon_drove_are_reset() {
+    use ventulusd::hwmon::gpu_fan::{PmfwHandBack, PMFW_RECORD_FILE_NAME};
+    let t = Tree::new();
+    let [(driven, driven_zrp), (other, other_zrp)] = pmfw_cards(&t);
+    let record = t.run.join(PMFW_RECORD_FILE_NAME);
+    let ledger = PmfwHandBack::default();
+    ledger.set_record_path(record.clone());
+    ledger.note_take("amd_gpu:1", &driven, Some(&driven_zrp));
+    assert!(
+        read(&record).contains(&driven.display().to_string()),
+        "precondition: the daemon's writer recorded the driven card"
+    );
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    // "r" then "c" to the curve, "1" then "c" to zero-RPM: a file keeps the last.
+    assert_eq!(read(&driven), "c", "the driven card's curve must be reset");
+    assert_eq!(
+        read(&driven_zrp),
+        "c",
+        "and its zero-RPM idle stop re-enabled"
+    );
+    assert_eq!(
+        read(&other),
+        "untouched",
+        "a card no line names must not be touched"
+    );
+    assert_eq!(read(&other_zrp), "untouched");
+}
+
+/// No record — no card was driven, or the daemon handed every one back itself —
+/// means no GPU is touched.
+#[test]
+fn no_pmfw_record_touches_no_gpu() {
+    let t = Tree::new();
+    let [(curve, zrp), _] = pmfw_cards(&t);
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&curve), "untouched");
+    assert_eq!(read(&zrp), "untouched");
+}
+
+/// A line the daemon could not have written is refused: a path outside the sysfs
+/// root, one that is not a PMFW `fan_curve`, one climbing out with `..`, and a
+/// zero-RPM path that is not the same card's.
+#[test]
+fn a_pmfw_line_naming_a_foreign_path_is_skipped() {
+    let t = Tree::new();
+    let [(curve, zrp), (other, other_zrp)] = pmfw_cards(&t);
+    let outside = t.run.join("gpu_od/fan_ctrl/fan_curve");
+    std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+    std::fs::write(&outside, "untouched\n").unwrap();
+    let not_a_curve = t.hwmon.join("pwm1");
+    std::fs::write(&not_a_curve, "untouched\n").unwrap();
+    // Resolves to card 2's real curve, so only the `..` check refuses it.
+    let climbing = t
+        .sys
+        .join("class/drm/card1/../card2/device/gpu_od/fan_ctrl/fan_curve");
+    let body = format!(
+        "# ventulus PMFW GPU hand-back record v1\n{}\t-\n{}\t-\n{}\t-\n{}\t{}\n",
+        outside.display(),
+        not_a_curve.display(),
+        climbing.display(),
+        curve.display(),
+        other_zrp.display(),
+    );
+    std::fs::write(t.run.join("gpu-pmfw-handback"), body).unwrap();
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&outside), "untouched", "outside the sysfs root");
+    assert_eq!(read(&not_a_curve), "untouched", "not a PMFW fan_curve");
+    assert_eq!(read(&other), "untouched", "a path climbing out with ..");
+    // Presence first: the well-formed curve on the last line WAS reset, so the
+    // loop ran — then its mismatched zero-RPM path was refused.
+    assert_eq!(read(&curve), "c");
+    assert_eq!(
+        read(&other_zrp),
+        "untouched",
+        "another card's zero-RPM file"
+    );
+    assert_eq!(
+        read(&zrp),
+        "untouched",
+        "no line named this card's own zero-RPM file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// LIFE-a (DEC-487) — a start refused because another daemon is running. Its
+// runtime directory holds THAT daemon's records, so the script must not replay
+// them; every other ending replays them and then removes them, because the
+// unit now keeps the directory (`RuntimeDirectoryPreserve=yes`) and systemd no
+// longer empties it after the script.
+// ---------------------------------------------------------------------------
+
+/// A runtime directory as a running daemon leaves it: a header it took from
+/// mode 5, a PMFW card it drives, and the paths of both records.
+struct Running {
+    t: Tree,
+    enable: PathBuf,
+    curve: PathBuf,
+    records: [PathBuf; 2],
+}
+
+fn a_running_daemons_records() -> Running {
+    use ventulusd::hwmon::gpu_fan::{PmfwHandBack, PMFW_RECORD_FILE_NAME};
+    let t = Tree::new();
+    let (enable, pwm) = t.header(1);
+    t.record(&[line(&enable, &pwm, "mode", "5")]);
+    let [(curve, zrp), _] = pmfw_cards(&t);
+    let pmfw = PmfwHandBack::default();
+    pmfw.set_record_path(t.run.join(PMFW_RECORD_FILE_NAME));
+    pmfw.note_take("amd_gpu:1", &curve, Some(&zrp));
+    let records = [
+        t.run.join("hwmon-handback"),
+        t.run.join(PMFW_RECORD_FILE_NAME),
+    ];
+    Running {
+        t,
+        enable,
+        curve,
+        records,
+    }
+}
+
+/// [SAFETY] A start refused by a running daemon — the lock held, or the socket
+/// served — exits `ANOTHER_INSTANCE_EXIT_CODE`, and the script then writes
+/// nothing and removes nothing: the header and the card stay as the running
+/// daemon has them, and its records survive for its own crash backstop. Before
+/// LIFE-a the header was handed back (`5`) and the card's curve reset.
+#[test]
+fn a_start_refused_by_a_running_daemon_hands_nothing_back() {
+    use ventulusd::single_instance::ANOTHER_INSTANCE_EXIT_CODE;
+    let r = a_running_daemons_records();
+
+    let status = ANOTHER_INSTANCE_EXIT_CODE.to_string();
+    let out = r.t.run_script_after(Some(("exited", &status)));
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        read(&r.enable),
+        "1",
+        "the running daemon's header is not handed back"
+    );
+    assert_eq!(read(&r.curve), "untouched", "nor its card's curve reset");
+    for record in &r.records {
+        assert!(
+            record.exists(),
+            "{} must be left for the running daemon",
+            record.display()
+        );
+    }
+}
+
+/// [SAFETY] The other half: every other ending still hands back — a clean stop,
+/// an ordinary failure, a signal, a core dump, and a run with nothing set — and
+/// then removes each record it replayed, so a later start that fails before its
+/// daemon writes records of its own cannot replay these over whatever has the
+/// headers by then. A skip that fired on any of these endings reddens here.
+#[test]
+fn every_other_ending_hands_back_and_consumes_the_records() {
+    let endings: [Option<(&str, &str)>; 6] = [
+        Some(("exited", "0")),
+        Some(("exited", "1")),
+        Some(("killed", "KILL")),
+        Some(("killed", "TERM")),
+        Some(("dumped", "ABRT")),
+        None,
+    ];
+    for ended in endings {
+        let r = a_running_daemons_records();
+        for record in &r.records {
+            assert!(
+                record.exists(),
+                "precondition: {} written",
+                record.display()
+            );
+        }
+
+        let out = r.t.run_script_after(ended);
+
+        assert!(out.status.success(), "{ended:?}: {out:?}");
+        assert_eq!(
+            read(&r.enable),
+            "5",
+            "{ended:?}: the header must be handed back"
+        );
+        assert_eq!(
+            read(&r.curve),
+            "c",
+            "{ended:?}: the card's curve must be reset"
+        );
+        for record in &r.records {
+            assert!(
+                !record.exists(),
+                "{ended:?}: {} must be removed once replayed",
+                record.display()
+            );
+        }
+    }
+}
+
+/// The legacy GPU record is consumed the same way as the other two.
+#[test]
+fn the_legacy_gpu_record_is_consumed_too() {
+    use ventulusd::hwmon::gpu_fan::{note_legacy_take, LegacyOriginal, GPU_RECORD_FILE_NAME};
+    let t = Tree::new();
+    let card = t.sys.join("class/hwmon/hwmon1");
+    std::fs::create_dir_all(&card).unwrap();
+    std::fs::write(card.join("pwm1"), "200\n").unwrap();
+    std::fs::write(card.join("pwm1_enable"), "1\n").unwrap();
+    let record = t.run.join(GPU_RECORD_FILE_NAME);
+    note_legacy_take(&record, &card, LegacyOriginal::Mode(2));
+    assert!(
+        record.exists(),
+        "precondition: the verify recorded the card"
+    );
+
+    let out = t.run_script();
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&card.join("pwm1_enable")), "2");
+    assert!(
+        !record.exists(),
+        "the legacy GPU record must be removed once replayed"
+    );
+}

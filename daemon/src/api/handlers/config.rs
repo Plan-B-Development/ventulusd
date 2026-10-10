@@ -1,0 +1,2252 @@
+//! Configuration endpoints.
+//!
+//! Read: `GET /config` — the effective merged configuration (DEC-243).
+//! Write: profile search dirs, startup delay, preferred sensors, the exit floor,
+//! header roles (a pump-floor safety input), cooling devices, and the DEC-243
+//! admin keys (poll interval, serial port/timeout, the two `[detection]`
+//! opt-ins). Every write lands in `runtime.toml`, never in the admin-owned
+//! `daemon.toml` (ADR-002), and is persist-first: a failed write returns
+//! `503 persistence_failed` and changes nothing the daemon acts on.
+
+use std::sync::Arc;
+
+use axum::extract::{ConnectInfo, State};
+use axum::http::StatusCode;
+use axum::response::Json;
+
+use super::{error_response, json_ok, AppState};
+use crate::api::responses::*;
+use crate::api::server::UdsConnectInfo;
+use crate::runtime_config::RuntimeConfig;
+
+/// Pull one optional array-of-strings field out of a request body.
+///
+/// `Ok(None)` means the key was absent. A present-but-wrong-shaped value is an
+/// error rather than a silent drop: the previous `filter_map(as_str)` quietly
+/// discarded every non-string entry, so `{"add": [null]}` was indistinguishable
+/// from `{"add": []}` and reported success having done nothing.
+fn dir_list_field(body: &serde_json::Value, field: &str) -> Result<Option<Vec<String>>, String> {
+    match body.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return Err(format!("'{field}' must be an array of strings"));
+                    }
+                }
+            }
+            Ok(Some(out))
+        }
+        Some(_) => Err(format!(
+            "'{field}' must be an array of absolute directory paths"
+        )),
+    }
+}
+
+/// Shape rules every search-dir path must satisfy, plus the one entry that may
+/// never be pruned.
+///
+/// Pure so the rules are unit-testable without a socket. The `..` rejection is
+/// what lets `confine_removed_dirs` compare lexically.
+pub(crate) fn validate_search_dir_edit(add: &[String], remove: &[String]) -> Result<(), String> {
+    let max_dirs = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+    if add.len() > max_dirs || remove.len() > max_dirs {
+        return Err(format!(
+            "at most {max_dirs} profile search directories can be added or removed at once"
+        ));
+    }
+    let max_bytes = crate::constants::MAX_PROFILE_SEARCH_DIR_BYTES;
+    for d in add.iter().chain(remove.iter()) {
+        if d.len() > max_bytes {
+            return Err(format!(
+                "search dir path is {} bytes; the limit is {max_bytes}",
+                d.len()
+            ));
+        }
+        if !d.starts_with('/') {
+            return Err(format!("search dir must be absolute: {d}"));
+        }
+        if d.contains("..") {
+            return Err(format!(
+                "search dir must not contain path traversal (..): {d}"
+            ));
+        }
+    }
+    if remove.iter().any(|d| is_system_dir(d)) {
+        return Err(system_dir_protected());
+    }
+    Ok(())
+}
+
+/// The comparison key of a search-dir entry: its lexical normal form, so
+/// `/home/u/./p`, `/home/u//p` and `/home/u/p/` are one directory (FFA-c).
+fn dir_key(dir: &str) -> std::path::PathBuf {
+    crate::profile_store::normalize_lexically(std::path::Path::new(dir))
+}
+
+fn is_system_dir(dir: &str) -> bool {
+    dir_key(dir) == std::path::Path::new(crate::config::SYSTEM_PROFILE_DIR)
+}
+
+fn system_dir_protected() -> String {
+    format!(
+        "the system profile directory cannot be removed: {}",
+        crate::config::SYSTEM_PROFILE_DIR
+    )
+}
+
+/// Refuse an edit that leaves a non-root caller more than
+/// [`MAX_PROFILE_SEARCH_DIRS_PER_USER`](crate::constants::MAX_PROFILE_SEARCH_DIRS_PER_USER)
+/// entries inside its home and grows that number (FFA-c): without a share, one
+/// user could fill the global cap and lock every other user out of registering
+/// theirs, with no way to remove the entries. Root is unconfined and has no
+/// share. Lexical: the entries are compared as stored.
+pub(crate) fn within_user_share(
+    current: &[String],
+    merged: Vec<String>,
+    who: &super::path_confine::Confinement,
+) -> Result<Vec<String>, String> {
+    use super::path_confine::Confinement;
+    if matches!(who, Confinement::Unconfined) {
+        return Ok(merged);
+    }
+    let mine = |dirs: &[String]| {
+        dirs.iter()
+            .filter(|d| who.permits(std::path::Path::new(d)))
+            .count()
+    };
+    let max = crate::constants::MAX_PROFILE_SEARCH_DIRS_PER_USER;
+    let now = mine(&merged);
+    if now > max && now > mine(current) {
+        return Err(format!(
+            "at most {max} profile search directories inside your home can be registered; \
+             remove one first"
+        ));
+    }
+    Ok(merged)
+}
+
+/// Apply one edit to the search-dir list: removals first, then additions.
+///
+/// Removals run first so `{"add": [new], "remove": [old]}` is a single atomic
+/// "move" — that is the request the GUI sends when the user repoints their
+/// profiles directory, and it is what stops the list growing by one entry every
+/// time they do. A path named in *both* lists therefore ends up present: add is
+/// the positive intent, and keeping it is the outcome that cannot lose a
+/// directory the caller still wants.
+///
+/// Rejects two results outright.
+///
+/// **An empty search path.** `activate_profile` resolves a profile path against
+/// this list, so an empty one is an unrecoverable soft-lock reachable from an
+/// unprivileged API call.
+///
+/// **A result whose FIRST entry is no longer `store_dir`.** The daemon's profile
+/// store of record (DEC-160) is *defined* as the first search dir —
+/// `profile.rs`'s `store_dir()` is literally `profile_search_dirs.first()`, and
+/// it is the write target for profile create and delete. Displacing it would
+/// silently redirect every profile write to whatever became first, for the rest
+/// of the process's life, and `with_store_dir` only re-prepends it at boot and
+/// on SIGHUP.
+///
+/// **Position, not membership** — and this is the second attempt. Checking
+/// merely that the store dir *survived* looked sufficient and was not: this
+/// function filters removals out and **appends** additions, so
+/// `{"remove": [store], "add": [store]}` deletes it from index 0 and re-adds it
+/// at the end. Present, displaced, accepted. The first cut of this guard shipped
+/// with a test that blessed exactly that request (`is_ok()`, no order assertion)
+/// and a comment claiming "a future reordering cannot slip past" — it did, and a
+/// contract review found it. Assert what `store_dir()` actually reads.
+///
+/// **Compared by lexical normal form, capped (FFA-c).** Every spelling of one
+/// directory (`/./`, `//`, a trailing `/`) is one entry, so spelling variants no
+/// longer each add an entry; the handler also passes additions as their real
+/// path and removals with their real-path spelling. An edit that would leave
+/// more than [`MAX_PROFILE_SEARCH_DIRS`](crate::constants::MAX_PROFILE_SEARCH_DIRS)
+/// entries and grows the list is refused. Without the cap, repeated adds could
+/// grow `runtime.toml` past its read cap, and boot would fall back to defaults.
+/// A list already over the cap can still be shrunk.
+pub(crate) fn merge_search_dirs(
+    current: &[String],
+    add: &[String],
+    remove: &[String],
+    store_dir: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let removed: Vec<std::path::PathBuf> = remove.iter().map(|d| dir_key(d)).collect();
+    let mut merged: Vec<String> = Vec::with_capacity(current.len() + add.len());
+    for d in current {
+        if removed.contains(&dir_key(d)) {
+            // A removal can reach the system dir through a spelling of it the
+            // shape check could not see (a real-path spelling of a symlink).
+            if is_system_dir(d) {
+                return Err(system_dir_protected());
+            }
+            continue;
+        }
+        merged.push(d.clone());
+    }
+    for d in add {
+        let key = dir_key(d);
+        if !merged.iter().any(|m| dir_key(m) == key) {
+            merged.push(key.display().to_string());
+        }
+    }
+    let max_dirs = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+    if merged.len() > max_dirs && merged.len() > current.len() {
+        return Err(format!(
+            "at most {max_dirs} profile search directories can be registered; remove one first"
+        ));
+    }
+    if merged.is_empty() {
+        return Err(
+            "at least one profile search directory must remain; refusing an edit that \
+             would empty the search path"
+                .to_string(),
+        );
+    }
+    if let Some(store) = store_dir {
+        if merged.first().map(String::as_str) != Some(store) {
+            return Err(format!(
+                "the daemon's profile store directory must remain first in the \
+                 search path and cannot be removed or displaced: {store}"
+            ));
+        }
+    }
+    Ok(merged)
+}
+
+/// POST /config/profile-search-dirs — edit the daemon's profile search path (DEC-285).
+///
+/// Body: `{"add": [...]}` and/or `{"remove": [...]}`, each an array of absolute
+/// directory paths. At least one of the two must be present.
+///
+/// `remove` is **daemon >= 2.23.0** and is advertised as
+/// `control.profile_search_dir_remove` in `GET /capabilities`. An older daemon
+/// parses only `add` and ignores `remove` **silently** — a partial success that
+/// looks like a whole one — which is exactly why the flag exists and why a
+/// client must check it rather than probing.
+///
+/// The system directory `/etc/ventulus/profiles` can never be removed, and
+/// neither can the last remaining entry.
+///
+/// Flow: validate, confine, merge, then persist runtime.toml *first* and only
+/// then update in-memory state. If the persist fails, the in-memory state is
+/// left untouched and the handler returns 503 `persistence_failed` so the GUI
+/// can retry or surface the error to the user. See ADR-002 for the rationale
+/// behind the two-file config split.
+pub async fn update_profile_search_dirs_handler(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<UdsConnectInfo>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (add, remove) = match (
+        dir_list_field(&body, "add"),
+        dir_list_field(&body, "remove"),
+    ) {
+        (Ok(a), Ok(r)) => (a, r),
+        (Err(msg), _) | (_, Err(msg)) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+        }
+    };
+    if add.is_none() && remove.is_none() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation(
+                "missing 'add' and/or 'remove' array of absolute directory paths",
+            ),
+        );
+    }
+    let add = add.unwrap_or_default();
+    let remove = remove.unwrap_or_default();
+
+    if let Err(msg) = validate_search_dir_edit(&add, &remove) {
+        return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+    }
+
+    // Confinement and the real-path lookups touch directories the caller chose,
+    // which can sit on a mount that stops answering: off the async workers,
+    // bounded, in their own pool and one at a time per uid (FFA-b).
+    use super::path_confine::{confine_adds, confine_removals, Confinement};
+    let peer_uid = peer.uid;
+    const ROUTE: &str = "POST /config/profile-search-dirs";
+
+    // Multi-user confinement (DEC-205): a non-root client may only add search
+    // directories that exist within its own home directory, and remove ones
+    // there. Root/CLI callers are exempt. The peer uid comes from SO_PEERCRED via
+    // the connect-info layer; an unresolvable uid/home fails closed.
+    //
+    // FFA-a/FFA-c: each addition is resolved ONCE, and that real path is both
+    // what is confined and what is stored. The profile reader requires an entry
+    // to still be its real path when read, which closes the DEC-205 residual this
+    // note used to accept: an approved in-home dir later swapped for a symlink out
+    // of the home is refused, not followed. That mattered because `GET
+    // /profiles/{id}` returns file contents. Root, with nothing to add, needs no
+    // filesystem access here at all, so it can always remove a directory that
+    // has stopped answering.
+    let (who, add) = if peer_uid == Some(0) && add.is_empty() {
+        (Confinement::Unconfined, Vec::new())
+    } else {
+        let resolved = super::resolve_io(peer_uid, move || {
+            let who = Confinement::of(peer_uid, super::path_confine::home_dir_for_uid)?;
+            let add = confine_adds(&add, &who)?;
+            Ok::<_, String>((who, add))
+        })
+        .await;
+        match resolved {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(msg)) => {
+                return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+            }
+            Err(e) => return super::profile_io_error_response(ROUTE, e),
+        }
+    };
+
+    // A removal also matches an entry stored by its real path, and may be
+    // confined by it (an entry an older daemon stored through a symlink). Looked
+    // up only for a removal whose spelling matches no current entry or is not
+    // the caller's as sent, and best-effort: if the lookup does not finish (the
+    // directory stopped answering — the case a user most needs to remove), the
+    // removal matches as sent.
+    let current_keys: Vec<std::path::PathBuf> = state
+        .profile_search_dirs
+        .read()
+        .iter()
+        .map(|d| crate::profile_store::normalize_lexically(d))
+        .collect();
+    let unmatched: Vec<String> = remove
+        .iter()
+        .filter(|r| !current_keys.contains(&dir_key(r)) || !who.permits(std::path::Path::new(r)))
+        .cloned()
+        .collect();
+    let real_paths: std::collections::HashMap<String, std::path::PathBuf> = if unmatched.is_empty()
+    {
+        std::collections::HashMap::new()
+    } else {
+        let looked_up = super::resolve_io(peer_uid, move || {
+            unmatched
+                .into_iter()
+                .filter_map(|d| {
+                    let real =
+                        super::path_confine::resolve_client_path(std::path::Path::new(&d)).ok()?;
+                    Some((d, real))
+                })
+                .collect()
+        })
+        .await;
+        looked_up.unwrap_or_else(|e| {
+            log::warn!(
+                "{ROUTE}: the real paths of removals were not found ({e:?}); matching them as sent"
+            );
+            std::collections::HashMap::new()
+        })
+    };
+    let remove = match confine_removals(&remove, &who, |d| real_paths.get(d).cloned()) {
+        Ok(spellings) => spellings,
+        Err(msg) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+        }
+    };
+
+    // Persist first. On failure, leave in-memory state alone and return 503
+    // so the caller sees a durable, actionable error rather than a silent
+    // drift between in-memory and on-disk state.
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    // [AIO1-d] The merge base is read INSIDE the guard, and that ordering is the
+    // whole fix for this route. This is the only one of the twelve whose
+    // persisted value is derived from shared mutable state rather than from the
+    // request body: `add`/`remove` are a delta applied to the *current* list. Read
+    // before the lock, two concurrent callers both merge onto the same stale base
+    // and the second silently discards the first's directory — the exact lost
+    // update the lock exists to remove, surviving inside it. Pinned by
+    // `concurrent_search_dir_edits_are_not_lost`.
+    let current: Vec<String> = {
+        let dirs = state.profile_search_dirs.read();
+        dirs.iter().map(|p| p.display().to_string()).collect()
+    };
+    // The store of record is the FIRST search dir — read from the same place
+    // `profile.rs::store_dir()` reads it, so the two cannot disagree about which
+    // directory profile writes land in.
+    let store = current.first().cloned();
+    let merged = match merge_search_dirs(&current, &add, &remove, store.as_deref())
+        .and_then(|merged| within_user_share(&current, merged, &who))
+    {
+        Ok(m) => m,
+        Err(msg) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(msg));
+        }
+    };
+    runtime.set_profile_search_dirs(merged.clone());
+    // DEC-252/255: fsync off the async worker threads the engine shares.
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist profile search dirs to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+
+    // Persist succeeded — commit the in-memory update.
+    let path_bufs: Vec<std::path::PathBuf> = merged.iter().map(std::path::PathBuf::from).collect();
+    *state.profile_search_dirs.write() = path_bufs;
+
+    log::info!("Profile search dirs updated: {:?}", merged);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "search_dirs": merged,
+        })),
+    )
+}
+
+/// POST /config/startup-delay — set the daemon startup delay (takes effect on restart).
+///
+/// Persists to runtime.toml. Returns 503 `persistence_failed` if the write
+/// fails, so the caller knows the setting did not stick. The daemon's live
+/// startup delay is only consulted at process start, so there is no
+/// in-memory state to roll back.
+pub async fn update_startup_delay_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let max = crate::constants::MAX_STARTUP_DELAY_SECS;
+    let delay = match body.get("delay_secs").and_then(|v| v.as_u64()) {
+        Some(d) if d <= max => d,
+        Some(d) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("delay_secs must be 0-{max}, got {d}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("missing 'delay_secs' (integer 0-{max})")),
+            );
+        }
+    };
+
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_startup_delay_secs(delay);
+    // DEC-252/255: fsync off the async worker threads the engine shares.
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist startup delay to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+
+    log::info!("Startup delay set to {delay}s (takes effect on restart)");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            // `key`/`value` match the DEC-243 setter shape, so one client-side
+            // parser covers every `POST /config/*` route. `delay_secs` predates
+            // that shape and is kept for older clients — this route is the one
+            // DEC-243 did not harmonise, which is why it was the one key the GUI
+            // still drove from a local mirror instead of the shared write path.
+            "key": "startup.delay_secs",
+            "value": delay,
+            "delay_secs": delay,
+            "note": "Takes effect on next daemon restart",
+        })),
+    )
+}
+
+/// POST /config/header-role — assign or clear one PWM header's role (DEC-311).
+///
+/// Body: `{"header_id": "hwmon:…", "role": "pump"}` to set, or `{"role": null}`
+/// to clear and fall back to the detected role. Since `ROLE-f` the id may also
+/// be an OpenFan channel (`openfan:ch03`), capability
+/// `control.openfan_header_roles`: a `pump` there earns the 30 % floor, a
+/// perturbing identify and a refused calibration.
+///
+/// [SAFETY] This is the mechanism that makes AIO-MB Phase 1 work on real
+/// hardware. On a board whose Super-I/O publishes no `pwmN_label` — measured on
+/// the validation target, `it8696`: five channels, zero label files — inference
+/// has nothing to work from and *every* header reads `unknown`. The user's
+/// assignment is then the only evidence that a header drives a pump, and it is
+/// what earns that header the 30% floor, the stop-snap exemption, pump-safe
+/// identify, and the role-aware verify duty.
+///
+/// Persist-first, exactly like the sibling setters: if the write fails we return
+/// 503 and the in-memory map is untouched, so the daemon never acts on an
+/// assignment it could not durably record. **Unlike** the DEC-243 admin keys,
+/// this one also takes effect immediately (no restart) — a safety floor that
+/// waited for a reboot would be a trap.
+pub async fn update_header_role_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // DEC-442: canonical, so an id carrying the it87 v2.0 suffixed chip
+    // spelling addresses the header discovery now publishes without it — and
+    // an OpenFan channel id is re-minted padded (`ROLE-f`), the spelling the
+    // engine and identify look it up under.
+    let header_id = match body.get("header_id") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            crate::hwmon::roles::role_key(s).into_owned()
+        }
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing or empty 'header_id' (a stable header id)"),
+            );
+        }
+    };
+
+    // `role` is required as a key; a string assigns, null clears.
+    let new_role: Option<crate::hwmon::roles::HeaderRole> = match body.get("role") {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing 'role' (a role token, or null to clear)"),
+            );
+        }
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(token)) => {
+            // An unrecognised token is rejected rather than defaulted. A typo
+            // that silently became `unknown` would drop a pump's protection
+            // while the response said "updated".
+            match crate::hwmon::roles::HeaderRole::from_token(token) {
+                Some(role) => Some(role),
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        &ErrorEnvelope::validation(format!(
+                            "unknown role '{token}' — expected one of: unknown, cpu_fan, \
+                             pump, radiator_fan, chassis_fan, no_fan"
+                        )),
+                    );
+                }
+            }
+        }
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("'role' must be a string or null"),
+            );
+        }
+    };
+
+    // Validate a set id against the discovered headers. Deliberately NOT applied
+    // to a clear: you must always be able to remove an assignment for a header
+    // that has since disappeared, or a stale entry would be unreachable.
+    //
+    // `ROLE-f`: an OpenFan channel id is accepted for any channel the controller
+    // has, adopted or not. The assignment can only add protection, so recording
+    // it while the controller is unplugged is harmless and protects the pump the
+    // moment it is adopted. An OpenFan-prefixed id that does not parse to such a
+    // channel is rejected here, never stored as an hwmon id.
+    if new_role.is_some() {
+        let known = match crate::serial::openfan_channel_of(&header_id) {
+            Ok(channel) => channel < crate::serial::protocol::NUM_CHANNELS,
+            Err(crate::serial::OpenFanMemberIdError::UnparseableChannel) => false,
+            Err(crate::serial::OpenFanMemberIdError::NotOpenFan) => state
+                .hwmon_controller
+                .as_ref()
+                .is_some_and(|c| c.header(&header_id).is_some()),
+        };
+        if !known {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "unknown hwmon header or OpenFan channel id: {header_id}"
+                )),
+            );
+        }
+    }
+
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_header_role(&header_id, new_role);
+
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist header role for '{header_id}' to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+
+    // Commit in memory only after the write succeeded. Rebuilt from the freshly
+    // persisted config rather than patched, so the map the engine reads and the
+    // file on disk cannot drift apart.
+    *state.header_roles.write() = Arc::new(runtime.header_roles_parsed());
+
+    // [SAFETY] DEC-311: a live identify hold stores an ABSOLUTE duty chosen from
+    // the role at take time, so assigning `pump` to a header already held at 0
+    // would otherwise leave a real pump stopped until its deadman fired (up to
+    // `OVERRIDE_TTL_SECS`). Releasing the hold restores curve control on the
+    // engine's next tick, which is the correct answer to "this is a pump" —
+    // the user can re-issue identify and get the perturbation.
+    //
+    // Ordered after the `header_roles` write guard is released, so this takes
+    // `override_table` on its own and adds no lock-ordering cycle.
+    //
+    // [SAFETY] TS-ax / DEC-419: the order — swap, THEN release — is load-bearing.
+    // Identify reads the assignment inside the `override_table` guard it inserts
+    // under, so it either sees this swap (and perturbs) or holds the table until
+    // its insert is done, and this release then removes the stop. Releasing
+    // before the swap would reopen the gap.
+    if new_role.is_some_and(|r| r.is_pump()) {
+        state.override_table.lock().identify_restore(&header_id);
+    }
+
+    log::info!(
+        "Header role for '{header_id}' set to {} (effective immediately)",
+        new_role
+            .map(|r| r.as_str())
+            .unwrap_or("<cleared, detected role applies>")
+    );
+
+    // [AIO1-d] Release the config lock BEFORE building the response. Everything
+    // it guards — the load, the persist and both in-memory commits — is done.
+    //
+    // `resolved_header_role` below reaches `AppState::header_role_parts`, which
+    // took `hwmon_controller` — the lock the profile engine holds across a
+    // blocking sysfs write (DEC-278/289) — until FFA-h moved it onto
+    // `HwmonHandle`'s header snapshot. The early release keeps `config_write`'s
+    // critical section to what it guards.
+    //
+    // The cost of dropping early is that a concurrent setter could change the
+    // resolution between here and the read, so `effective_role` reports the live
+    // answer rather than a snapshot of ours. That is a *report*, never a safety
+    // decision, and the live answer is the more useful one. The alternative —
+    // recomputing the resolution locally from `new_role` — was rejected: it would
+    // duplicate a safety-adjacent rule that DEC-312 deliberately keeps in one place.
+    drop(_config_guard);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "header_id": header_id,
+            "role": new_role.map(|r| r.as_str()),
+            "effective_role": state.resolved_header_role(&header_id).as_str(),
+        })),
+    )
+}
+
+/// Which preferred-sensor slot a request targets (Phase 5).
+enum PreferredSensorRole {
+    Cpu,
+    Mb,
+}
+
+/// Shared logic for `POST /config/preferred-{cpu,mb}-sensor`. Body:
+/// `{"sensor_id": "<stable id>"}` to set, or `{"sensor_id": null}` to clear.
+///
+/// A set is validated against the live sensor set (unknown id → 400); staleness
+/// after a later hardware change is surfaced by the readiness model, not here.
+/// Persist-first like the sibling handlers: a write failure returns 503 and does
+/// not change anything the daemon acts on (the preference is advisory — thermal
+/// safety still uses the hottest CpuTemp).
+async fn set_preferred_sensor(
+    state: &AppState,
+    body: &serde_json::Value,
+    role: PreferredSensorRole,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Parse sensor_id: the key is required; a string sets, null clears.
+    let new_id: Option<String> = match body.get("sensor_id") {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(
+                    "missing 'sensor_id' (a stable sensor id, or null to clear)",
+                ),
+            );
+        }
+        Some(serde_json::Value::Null) => None,
+        // DEC-442: an id saved under the it87 v2.0 suffixed chip spelling names
+        // the same sensor the daemon now publishes without the suffix.
+        Some(serde_json::Value::String(s)) => {
+            Some(crate::hwmon::chip_name::canonical_hwmon_id(s).into_owned())
+        }
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("'sensor_id' must be a string or null"),
+            );
+        }
+    };
+
+    // Validate a set id against the live sensor set.
+    if let Some(ref id) = new_id {
+        if !state.cache.snapshot().sensors.contains_key(id) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("unknown sensor id: {id}")),
+            );
+        }
+    }
+
+    // Persist-first, matching the sibling config handlers.
+    let (_config_guard, mut runtime) = match runtime_for_update(state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let role_str = match role {
+        PreferredSensorRole::Cpu => {
+            runtime.set_preferred_cpu_sensor(new_id.clone());
+            "cpu"
+        }
+        PreferredSensorRole::Mb => {
+            runtime.set_preferred_mb_sensor(new_id.clone());
+            "mb"
+        }
+    };
+    // DEC-252/255: fsync off the async worker threads the engine shares. This
+    // setter was a plain `fn`, which is why it was missed the first time.
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist preferred {role_str} sensor to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+
+    log::info!("Preferred {role_str} sensor set to {new_id:?}");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "role": role_str,
+            "preferred_sensor": new_id,
+        })),
+    )
+}
+
+/// POST /config/preferred-cpu-sensor — set/clear the preferred CPU temp sensor (Phase 5).
+pub async fn update_preferred_cpu_sensor_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = set_preferred_sensor(&state, &body, PreferredSensorRole::Cpu).await;
+    refresh_rollup_if_ok(&state, resp.0);
+    resp
+}
+
+/// POST /config/preferred-mb-sensor — set/clear the preferred motherboard sensor (Phase 5).
+pub async fn update_preferred_mb_sensor_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let resp = set_preferred_sensor(&state, &body, PreferredSensorRole::Mb).await;
+    refresh_rollup_if_ok(&state, resp.0);
+    resp
+}
+
+/// DEC-206: after a successful preferred-sensor change, recompute the cached
+/// readiness rollup on the blocking pool so the Dashboard health chip's
+/// `selected_*_sensor_missing` state updates within a poll. Fire-and-forget — the
+/// response does not depend on it and the change is already persisted.
+fn refresh_rollup_if_ok(state: &Arc<AppState>, status: StatusCode) {
+    if status == StatusCode::OK {
+        let s = state.clone();
+        // DEC-207: a preferred-sensor change invalidates the shared assessment
+        // (readiness items depend on runtime.toml). Fire-and-forget, force-refresh
+        // — the response does not depend on it; ensure_assessment coalesces the
+        // scan off the poll path and logs its own failure.
+        tokio::spawn(async move {
+            let _ = super::ensure_assessment(s, true).await;
+        });
+    }
+}
+
+// ── DEC-243: readable + extended-writable daemon configuration ───────────
+
+/// Build the effective on-disk config: admin `daemon.toml` with the
+/// `runtime.toml` overlay applied. This is what a restart would produce.
+///
+/// Deliberately re-reads both files rather than reusing the running config —
+/// the whole point of the endpoint is to expose the difference between what is
+/// persisted and what is in effect.
+fn effective_on_disk(state: &AppState) -> (crate::config::DaemonConfig, RuntimeConfig) {
+    effective_on_disk_paths(&state.config_path, &state.runtime_config_path)
+}
+
+/// Path-based core of [`effective_on_disk`].
+///
+/// Public so `main`'s overlay tests can assert this merge and
+/// `apply_runtime_overlay` agree. They are two independent implementations of
+/// the same precedence rule: this one answers `GET /config`, the other decides
+/// what the process actually runs on. If they drift, a setting persists,
+/// reports `restart_pending` forever, and never applies.
+pub fn effective_on_disk_paths(
+    admin_path: &str,
+    runtime_path: &std::path::Path,
+) -> (crate::config::DaemonConfig, RuntimeConfig) {
+    let mut cfg = crate::config::DaemonConfig::load(admin_path).unwrap_or_default();
+    let runtime = RuntimeConfig::load_from(runtime_path);
+    if let Some(dirs) = runtime.profile_search_dirs() {
+        cfg.profiles.search_dirs = dirs.to_vec();
+    }
+    if let Some(d) = runtime.startup_delay_secs() {
+        cfg.startup.delay_secs = d;
+    }
+    if let Some(p) = runtime.serial_port() {
+        cfg.serial.port = Some(p.to_string());
+    }
+    if let Some(t) = runtime.serial_timeout_ms() {
+        cfg.serial.timeout_ms = t;
+    }
+    if let Some(i) = runtime.poll_interval_ms() {
+        cfg.polling.poll_interval_ms = i;
+    }
+    if let Some(a) = runtime.allow_port_probe() {
+        cfg.detection.allow_port_probe = a;
+    }
+    if let Some(e) = runtime.enable_nvidia_telemetry() {
+        cfg.detection.enable_nvidia_telemetry = e;
+    }
+    if let Some(p) = runtime.exit_floor_pct() {
+        cfg.shutdown.exit_floor_pct = p;
+    }
+    if let Some(l) = runtime.coolant_limit_c() {
+        cfg.safety.coolant_limit_c = l;
+    }
+    // DEC-270: the same clamp `apply_runtime_overlay` applies, for the same
+    // reason the doc comment above gives. Without it this copy reports the
+    // hand-edited value while the process runs the clamped one, so
+    // `config_key`'s `pending = requires_restart && value != running` latches
+    // true forever and the GUI advises a restart that can never resolve it.
+    if cfg.polling.poll_interval_ms > crate::health::cache::MAX_SUPERVISABLE_POLL_INTERVAL_MS {
+        cfg.polling.poll_interval_ms = crate::health::cache::MAX_SUPERVISABLE_POLL_INTERVAL_MS;
+    }
+    // DEC-388: the same clamp `apply_runtime_overlay` applies to a hand-edited
+    // `runtime.toml`, for the reason the doc comment above gives.
+    cfg.shutdown.exit_floor_pct = cfg.shutdown.exit_floor_pct.min(100);
+    // DEC-443: the same clamp `apply_runtime_overlay` applies.
+    cfg.safety.coolant_limit_c =
+        crate::health::cache::clamp_coolant_limit_c(cfg.safety.coolant_limit_c);
+    (cfg, runtime)
+}
+
+/// Assemble one `ConfigKey`, deriving `restart_pending` from disk-vs-running.
+#[allow(clippy::too_many_arguments)]
+fn config_key(
+    key: &str,
+    value: serde_json::Value,
+    running: serde_json::Value,
+    overridden: bool,
+    is_admin_set: bool,
+    mutable: bool,
+    requires_restart: bool,
+    requires_privilege: Option<&str>,
+) -> ConfigKey {
+    let pending = requires_restart && value != running;
+    let source = if overridden {
+        "runtime"
+    } else if is_admin_set {
+        "admin"
+    } else {
+        "default"
+    };
+    ConfigKey {
+        key: key.to_string(),
+        running_value: running,
+        value,
+        source: source.to_string(),
+        mutable,
+        requires_restart,
+        restart_pending: pending,
+        requires_privilege: requires_privilege.map(String::from),
+    }
+}
+
+/// GET /config — the daemon's effective configuration (DEC-243).
+///
+/// Read-only. Contains no secrets: paths, intervals and booleans only.
+pub async fn get_config_handler(
+    State(state): State<Arc<AppState>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (disk, runtime) = effective_on_disk(&state);
+    let run = &state.running_config;
+    // Parse the admin file to decide `source`: "admin" must mean *this exact
+    // key* is set in daemon.toml, not merely that its section header appears
+    // (a commented-out header or a section holding only sibling keys would
+    // both fool a raw text match).
+    let admin_doc: toml::Value = std::fs::read_to_string(&state.config_path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+    let admin_has = |dotted: &str| -> bool {
+        let mut node = &admin_doc;
+        for part in dotted.split('.') {
+            match node.get(part) {
+                Some(next) => node = next,
+                None => return false,
+            }
+        }
+        true
+    };
+
+    let keys = vec![
+        // One of the two keys that apply live (the other is
+        // `shutdown.exit_floor_pct`, below): `update_profile_search_dirs_handler`
+        // swaps `state.profile_search_dirs` in-process, and SIGHUP re-applies it
+        // too. So `requires_restart` is false, and the running value is read
+        // from that live lock rather than from `running_config` (which is frozen
+        // at startup and would therefore report a restart as owed forever — the
+        // GUI re-registers its profiles dir on every connect, so that false
+        // banner would fire for essentially every user).
+        config_key(
+            "profiles.search_dirs",
+            serde_json::json!(disk.profiles.search_dirs),
+            serde_json::json!(state
+                .profile_search_dirs
+                .read()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()),
+            runtime.profile_search_dirs().is_some(),
+            admin_has("profiles.search_dirs"),
+            true,
+            false,
+            None,
+        ),
+        config_key(
+            "startup.delay_secs",
+            serde_json::json!(disk.startup.delay_secs),
+            serde_json::json!(run.startup.delay_secs),
+            runtime.startup_delay_secs().is_some(),
+            admin_has("startup.delay_secs"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "polling.poll_interval_ms",
+            serde_json::json!(disk.polling.poll_interval_ms),
+            serde_json::json!(run.polling.poll_interval_ms),
+            runtime.poll_interval_ms().is_some(),
+            admin_has("polling.poll_interval_ms"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "serial.port",
+            serde_json::json!(disk.serial.port),
+            serde_json::json!(run.serial.port),
+            runtime.serial_port().is_some(),
+            admin_has("serial.port"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "serial.timeout_ms",
+            serde_json::json!(disk.serial.timeout_ms),
+            serde_json::json!(run.serial.timeout_ms),
+            runtime.serial_timeout_ms().is_some(),
+            admin_has("serial.timeout_ms"),
+            true,
+            true,
+            None,
+        ),
+        config_key(
+            "detection.allow_port_probe",
+            serde_json::json!(disk.detection.allow_port_probe),
+            serde_json::json!(run.detection.allow_port_probe),
+            runtime.allow_port_probe().is_some(),
+            admin_has("detection.allow_port_probe"),
+            true,
+            true,
+            Some(
+                "also requires the CAP_SYS_RAWIO systemd drop-in \
+                 (superio-port-probe.conf.example)",
+            ),
+        ),
+        config_key(
+            "detection.enable_nvidia_telemetry",
+            serde_json::json!(disk.detection.enable_nvidia_telemetry),
+            serde_json::json!(run.detection.enable_nvidia_telemetry),
+            runtime.enable_nvidia_telemetry().is_some(),
+            admin_has("detection.enable_nvidia_telemetry"),
+            true,
+            true,
+            Some(
+                "also requires the /dev/nvidia* systemd drop-in \
+                 (nvidia-telemetry.conf.example)",
+            ),
+        ),
+        // DEC-388: applies LIVE, like the search dirs — the handler updates the
+        // running daemon as well as `runtime.toml`, and the shutdown reads the
+        // value in force at the moment of the stop. So the running value comes
+        // from the cache rather than the frozen `running_config`, and nothing is
+        // ever owed to a restart.
+        config_key(
+            "shutdown.exit_floor_pct",
+            serde_json::json!(disk.shutdown.exit_floor_pct),
+            serde_json::json!(state.cache.exit_floor_pct()),
+            runtime.exit_floor_pct().is_some(),
+            admin_has("shutdown.exit_floor_pct"),
+            true,
+            false,
+            None,
+        ),
+        // DEC-443: applies LIVE, like the exit floor — the engine re-reads the
+        // cache every tick — so the running value comes from the cache and
+        // nothing is owed to a restart.
+        config_key(
+            "safety.coolant_limit_c",
+            serde_json::json!(disk.safety.coolant_limit_c),
+            serde_json::json!(state.cache.coolant_limit_c()),
+            runtime.coolant_limit_c().is_some(),
+            admin_has("safety.coolant_limit_c"),
+            true,
+            false,
+            None,
+        ),
+        // Read-only by design (DEC-243). Editing either from an unprivileged
+        // client is self-destructive: a bad socket path locks every client out
+        // of the daemon permanently, and moving state_dir orphans runtime.toml
+        // and the daemon-owned profile store. Shown so they are diagnosable.
+        config_key(
+            "ipc.socket_path",
+            serde_json::json!(disk.ipc.socket_path),
+            serde_json::json!(run.ipc.socket_path),
+            false,
+            admin_has("ipc.socket_path"),
+            false,
+            true,
+            None,
+        ),
+        config_key(
+            "state.state_dir",
+            serde_json::json!(disk.state.state_dir),
+            serde_json::json!(run.state.state_dir),
+            false,
+            admin_has("state.state_dir"),
+            false,
+            true,
+            None,
+        ),
+    ];
+
+    let restart_pending = keys.iter().any(|k| k.restart_pending);
+    let body = ConfigResponse {
+        api_version: API_VERSION,
+        admin_config_path: state.config_path.clone(),
+        runtime_config_path: state.runtime_config_path.display().to_string(),
+        restart_pending,
+        keys,
+    };
+    // `DC-ce`: through `json_ok` like every other handler, so a report that fails
+    // to serialise answers `500 internal_error` rather than `200 {}` — an empty
+    // body a client would read as a real config with no `api_version`.
+    json_ok(StatusCode::OK, body)
+}
+
+/// Take the `/config/*` write lock, then load runtime.toml for a setter —
+/// converting an unreadable existing file into a 503 rather than letting the
+/// write erase it (DEC-252).
+///
+/// Every `POST`/`DELETE /config/*` is load → mutate one key → save → commit.
+/// Without the DEC-252 half, the fallback-to-defaults inside `load_from` turns a
+/// failed read into a permanent overwrite of every other setting.
+///
+/// # The returned guard is load-bearing (`AIO1-d`)
+///
+/// The lock is acquired **here**, before the load, and the caller must hold the
+/// returned guard until it has finished persisting *and* committing. That is
+/// what makes the read-modify-write atomic against a second setter: without it,
+/// two handlers load the same base, and the later `save_to` wins the file while
+/// the later in-memory commit wins the cache — with **both** answering
+/// `updated: true`. Losing a `header_roles` edit that way drops a pump's 30%
+/// floor at the next restart, and since DEC-316 the GUI opens that window during
+/// one ordinary Configure-AIO action (`/config/header-role` then
+/// `/config/cooling-device`, back to back).
+///
+/// Binding it as `_config_guard` — a named binding, **never** a bare `_` — is
+/// what keeps it alive to the end of the handler. A bare `_` drops it
+/// immediately and silently restores the race. Two route tests in
+/// `daemon/tests/ipc_integration.rs` are what catch that, and both were verified
+/// to fail under exactly that mutation:
+/// `concurrent_config_setters_do_not_lose_an_edit` and
+/// `a_cooling_device_write_never_drops_a_concurrent_header_role`.
+///
+/// Handing the guard back from the same call that does the load is deliberate:
+/// it means a new setter cannot acquire the config without acquiring the lock,
+/// so the rule does not depend on the next author reading this comment
+/// (the project rulebook — a rule that lives inside one consumer is a rule the others
+/// cannot follow).
+async fn runtime_for_update(
+    state: &AppState,
+) -> Result<(tokio::sync::MutexGuard<'_, ()>, RuntimeConfig), (StatusCode, Json<serde_json::Value>)>
+{
+    let guard = state.config_write.lock().await;
+    // [SAFETY] `TS-r`: the live maps go in so a quarantine carries them into the
+    // file that replaces the unreadable one — and into the maps this setter
+    // rebuilds from it. Read under `config_write`, the lock every writer of these
+    // two maps holds. Off the runtime, because a quarantine now writes and fsyncs
+    // (DEC-252).
+    let header_roles = state.header_roles();
+    let cooling_devices = Arc::clone(&state.cooling_devices.read());
+    let path = state.runtime_config_path.clone();
+    let slot = Arc::clone(&state.runtime_config_degraded);
+    let loaded = super::persist_off_runtime(move || {
+        let (cfg, quarantined) = RuntimeConfig::load_for_update(
+            &path,
+            crate::runtime_config::LiveAssignments {
+                header_roles: &header_roles,
+                cooling_devices: &cooling_devices,
+            },
+        )?;
+        // Published inside the blocking task, which a dropped request cannot
+        // cancel: the unreadable file has been kept aside and replaced whether
+        // or not this handler lives to see it, and whether or not the setter
+        // goes on to write. That is the fact `/status` must carry.
+        if let Some(problem) = quarantined {
+            crate::runtime_config::record_degraded(&slot, problem);
+        }
+        Ok(cfg)
+    })
+    .await;
+    let cfg = loaded.map_err(|e| {
+        log::error!("{e}");
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed(
+                "existing runtime configuration could not be read; refusing to overwrite it",
+            ),
+        )
+    })?;
+    Ok((guard, cfg))
+}
+
+/// Run a SIGHUP configuration reload under `config_write` (`TS-aq`).
+///
+/// The reload reads `daemon.toml` and `runtime.toml` and then applies what it
+/// read to the running daemon — the search dirs and, since DEC-388, the exit
+/// floor. Without the lock a setter could land between the two: the reload
+/// read the old file, `POST /config/exit-floor` wrote the new value to the file
+/// and the cache, and the reload then overwrote the cache with the stale value
+/// it had read. The file and the process disagreed until the next reload or
+/// restart, with the older value the one a stop would use. Taking the lock
+/// every setter holds orders the reload wholly before or wholly after each one.
+///
+/// Called from a task of its own, never awaited by the signal loop: a setter
+/// holds this lock across an fsync, and a SIGTERM must not wait behind one.
+/// The reload itself runs off the async runtime, like every other config file
+/// read and write here (DEC-252). `reload` is the binary's
+/// `apply_config_reload`, passed in because it lives in `main.rs`.
+pub async fn reload_under_config_write<F>(state: Arc<AppState>, reload: F)
+where
+    F: FnOnce(&AppState) -> Result<(), String> + Send + 'static,
+{
+    let _guard = state.config_write.lock().await;
+    let owned = Arc::clone(&state);
+    if let Err(e) = super::persist_off_runtime(move || reload(&owned)).await {
+        log::error!("{e}");
+    }
+}
+
+/// Shared persist-and-report tail for the DEC-243 setters.
+async fn persist_runtime(
+    state: &AppState,
+    runtime: &RuntimeConfig,
+    key: &str,
+    applied: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // DEC-252: write + fsync + rename + directory fsync, off the async worker
+    // threads the 1 Hz profile engine shares. See `persist_off_runtime`.
+    let runtime_owned = runtime.clone();
+    let path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&path)).await {
+        log::error!(
+            "Failed to persist {key} to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    log::info!("{key} set to {applied} (takes effect on restart)");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "key": key,
+            "value": applied,
+            "note": "Takes effect on next daemon restart",
+        })),
+    )
+}
+
+/// POST /config/poll-interval — `{"poll_interval_ms": 250..=2000}`.
+pub async fn update_poll_interval_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ms = match body.get("poll_interval_ms").and_then(|v| v.as_u64()) {
+        // Floor of 250 ms: the control loop, serial I/O and sysfs writes all run
+        // on this cadence, so a tiny value is a self-inflicted denial of service
+        // on the very hardware the daemon is meant to protect.
+        //
+        // [SAFETY] Ceiling of 2000 ms, deliberately tighter than what
+        // `daemon.toml` accepts. This interval drives the sensor poll loop, and
+        // the thermal emergency rule's staleness budget is derived from it
+        // (5x, DEC-267) — so raising it directly widens how old a temperature
+        // that rule will still act on, and `StalenessConfig` moves with it.
+        //
+        // DEC-269 corrected the reasoning that used to sit here: it claimed the
+        // safety leg read the cache "with no age filter". That was true when
+        // written and is now false — there IS a filter, and this ceiling bounds
+        // its budget rather than substituting for it. A second, independent
+        // backstop caps the budget at `CPU_TEMP_STALE_CEILING_MS` regardless of how
+        // the admin file is set, so a hand-edited interval cannot silently
+        // disable the protection this endpoint is guarding.
+        // DEC-270: the admin file is no longer unbounded either — it is clamped
+        // to `MAX_SUPERVISABLE_POLL_INTERVAL_MS` (6000 ms) in
+        // `apply_runtime_overlay`, because past that the staleness budget stops
+        // tracking the cadence. This API ceiling is still much tighter, because
+        // this endpoint is reachable by any local user (the socket is 0666,
+        // DEC-049) while the admin file needs root.
+        Some(v) if (250..=2_000).contains(&v) => v,
+        Some(v) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("poll_interval_ms must be 250-2000, got {v}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing 'poll_interval_ms' (integer 250-2000)"),
+            );
+        }
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_poll_interval_ms(Some(ms));
+    persist_runtime(
+        &state,
+        &runtime,
+        "polling.poll_interval_ms",
+        serde_json::json!(ms),
+    )
+    .await
+}
+
+/// POST /config/serial-port — `{"port": "/dev/ttyACM0"}` or `{"port": null}`
+/// to clear the override and return to auto-detection.
+pub async fn update_serial_port_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let port: Option<String> = match body.get("port") {
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(
+                    "missing 'port' (a device path, or null to auto-detect)",
+                ),
+            );
+        }
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => {
+            // [SAFETY] Validate against the transport's OWN allowlist, not a
+            // private `/dev/` test. The daemon opens this path as root, and the
+            // endpoint is reachable by any local user (0666 socket, DEC-049).
+            // A second copy of a security check drifts: the previous `/dev/`
+            // test accepted `/dev/shm/...` and `/dev/mqueue/...` — the only
+            // world-writable, symlink-capable directories under /dev — which
+            // `RealSerialTransport::open` then rejected anyway.
+            if !crate::serial::real_transport::is_allowed_serial_path(s) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorEnvelope::validation(format!(
+                        "serial port must be a supported serial device path: {s}"
+                    )),
+                );
+            }
+            // Bound the length: an oversized value would push runtime.toml past
+            // the 4 MiB read cap, after which `load_from` treats the file as
+            // malformed and silently reverts EVERY runtime setting to defaults —
+            // which the next successful write then makes permanent.
+            if s.len() > 256 {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    &ErrorEnvelope::validation("serial port path must be 256 characters or fewer"),
+                );
+            }
+            Some(s.clone())
+        }
+        Some(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("'port' must be a string or null"),
+            );
+        }
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_serial_port(port.clone());
+    persist_runtime(&state, &runtime, "serial.port", serde_json::json!(port)).await
+}
+
+/// POST /config/serial-timeout — `{"timeout_ms": 50..=1000}`.
+pub async fn update_serial_timeout_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ms = match body.get("timeout_ms").and_then(|v| v.as_u64()) {
+        // [SAFETY] Ceiling of 1000 ms, tighter than the admin file allows. The
+        // thermal force writes the OpenFan channels one after another, so a
+        // wedged serial link costs up to `channels x timeout` before it reaches
+        // the last fan — at 5000 ms that is ~40 s for 8 channels. Since DEC-289
+        // the tick does not wait for that (it stops joining after
+        // `WRITE_JOIN_BUDGET` and the write finishes in the background), so
+        // safety evaluation carries on; what the ceiling still bounds is how
+        // long the force takes to land and how long the write-stall ladder
+        // reports "in flight" before "wedged" (`TS-am`). Same reasoning as the
+        // poll ceiling: the API is unprivileged-reachable, the file is not.
+        Some(v) if (50..=1_000).contains(&v) => v,
+        Some(v) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("timeout_ms must be 50-1000, got {v}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing 'timeout_ms' (integer 50-1000)"),
+            );
+        }
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_serial_timeout_ms(Some(ms));
+    persist_runtime(&state, &runtime, "serial.timeout_ms", serde_json::json!(ms)).await
+}
+
+/// POST /config/exit-floor — `{"exit_floor_pct": 0..=100}` (DEC-388).
+///
+/// The lowest duty a clean stop leaves an output at when it has no firmware
+/// mode to be given back to (OpenFan channels, hwmon headers with no
+/// `pwmN_enable`); `0` turns the exit floor off. **Applies live**, unlike the
+/// DEC-243 setters: the value is persisted first and only then put in force, so
+/// a failed persist changes nothing — the same order the search-dir setter
+/// uses. The full range is allowed: every value is safe, since the floor can
+/// only raise a duty, never lower one.
+pub async fn update_exit_floor_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let pct = match body.get("exit_floor_pct").and_then(|v| v.as_u64()) {
+        Some(v) if v <= 100 => v as u8,
+        Some(v) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("exit_floor_pct must be 0-100, got {v}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing 'exit_floor_pct' (integer 0-100)"),
+            );
+        }
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_exit_floor_pct(pct);
+    let runtime_owned = runtime.clone();
+    let path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&path)).await {
+        log::error!(
+            "Failed to persist shutdown.exit_floor_pct to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    state.cache.set_exit_floor_pct(pct);
+    log::info!("shutdown.exit_floor_pct set to {pct} (in force now)");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "key": "shutdown.exit_floor_pct",
+            "value": pct,
+            "note": "In force now; applies at the daemon's next stop",
+        })),
+    )
+}
+
+/// POST /config/coolant-limit — `{"coolant_limit_c": 40..=70}` (DEC-443).
+///
+/// The coolant temperature, in whole °C, at which a fresh coolant reading
+/// latches the thermal emergency's 100 % force (released 5 °C below). **Applies
+/// live**, persisted first and put in force only after the persist succeeds —
+/// the exit-floor handler's order, so a failed persist changes nothing. The
+/// range has no off switch by the user's decision: a limit above 70 would stop
+/// meaning anything, and below 40 an ordinary warm loop would trip it.
+pub async fn update_coolant_limit_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (lo, hi) = (
+        crate::constants::COOLANT_LIMIT_MIN_C,
+        crate::constants::COOLANT_LIMIT_MAX_C,
+    );
+    let limit = match body.get("coolant_limit_c").and_then(|v| v.as_u64()) {
+        Some(v) if (u64::from(lo)..=u64::from(hi)).contains(&v) => v as u8,
+        Some(v) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!("coolant_limit_c must be {lo}-{hi}, got {v}")),
+            );
+        }
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "missing 'coolant_limit_c' (whole degrees C, {lo}-{hi})"
+                )),
+            );
+        }
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_coolant_limit_c(limit);
+    let runtime_owned = runtime.clone();
+    let path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&path)).await {
+        log::error!(
+            "Failed to persist safety.coolant_limit_c to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    state.cache.set_coolant_limit_c(limit);
+    log::info!("safety.coolant_limit_c set to {limit} °C (in force from the next tick)");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "key": "safety.coolant_limit_c",
+            "value": limit,
+            "note": "In force from the next engine tick",
+        })),
+    )
+}
+
+/// Shared body parse for the two `[detection]` opt-ins.
+fn parse_enabled(body: &serde_json::Value) -> Result<bool, (StatusCode, Json<serde_json::Value>)> {
+    match body.get("enabled") {
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        Some(_) => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation("'enabled' must be a boolean"),
+        )),
+        None => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation("missing 'enabled' (boolean)"),
+        )),
+    }
+}
+
+/// POST /config/allow-port-probe — `{"enabled": bool}` (DEC-203 opt-in).
+///
+/// Persisting `true` is only half of enabling the probe: it also needs the
+/// `CAP_SYS_RAWIO` systemd drop-in, which this unprivileged-reachable endpoint
+/// cannot install. The response says so explicitly so a client cannot honestly
+/// report the feature as on.
+pub async fn update_allow_port_probe_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let enabled = match parse_enabled(&body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_allow_port_probe(Some(enabled));
+    let (status, mut resp) = persist_runtime(
+        &state,
+        &runtime,
+        "detection.allow_port_probe",
+        serde_json::json!(enabled),
+    )
+    .await;
+    if status == StatusCode::OK && enabled {
+        if let Some(obj) = resp.0.as_object_mut() {
+            obj.insert(
+                "requires_privilege".into(),
+                serde_json::json!(
+                    "also requires the CAP_SYS_RAWIO systemd drop-in \
+                     (superio-port-probe.conf.example)"
+                ),
+            );
+        }
+    }
+    (status, resp)
+}
+
+/// POST /config/nvidia-telemetry — `{"enabled": bool}` (DEC-204 opt-in).
+///
+/// Same half-a-requirement caveat as the port probe: the NVML backend also needs
+/// the `/dev/nvidia*` drop-in.
+pub async fn update_nvidia_telemetry_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let enabled = match parse_enabled(&body) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    runtime.set_enable_nvidia_telemetry(Some(enabled));
+    let (status, mut resp) = persist_runtime(
+        &state,
+        &runtime,
+        "detection.enable_nvidia_telemetry",
+        serde_json::json!(enabled),
+    )
+    .await;
+    if status == StatusCode::OK && enabled {
+        if let Some(obj) = resp.0.as_object_mut() {
+            obj.insert(
+                "requires_privilege".into(),
+                serde_json::json!(
+                    "also requires the /dev/nvidia* systemd drop-in \
+                     (nvidia-telemetry.conf.example)"
+                ),
+            );
+        }
+    }
+    (status, resp)
+}
+
+// ── AIO-MB Phase 4 (DEC-316): cooling-device topology ─────────────────────────
+
+/// Keys a client might send believing they set a safety number.
+///
+/// A cooling device selects a policy **by id**; the numbers live compiled into
+/// `hwmon::device_policy`, whose `DevicePolicy` derives no `Deserialize` so they
+/// are unconstructible from a payload. That already makes these keys inert — but
+/// silently ignoring them would let a caller believe it had tightened a pump
+/// floor when it had not, which is the more dangerous failure. So they are
+/// rejected explicitly, by name.
+const REJECTED_POLICY_KEYS: &[&str] = &[
+    "minimum_safe_pwm",
+    "minimum_safe_pwm_pct",
+    "supports_stop",
+    "startup_override_seconds",
+    "expected_rpm_min",
+    "expected_rpm_max",
+    "internal_control_possible",
+    "device_policy",
+    "effective_min_pwm_pct",
+    "stop_permitted",
+];
+
+/// Pull an optional string field, treating `null` and absent alike.
+fn opt_string_field(body: &serde_json::Value, field: &str) -> Result<Option<String>, String> {
+    match body.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("'{field}' must be a string or null")),
+    }
+}
+
+/// Pull an optional array-of-non-empty-strings field.
+fn member_list_field(body: &serde_json::Value, field: &str) -> Result<Vec<String>, String> {
+    match body.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .map(|v| match v {
+                serde_json::Value::String(s) if !s.is_empty() => Ok(s.clone()),
+                _ => Err(format!("'{field}' entries must be non-empty strings")),
+            })
+            .collect(),
+        Some(_) => Err(format!("'{field}' must be an array of strings")),
+    }
+}
+
+/// POST /config/cooling-device — create or replace one cooling device by id.
+///
+/// Persist-first, then commit in memory by rebuilding from the freshly persisted
+/// config, exactly as `update_header_role_handler` does, so the map handlers read
+/// and the file on disk cannot drift.
+///
+/// **No follow-on safety action, deliberately.** `update_header_role_handler`
+/// releases a live identify hold when a header becomes a pump, because that call
+/// changes `header_is_pump_protected`. This one cannot: the pump-protection union
+/// is role + label + liquid-cooler channel + the active profile's pump-named
+/// members (DEC-384), and reads no cooling device. Naming a
+/// header as a device's `pump_member` is a *description*, not a protection
+/// grant — a client that wants the floor assigns the role, and the GUI's
+/// Configure-AIO flow already posts `/config/header-role` before it posts here.
+pub async fn set_cooling_device_handler(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !body.is_object() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation("body must be a JSON object"),
+        );
+    }
+    for key in REJECTED_POLICY_KEYS {
+        if body.get(key).is_some() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "'{key}' is not settable — safety limits are daemon-owned. Select a \
+                     policy with 'device_policy_id' instead; the values it names are \
+                     compiled into the daemon."
+                )),
+            );
+        }
+    }
+
+    let id = match body.get("id") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+        _ => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation("missing or empty 'id'"),
+            );
+        }
+    };
+
+    let field = |f: &str| opt_string_field(&body, f);
+    let (name, kind, pump_member, preferred_sensor, fallback_sensor, coolant_sensor, policy_id) = {
+        let vals = [
+            field("name"),
+            field("kind"),
+            field("pump_member"),
+            field("preferred_sensor"),
+            field("fallback_sensor"),
+            field("coolant_sensor"),
+            field("device_policy_id"),
+        ];
+        let mut out = Vec::with_capacity(vals.len());
+        for v in vals {
+            match v {
+                Ok(x) => out.push(x),
+                Err(e) => {
+                    return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(e));
+                }
+            }
+        }
+        (
+            out[0].clone(),
+            out[1].clone(),
+            out[2].clone(),
+            out[3].clone(),
+            out[4].clone(),
+            out[5].clone(),
+            out[6].clone(),
+        )
+    };
+
+    let radiator_members = match member_list_field(&body, "radiator_members") {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(e));
+        }
+    };
+    let auxiliary_members = match member_list_field(&body, "auxiliary_members") {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(e));
+        }
+    };
+
+    // An unrecognised kind is rejected rather than defaulted, matching the role
+    // setter: a typo that silently became `unknown` would report success having
+    // stored something the caller did not ask for.
+    if let Some(k) = kind.as_deref() {
+        if crate::hwmon::cooling_device::CoolingDeviceKind::from_token(k).is_none() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "unknown kind '{k}' — expected one of: unknown, aio_liquid, \
+                     air_cooler, custom_loop"
+                )),
+            );
+        }
+    }
+    // Likewise an unrecognised policy id: on the *load* path an unknown id
+    // degrades to the conservative default with a warning (a file written by a
+    // newer daemon must still boot), but a live caller gets told.
+    if let Some(pid) = policy_id.as_deref() {
+        if !crate::hwmon::device_policy::POLICIES
+            .iter()
+            .any(|p| p.id == pid)
+        {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                &ErrorEnvelope::validation(format!(
+                    "unknown device_policy_id '{pid}' — this daemon ships: {}",
+                    crate::hwmon::device_policy::POLICIES
+                        .iter()
+                        .map(|p| p.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            );
+        }
+    }
+
+    // DEC-442: canonical ids, so a member or sensor carrying the it87 v2.0
+    // suffixed chip spelling addresses what discovery now publishes.
+    let dev = crate::hwmon::cooling_device::canonicalize_ids(
+        crate::hwmon::cooling_device::CoolingDeviceConfig {
+            id: id.clone(),
+            name: name.unwrap_or_default(),
+            kind: kind.unwrap_or_default(),
+            pump_member,
+            radiator_members,
+            auxiliary_members,
+            preferred_sensor,
+            fallback_sensor,
+            coolant_sensor,
+            device_policy_id: policy_id.unwrap_or_default(),
+        },
+    );
+
+    if let Err(reason) = crate::hwmon::cooling_device::validate_device(&dev) {
+        return error_response(StatusCode::BAD_REQUEST, &ErrorEnvelope::validation(reason));
+    }
+
+    // Members must exist, so a typo is caught at author time rather than
+    // producing a device that silently describes nothing. Checked against live
+    // discovery, like the role setter's id check — but across BOTH fan sources a
+    // cooling device may name, not hwmon alone (`AUD3-h`). See
+    // `cooling_device::unknown_member` for why the per-source skip is preserved.
+    let hwmon_ids: std::collections::HashSet<String> = state
+        .hwmon_controller
+        .as_ref()
+        .map(|c| c.headers().iter().map(|h| h.id.clone()).collect())
+        .unwrap_or_default();
+    let openfan_ids: std::collections::HashSet<String> = state
+        .cache
+        .snapshot()
+        .openfan_fans
+        .keys()
+        .map(|ch| crate::serial::openfan_member_id(*ch))
+        .collect();
+    if let Some(m) =
+        crate::hwmon::cooling_device::unknown_member(&dev.all_members(), &hwmon_ids, &openfan_ids)
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorEnvelope::validation(format!("unknown member id: {m}")),
+        );
+    }
+
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if !runtime.set_cooling_device(dev) {
+        return error_response(
+            StatusCode::CONFLICT,
+            &ErrorEnvelope::already_exists(format!(
+                "cooling device limit reached ({})",
+                crate::hwmon::cooling_device::MAX_COOLING_DEVICES
+            )),
+        );
+    }
+
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist cooling device '{id}' to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    *state.cooling_devices.write() = Arc::new(runtime.cooling_devices());
+
+    log::info!("Cooling device '{id}' saved (effective immediately)");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "id": id,
+        })),
+    )
+}
+
+/// DELETE /config/cooling-device/{id} — remove one cooling device.
+pub async fn delete_cooling_device_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let (_config_guard, mut runtime) = match runtime_for_update(&state).await {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    if !runtime.remove_cooling_device(&id) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            &ErrorEnvelope::not_found(format!("no cooling device with id: {id}")),
+        );
+    }
+
+    let runtime_owned = runtime.clone();
+    let rc_path = state.runtime_config_path.clone();
+    if let Err(e) = super::persist_off_runtime(move || runtime_owned.save_to(&rc_path)).await {
+        log::error!(
+            "Failed to persist cooling device removal '{id}' to {}: {e}",
+            state.runtime_config_path.display()
+        );
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorEnvelope::persistence_failed("failed to persist runtime configuration"),
+        );
+    }
+    *state.cooling_devices.write() = Arc::new(runtime.cooling_devices());
+
+    log::info!("Cooling device '{id}' removed");
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "api_version": API_VERSION,
+            "updated": true,
+            "id": id,
+        })),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SYSTEM_PROFILE_DIR;
+
+    // ── `TS-aq`: a SIGHUP reload is serialised with the setters ─────────────
+
+    /// The reload must wait for a setter holding `config_write`, or it can read
+    /// the files before the setter writes them and apply that stale value after.
+    /// Asserted as "does not run while the lock is held", then "does run once it
+    /// is released" — the presence half, so a reload that never runs cannot pass.
+    #[tokio::test]
+    async fn a_config_reload_waits_for_a_setter_holding_config_write() {
+        let (state, _writes, _tx, _tmp) = super::super::hwmon_ctl::tests::build_verify_state_with(
+            None,
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            None,
+        );
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let setter = state.config_write.lock().await;
+
+        let flag = Arc::clone(&ran);
+        let mut reload = tokio::spawn(reload_under_config_write(state.clone(), move |_| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }));
+
+        let early = tokio::time::timeout(std::time::Duration::from_millis(200), &mut reload).await;
+        assert!(
+            early.is_err() && !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the reload ran while a setter held config_write"
+        );
+
+        drop(setter);
+        tokio::time::timeout(std::time::Duration::from_secs(5), reload)
+            .await
+            .expect("the reload runs once the setter releases the lock")
+            .expect("the reload task did not panic");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ── dir_list_field ────────────────────────────────────────────────
+
+    #[test]
+    fn absent_and_null_fields_read_as_none() {
+        let body = serde_json::json!({ "remove": null });
+        assert_eq!(dir_list_field(&body, "add").unwrap(), None);
+        assert_eq!(dir_list_field(&body, "remove").unwrap(), None);
+    }
+
+    #[test]
+    fn a_non_string_entry_is_an_error_not_a_silent_drop() {
+        // REGRESSION: the previous `filter_map(as_str)` made `{"add": [null]}`
+        // indistinguishable from `{"add": []}` — the handler reported success
+        // having applied nothing.
+        let body = serde_json::json!({ "add": ["/a", 7] });
+        let msg = dir_list_field(&body, "add").expect_err("a non-string entry must be rejected");
+        assert!(
+            msg.contains("array of strings"),
+            "unexpected message: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_non_array_value_is_rejected() {
+        let body = serde_json::json!({ "add": "/a" });
+        assert!(dir_list_field(&body, "add").is_err());
+    }
+
+    #[test]
+    fn an_empty_array_is_an_explicit_empty_list() {
+        let body = serde_json::json!({ "add": [] });
+        assert_eq!(dir_list_field(&body, "add").unwrap(), Some(vec![]));
+    }
+
+    // ── validate_search_dir_edit ──────────────────────────────────────
+
+    #[test]
+    fn shape_rules_apply_to_removals_too() {
+        // The lexical containment check in `confine_removed_dirs` is only sound
+        // because `..` never reaches it.
+        assert!(validate_search_dir_edit(&[], &v(&["relative/path"])).is_err());
+        assert!(validate_search_dir_edit(&[], &v(&["/a/../../etc"])).is_err());
+        assert!(validate_search_dir_edit(&v(&["/a/../b"]), &[]).is_err());
+        assert!(validate_search_dir_edit(&v(&["/ok"]), &v(&["/also/ok"])).is_ok());
+    }
+
+    #[test]
+    fn the_system_profile_dir_may_never_be_removed() {
+        let msg = validate_search_dir_edit(&[], &v(&[SYSTEM_PROFILE_DIR]))
+            .expect_err("the system dir must be protected");
+        assert!(
+            msg.contains(SYSTEM_PROFILE_DIR),
+            "the rejection must name the directory: {msg}"
+        );
+        // Adding it back is fine — only removal is refused.
+        assert!(validate_search_dir_edit(&v(&[SYSTEM_PROFILE_DIR]), &[]).is_ok());
+    }
+
+    // ── merge_search_dirs ─────────────────────────────────────────────
+
+    #[test]
+    fn removal_prunes_and_addition_appends() {
+        let current = v(&[SYSTEM_PROFILE_DIR, "/home/u/old", "/home/u/keep"]);
+        let out =
+            merge_search_dirs(&current, &v(&["/home/u/new"]), &v(&["/home/u/old"]), None).unwrap();
+        assert_eq!(out, v(&[SYSTEM_PROFILE_DIR, "/home/u/keep", "/home/u/new"]));
+    }
+
+    #[test]
+    fn removing_an_absent_dir_is_a_no_op_not_an_error() {
+        let current = v(&[SYSTEM_PROFILE_DIR]);
+        let out = merge_search_dirs(&current, &[], &v(&["/never/registered"]), None).unwrap();
+        assert_eq!(out, current, "an idempotent remove must succeed unchanged");
+    }
+
+    #[test]
+    fn adding_an_existing_dir_does_not_duplicate_it() {
+        let current = v(&[SYSTEM_PROFILE_DIR, "/home/u/p"]);
+        let out = merge_search_dirs(&current, &v(&["/home/u/p"]), &[], None).unwrap();
+        assert_eq!(out, current);
+    }
+
+    #[test]
+    fn a_path_in_both_lists_survives() {
+        // Removals run first, so `add` wins. Re-registering the directory you
+        // are already using must never be able to un-register it.
+        let current = v(&[SYSTEM_PROFILE_DIR, "/home/u/p"]);
+        let out =
+            merge_search_dirs(&current, &v(&["/home/u/p"]), &v(&["/home/u/p"]), None).unwrap();
+        assert!(
+            out.contains(&"/home/u/p".to_string()),
+            "add must win: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_edit_that_would_empty_the_search_path_is_rejected() {
+        // `activate_profile` resolves against this list; emptying it is an
+        // unrecoverable soft-lock reachable from an unprivileged API call.
+        let current = v(&["/home/u/only"]);
+        let msg = merge_search_dirs(&current, &[], &v(&["/home/u/only"]), None)
+            .expect_err("emptying the search path must be refused");
+        assert!(msg.contains("at least one"), "unexpected message: {msg}");
+        // …but the same removal paired with a replacement is fine.
+        assert!(
+            merge_search_dirs(&current, &v(&["/home/u/new"]), &v(&["/home/u/only"]), None).is_ok()
+        );
+    }
+
+    #[test]
+    fn the_profile_store_directory_cannot_be_removed() {
+        // REGRESSION (self-review P1): `profile.rs::store_dir()` is
+        // `profile_search_dirs.first()`, and it is the write target for profile
+        // create and delete. Dropping it from the live list would silently
+        // redirect every profile write to whatever became first, for the rest of
+        // the process's life — `with_store_dir` only re-prepends it at boot and
+        // on SIGHUP. Reachable by root/CLI, which `confine_removed_dirs` exempts.
+        let store = "/var/lib/ventulus/profiles";
+        let current = v(&[store, SYSTEM_PROFILE_DIR, "/home/u/p"]);
+
+        let msg = merge_search_dirs(&current, &[], &v(&[store]), Some(store))
+            .expect_err("the store dir must be protected");
+        assert!(msg.contains(store), "the rejection must name it: {msg}");
+
+        // Removing something else is unaffected, and the store stays first.
+        let out = merge_search_dirs(&current, &[], &v(&["/home/u/p"]), Some(store)).unwrap();
+        assert_eq!(out.first().map(String::as_str), Some(store));
+
+        // REGRESSION (contract review P1): removing and re-adding it in ONE
+        // request must be refused, not blessed. The first cut of this guard
+        // checked membership, and this exact request passed it — the filter
+        // drops the store from index 0 and the append puts it back at the END,
+        // so it survives, is displaced, and `store_dir()` silently starts
+        // returning a different directory. The old test asserted `is_ok()` here
+        // and no order at all, which is how the hole shipped.
+        let msg = merge_search_dirs(&current, &v(&[store]), &v(&[store]), Some(store))
+            .expect_err("displacing the store dir must be refused, not merely surviving it");
+        assert!(msg.contains(store), "the rejection must name it: {msg}");
+
+        // Position is the property, so assert it directly on every accepted
+        // edit — membership alone is what let this through the first time.
+        for (add, remove) in [
+            (v(&["/home/u/new"]), vec![]),
+            (vec![], v(&["/home/u/p"])),
+            (v(&["/home/u/new"]), v(&["/home/u/p"])),
+        ] {
+            let out = merge_search_dirs(&current, &add, &remove, Some(store)).unwrap();
+            assert_eq!(
+                out.first().map(String::as_str),
+                Some(store),
+                "the store dir must stay at index 0 for add={add:?} remove={remove:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn emptying_is_reported_as_emptying_even_when_the_store_dir_is_the_casualty() {
+        // Both guards apply when the sole entry IS the store dir. The empty
+        // check runs first because "you cannot remove the last one" is the
+        // message that explains the situation; naming the store dir there would
+        // be true but less useful.
+        let only = v(&["/var/lib/ventulus/profiles"]);
+        let msg = merge_search_dirs(&only, &[], &only, Some(&only[0]))
+            .expect_err("removing the sole entry must be refused");
+        assert!(msg.contains("at least one"), "unexpected message: {msg}");
+    }
+
+    #[test]
+    fn order_of_the_surviving_entries_is_preserved() {
+        // The daemon searches in order, so a reshuffle would silently change
+        // which copy of a duplicated profile id wins.
+        let current = v(&["/a", "/b", "/c", "/d"]);
+        let out = merge_search_dirs(&current, &[], &v(&["/c"]), None).unwrap();
+        assert_eq!(out, v(&["/a", "/b", "/d"]));
+    }
+
+    // ── FFA-c: spelling variants and bounds ───────────────────────────
+
+    #[test]
+    fn spelling_variants_of_one_dir_are_one_entry() {
+        // Each of these passed the `..` check and confinement and used to be
+        // stored as a new raw entry, so repeated adds grew `runtime.toml`.
+        let current = v(&["/etc/ventulus/profiles", "/home/u/p"]);
+        for variant in ["/home/u/./p", "/home/u//p", "/home/u/p/", "//home/u/p"] {
+            let out = merge_search_dirs(&current, &v(&[variant]), &[], None).unwrap();
+            assert_eq!(out, current, "{variant} must be a duplicate");
+            let out = merge_search_dirs(&current, &[], &v(&[variant]), None).unwrap();
+            assert_eq!(
+                out,
+                v(&["/etc/ventulus/profiles"]),
+                "{variant} must remove it"
+            );
+        }
+        // A new directory is stored in its normal form.
+        let out = merge_search_dirs(&current, &v(&["/home/u/./q/"]), &[], None).unwrap();
+        assert_eq!(out.last().map(String::as_str), Some("/home/u/q"));
+    }
+
+    #[test]
+    fn an_add_past_the_cap_is_refused() {
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+        let full: Vec<String> = (0..max).map(|i| format!("/d{i}")).collect();
+        let msg = merge_search_dirs(&full, &v(&["/one-more"]), &[], None)
+            .expect_err("an add past the cap must be refused");
+        assert!(
+            msg.contains(&max.to_string()),
+            "the message names the cap: {msg}"
+        );
+        // One below the cap still takes an add, so the bound is exactly the cap.
+        assert!(merge_search_dirs(&full[1..], &v(&["/one-more"]), &[], None).is_ok());
+        // A move at the cap does not grow the list and is accepted.
+        let moved = merge_search_dirs(&full, &v(&["/one-more"]), &v(&["/d3"]), None).unwrap();
+        assert_eq!(moved.len(), max);
+    }
+
+    #[test]
+    fn a_list_already_over_the_cap_can_still_shrink() {
+        // A runtime.toml written before the cap may hold more; it must stay
+        // editable downwards.
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+        let over: Vec<String> = (0..max + 5).map(|i| format!("/d{i}")).collect();
+        let out = merge_search_dirs(&over, &[], &v(&["/d0"]), None).unwrap();
+        assert_eq!(out.len(), max + 4);
+        assert!(merge_search_dirs(&over, &v(&["/new"]), &[], None).is_err());
+    }
+
+    #[test]
+    fn an_overlong_path_or_request_is_refused() {
+        let max_bytes = crate::constants::MAX_PROFILE_SEARCH_DIR_BYTES;
+        let at_cap = format!("/{}", "a".repeat(max_bytes - 1));
+        let over_cap = format!("/{}", "a".repeat(max_bytes));
+        assert!(validate_search_dir_edit(&[at_cap], &[]).is_ok());
+        assert!(validate_search_dir_edit(std::slice::from_ref(&over_cap), &[]).is_err());
+        assert!(validate_search_dir_edit(&[], &[over_cap]).is_err());
+
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+        let many: Vec<String> = (0..=max).map(|i| format!("/d{i}")).collect();
+        assert!(validate_search_dir_edit(&many, &[]).is_err());
+        assert!(validate_search_dir_edit(&many[1..], &[]).is_ok());
+    }
+
+    #[test]
+    fn the_system_dir_cannot_be_removed_by_another_spelling() {
+        let respelled = format!("{SYSTEM_PROFILE_DIR}/");
+        assert!(validate_search_dir_edit(&[], &v(&[&respelled])).is_err());
+        // The merge refuses too: the handler adds a removal's real-path
+        // spelling, which the shape check never sees.
+        let current = v(&["/store", SYSTEM_PROFILE_DIR, "/home/u/p"]);
+        let msg = merge_search_dirs(&current, &[], &v(&[SYSTEM_PROFILE_DIR]), Some("/store"))
+            .expect_err("the system dir must stay");
+        assert!(msg.contains(SYSTEM_PROFILE_DIR), "{msg}");
+    }
+
+    #[test]
+    fn one_user_cannot_take_more_than_its_share_of_the_search_path() {
+        // Security review S3: without a share one user could fill the global cap
+        // and lock every other user out, with no way to remove the entries.
+        use super::super::path_confine::Confinement;
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS_PER_USER;
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().to_path_buf();
+        let who = Confinement::of(Some(1000), |_| Some(home_path.clone())).unwrap();
+        let mine = |n: usize| -> Vec<String> {
+            (0..n)
+                .map(|i| home.path().join(format!("d{i}")).display().to_string())
+                .collect()
+        };
+        let current = [v(&["/store", SYSTEM_PROFILE_DIR]), mine(max)].concat();
+
+        let grown = [current.clone(), mine(max + 1)[max..].to_vec()].concat();
+        let msg = within_user_share(&current, grown.clone(), &who)
+            .expect_err("a share past the cap must be refused");
+        assert!(msg.contains(&max.to_string()), "{msg}");
+        // Exactly the share is accepted.
+        let at_share = [v(&["/store"]), mine(max)].concat();
+        assert!(within_user_share(&current, at_share, &who).is_ok());
+        // Entries outside the caller's home are not its share.
+        let others = [current.clone(), v(&["/home/someone-else/p"])].concat();
+        assert!(within_user_share(&current, others, &who).is_ok());
+        // A list already over the share can shrink.
+        let over = [v(&["/store"]), mine(max + 2)].concat();
+        let shrunk = [v(&["/store"]), mine(max + 1)].concat();
+        assert!(within_user_share(&over, shrunk, &who).is_ok());
+        // Root has no share.
+        assert!(within_user_share(&current, grown, &Confinement::Unconfined).is_ok());
+    }
+
+    #[test]
+    fn a_full_search_dir_list_fits_well_inside_the_runtime_config_read_cap() {
+        // The realised artefact: the cap exists so `runtime.toml` stays
+        // readable, so measure the file the daemon writes at the cap, with
+        // every path at the length cap.
+        let max = crate::constants::MAX_PROFILE_SEARCH_DIRS;
+        let max_bytes = crate::constants::MAX_PROFILE_SEARCH_DIR_BYTES;
+        let dirs: Vec<String> = (0..max)
+            .map(|i| format!("/{i:02}{}", "a".repeat(max_bytes - 3)))
+            .collect();
+        assert!(dirs.iter().all(|d| d.len() == max_bytes));
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runtime.toml");
+        let mut runtime = RuntimeConfig::default();
+        runtime.set_profile_search_dirs(dirs.clone());
+        runtime.save_to(&path).unwrap();
+
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            on_disk <= crate::atomic_io::MAX_CONFIG_BYTES / 8,
+            "{on_disk} bytes on disk"
+        );
+        let (loaded, degraded) =
+            RuntimeConfig::load_from_reporting(&path, crate::runtime_config::LoadPhase::Startup);
+        assert!(degraded.is_none());
+        assert_eq!(loaded.profile_search_dirs(), Some(&dirs[..]));
+    }
+}

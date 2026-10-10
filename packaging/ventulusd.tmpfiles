@@ -1,0 +1,14 @@
+# Installed as /usr/lib/tmpfiles.d/ventulusd.conf.
+#
+# The Ventulus rename, for the 5.x series only (removed in 6.0): a client built
+# for Control-OFC 4.x -- an older GUI, a script, a monitoring check -- still
+# reaches the daemon at the old socket path. Only the socket is linked: a link
+# of the whole directory would point the old file name, control-ofc.sock, at a
+# file /run/ventulus never holds.
+#
+# Plain L, never L+: an existing file at the old path is left alone. It can be
+# the socket of a control-ofc-daemon that is still running, and removing it
+# would hide that daemon from ventulusd's startup probe (two fan writers).
+# ventulusd-carryover replaces a stale one once the old daemon is stopped.
+d /run/control-ofc 0755 root root -
+L /run/control-ofc/control-ofc.sock - - - - /run/ventulus/ventulus.sock
