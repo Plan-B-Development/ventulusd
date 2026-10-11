@@ -28,11 +28,6 @@ install) are in the [Install section of the top-level
 README](../README.md#install), which also covers the one-off `pacman -U` path
 using the clean-room package attached to every release.
 
-> **The AUR package is no longer updated** (DEC-240). `ventulusd` was
-> published to the AUR through v2.13.0 and is frozen there; releases now go to
-> GitHub only. The top-level README has the migration note for existing
-> `paru -S ventulusd` installs.
-
 **Build the package yourself:** `cd packaging && makepkg -si` builds the tagged
 release from source and installs it. It fetches the release tarball, not your
 checkout.

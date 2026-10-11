@@ -50,9 +50,8 @@ only when its menu is about to be shown, and is otherwise asleep.
   report one, or *daemon unavailable* when it could not be reached;
 - a greyed warning line when the daemon reports a thermal state other than
   normal: *⚠ Thermal emergency — fans forced to maximum*, *⚠ No CPU
-  temperature — fans held at a safety floor*, from a daemon older than
-  2.50.0 *⚠ Thermal recovery — fans held elevated*, or, for a state this
-  tray does not know, *⚠ Thermal state:* and the daemon's own name for it;
+  temperature — fans held at a safety floor*, or, for a state this tray
+  does not know, *⚠ Thermal state:* and the daemon's own name for it;
 - a greyed line when the last profile change you made did not happen (see
   below);
 - *Profile*, listing every profile the daemon knows, with the active one
@@ -80,9 +79,9 @@ stays until a later change succeeds.
 ## Double-click
 
 The StatusNotifierItem protocol has no double-click. Plasma routes a left
-click straight to _Activate_, so a double click opens the GUI twice. From
-ventulus 2.68.0 the GUI is single-instance and the second launch raises
-the first window instead of starting a second copy.
+click straight to _Activate_, so a double click launches the GUI twice. The
+GUI is single-instance, so the second launch raises the first window instead
+of starting a second copy.
 
 On Wayland, raising an existing window is subject to the compositor's
 focus-stealing prevention. With KWin's default setting this normally succeeds,

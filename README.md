@@ -146,18 +146,6 @@ makepkg -si
 > verifiable, use the release asset and check its Sigstore attestation with the
 > `gh attestation verify` command above.
 
-> **The AUR package is no longer updated.** `ventulusd` was published
-> to the AUR through v2.13.0 and is frozen there. The AUR is a third-party
-> service that goes read-only for maintenance without warning — the 2026-08-02
-> freeze took the *entire* AUR down to two accepted pushes in a day — so
-> releases now go to GitHub only. If you installed with
-> `paru -S ventulusd`, the prebuilt-package command above upgrades it
-> in place: it is the same `ventulusd` package name, so `pacman -U`
-> simply replaces the AUR copy, and no AUR helper will try to pull you back to
-> the older frozen version. This applies to *this* package only — the
-> out-of-tree DKMS drivers in the prerequisites table above are separate
-> third-party AUR packages and are installed from the AUR as before.
-
 ## Quick start
 
 Once the package is installed and the service enabled (see Install above), check

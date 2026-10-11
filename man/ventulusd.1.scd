@@ -89,8 +89,8 @@ _/etc/ventulus/daemon.toml_
 	or an out-of-range value makes the daemon exit at startup, and systemd
 	keeps restarting it, with nothing controlling the fans, until the file
 	is fixed. After an edit, *systemctl reload ventulusd* applies
-	the profile search directories and the exit floor; every other key
-	needs a restart. Moving _state_dir_ or _socket_path_ also needs a
+	the profile search directories, the exit floor and the coolant limit;
+	every other key needs a restart. Moving _state_dir_ or _socket_path_ also needs a
 	*ReadWritePaths=* drop-in, because the unit uses *ProtectSystem=strict*.
 	The daemon refuses to start (exit 1) if another user can write the
 	directory _socket_path_ goes in (sticky bit or not), owns a directory
