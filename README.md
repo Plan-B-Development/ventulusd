@@ -14,7 +14,7 @@ hardware itself. The package also installs `ventulus-tray`, a KDE system-tray ic
 
 | Hardware | Support |
 |---|---|
-| OpenFan Controller (USB, 10 channels) | Full control |
+| OpenFAN controller (USB, 10 channels) | Full control |
 | Motherboard fan headers, and other fan controllers with a kernel hwmon driver (such as the ARCTIC Fan Controller) | Full control on most boards; newer Gigabyte, MSI and some ASRock boards need an out-of-tree driver first |
 | Liquid coolers with a kernel driver (NZXT Kraken, Aquacomputer) | Coolant temperature, and pump and fan control where the driver allows it |
 | AMD GPU fans, RX 7000 / RX 9000 | Full control through the card's firmware fan curve; needs one kernel parameter |
@@ -86,7 +86,7 @@ local user and has no authentication. Only the daemon writes fan speeds.
 
 It also owns thermal safety, and none of it can be turned off:
 
-- At the CPU emergency limit, every OpenFan channel and writable motherboard
+- At the CPU emergency limit, every OpenFAN channel and writable motherboard
   header runs at 100 % until a current reading is 80 °C or lower. The limit is at
   least 105 °C, and up to 115 °C on a CPU that reports its own ceiling.
 - A coolant sensor at or above `[safety] coolant_limit_c` (60 °C by default) does
@@ -96,7 +96,7 @@ It also owns thermal safety, and none of it can be turned off:
 - A pump is never stopped and never driven below 30 %, or 70 % on a header in DC
   mode. A pump that stalls is driven to 100 %.
 - When the daemon stops, every motherboard header and GPU fan curve it took goes
-  back to what it was doing before. OpenFan channels, which have nothing to go
+  back to what it was doing before. OpenFAN channels, which have nothing to go
   back to, stay at their last speed or the exit floor (50 % by default),
   whichever is higher.
 
@@ -108,7 +108,7 @@ are in the [User Guide § Safety](https://github.com/Plan-B-Development/ventulus
 
 | Document | For | Covers |
 |---|---|---|
-| [User Guide](https://github.com/Plan-B-Development/ventulusd/blob/main/docs/USER_GUIDE.md) | operators | Sensor drivers, configuration, the service, profiles, the OpenFan Controller, GPU fans, safety, troubleshooting, uninstalling |
+| [User Guide](https://github.com/Plan-B-Development/ventulusd/blob/main/docs/USER_GUIDE.md) | operators | Sensor drivers, configuration, the service, profiles, the OpenFAN controller, GPU fans, safety, troubleshooting, uninstalling |
 | `man ventulusd`, `man ventulus-tray` | operators | Options, files, environment and signals |
 | [GUI manual](https://github.com/Plan-B-Development/ventulus/blob/main/manual/README.md) | everyone | Setting up and using Ventulus, driver setup, hardware troubleshooting |
 | [API contract](https://github.com/Plan-B-Development/ventulus/blob/main/docs/08_API_Integration_Contract.md) | script and client authors | Every endpoint, payload, error code and capability flag |

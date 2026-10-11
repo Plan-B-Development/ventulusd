@@ -18,12 +18,12 @@ switching and to the GUI without keeping the full GUI running.
 It is a *client*, not a controller. It calls the daemon's HTTP API over the
 Unix socket and nothing else: it holds no lease, writes no PWM, evaluates no
 fan curve, and reads no hardware. The daemon has no knowledge of the tray and
-no dependency on it — stopping the tray, or never starting it, changes nothing
+no dependency on it: stopping the tray, or never starting it, changes nothing
 about fan control, thermal safety, or profile execution.
 
 Written in Rust and deliberately toolkit-free: no Qt, GTK, OpenGL, Vulkan or
 Mesa library is loaded into the process, so it cannot interfere with a
-GPU-heavy workload. It runs no timer and no polling loop — it reads the daemon
+GPU-heavy workload. It runs no timer and no polling loop: it reads the daemon
 only when its menu is about to be shown, and is otherwise asleep.
 
 # OPTIONS
@@ -68,7 +68,7 @@ deduplicated by id rather than by name.
 Selecting a profile sends the change to the daemon and then re-reads it, so
 what the menu shows afterwards is what the daemon actually applied, not what
 was requested. If the change did not happen, the menu says so on a greyed
-line below the header and any thermal line — *⚠ Profile not switched — <profile> is still active*,
+line below the header and any thermal line: *⚠ Profile not switched — <profile> is still active*,
 *⚠ Not stopped — <profile> is still controlling the fans*, or, when the daemon
 did not answer the re-read either, *⚠ Profile switch failed, and the daemon is
 not answering* or *⚠ Stop failed, and the daemon is not answering*. The line
@@ -109,7 +109,7 @@ The tray starts automatically at login via
 _/etc/xdg/autostart/ventulus-tray.desktop_. Only one tray runs per user.
 
 The autostart entry names ventulus in its _TryExec_ field, so on a
-headless or daemon-only installation — where the GUI is not installed — the
+headless or daemon-only installation, where the GUI is not installed, the
 tray is not started at all.
 
 # TROUBLESHOOTING

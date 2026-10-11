@@ -6,9 +6,9 @@ same package is likewise MIT (`tray/Cargo.toml`). Both depend on third-party
 crates under their own licenses, including two whose license differs from MIT
 and which are called out here for transparency:
 
-- **serialport** (4.9.0) — **Mozilla Public License 2.0 (MPL-2.0)**.
+- **serialport** (4.9.0): **Mozilla Public License 2.0 (MPL-2.0)**.
   <https://github.com/serialport/serialport-rs>
-- **ksni** (0.3.6) — **The Unlicense**, used by `ventulus-tray` for the
+- **ksni** (0.3.6): **The Unlicense**, used by `ventulus-tray` for the
   StatusNotifierItem / dbusmenu implementation (DEC-352).
   <https://github.com/iovxw/ksni>
 
@@ -19,8 +19,8 @@ own files and is satisfied by that project's public upstream repository and its
 crates.io publication.
 
 The Unlicense is a public-domain dedication, not a copyleft licence. It imposes
-no condition of any kind — no re-linking obligation, no source-availability
-obligation, not even attribution — so it places no requirement on this project
+no condition of any kind (no re-linking obligation, no source-availability
+obligation, not even attribution), so it places no requirement on this project
 or on anyone redistributing it. It is recorded here only because it is not the
 MIT licence the rest of the tree carries. It is OSI-approved and listed by the
 FSF as Free/Libre.
@@ -35,8 +35,8 @@ which are distributed under the **GNU General Public License v2.0**.
 <https://github.com/frankcrawford/it87>
 
 What the daemon carries is the factual content of their `label inN`, `compute inN`
-and `ignore inN` lines — which board rail each Super-I/O voltage input is wired to,
-the divider ratio on it, and which inputs a board's configuration does not map — re-expressed
+and `ignore inN` lines (which board rail each Super-I/O voltage input is wired to,
+the divider ratio on it, and which inputs a board's configuration does not map), re-expressed
 as a Rust table keyed the way those configurations key it (chip and Gigabyte SIV).
 No configuration file is copied or shipped. The generated file's header records the
 upstream commit it was produced from. The same approach was already taken for the

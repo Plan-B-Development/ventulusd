@@ -2,7 +2,7 @@
 
 `ventulusd` is the fan control daemon for Ventulus. It drives:
 
-- an **OpenFan Controller**, a USB fan controller with up to 10 channels;
+- an **OpenFAN controller**, a USB fan controller with up to 10 channels;
 - **motherboard fan headers**, and other fan controllers with a kernel hwmon
   driver, through `/sys/class/hwmon`;
 - **AMD GPU fans**, through the firmware fan curve of an RX 7000 or RX 9000.
@@ -21,7 +21,7 @@ so can your scripts be (§ Scripting the daemon). No client writes a fan.
 > **New to Ventulus?** The GUI manual walks through setup step by step. Start
 > with the [Setup Checklist](https://github.com/Plan-B-Development/ventulus/blob/main/manual/setup-checklist.md);
 > [Understanding Motherboard Fan Control](https://github.com/Plan-B-Development/ventulus/blob/main/manual/understanding-fan-control.md)
-> explains the background, and [OpenFan Controller](https://github.com/Plan-B-Development/ventulus/blob/main/manual/openfan-controller.md)
+> explains the background, and [OpenFAN Controller](https://github.com/Plan-B-Development/ventulus/blob/main/manual/openfan-controller.md)
 > covers that device.
 
 ## Supported hardware
@@ -32,7 +32,7 @@ so can your scripts be (§ Scripting the daemon). No client writes a fan.
 | GPU temperature (AMD `amdgpu`, Intel Arc `xe` / `i915`, NVIDIA `nouveau` or opt-in NVML) | Yes | — |
 | Disk temperature (NVMe) | Yes | — |
 | Motherboard temperatures (ITE, Nuvoton) | Yes | — |
-| OpenFan Controller fans | Yes | Yes |
+| OpenFAN controller fans | Yes | Yes |
 | Motherboard fan headers (hwmon) | Yes | Yes |
 | AMD GPU fans, RX 7000 / RX 9000 | Yes | Yes, through the firmware (PMFW) fan curve |
 | AMD GPU fans, RX 6000 and older | Yes | Fan test and reset only. No profile drives them, so the card's own curve stays in charge |
@@ -72,7 +72,7 @@ itself, because the chips sit on ISA ports:
 | Module | Chipset | Common boards |
 |--------|---------|---------------|
 | `nct6775` | Nuvoton NCT6775–NCT6799 (incl. NCT5585D and the ASUS NCT6701D, which it reports as `nct6799`) | ASUS (AM4 500-series onward, Intel), ASRock, older MSI (AM4 300/400, the original X570 boards, Intel ≤ 300-series) |
-| `it87` | ITE IT87xx/IT86xx — the in-kernel driver covers only older parts plus IT8689E (7.1+) and IT87952E (6.3+); IT8686E/IT8688E/IT8696E/IT8665E need `it87-dkms-git` | Gigabyte; ASUS AM4 300/400-series (IT8665E) |
+| `it87` | ITE IT87xx/IT86xx: the in-kernel driver covers only older parts plus IT8689E (7.1+) and IT87952E (6.3+); IT8686E/IT8688E/IT8696E/IT8665E need `it87-dkms-git` | Gigabyte; ASUS AM4 300/400-series (IT8665E) |
 | `w83627ehf` | Winbond W83627EHF/DHG | Older boards |
 | `drivetemp` | SATA/SAS drive temperature | All SATA drives |
 
@@ -271,7 +271,7 @@ a restart (`requires_restart`), and whether one is waiting now
 | `profiles.search_dirs` | `POST /config/profile-search-dirs` | Add and remove directories (§ Profile search directories). Applies at once |
 | `startup.delay_secs` | `POST /config/startup-delay` | 0–30. After a restart |
 | `polling.poll_interval_ms` | `POST /config/poll-interval` | 250–2000 through the API, after a restart. The cap bounds how stale a temperature the thermal emergency can act on |
-| `serial.port` | `POST /config/serial-port` | A `/dev/ttyS*`, `ttyUSB*`, `ttyACM*`, `ttyAMA*` or `/dev/serial/` path of up to 256 characters, or `null` to auto-detect. After a restart. The service itself can open only `ttyACM` and `ttyUSB` nodes (§ Serial permissions). A port that does not answer as an OpenFan Controller falls back to auto-detection |
+| `serial.port` | `POST /config/serial-port` | A `/dev/ttyS*`, `ttyUSB*`, `ttyACM*`, `ttyAMA*` or `/dev/serial/` path of up to 256 characters, or `null` to auto-detect. After a restart. The service itself can open only `ttyACM` and `ttyUSB` nodes (§ Serial permissions). A port that does not answer as an OpenFAN controller falls back to auto-detection |
 | `serial.timeout_ms` | `POST /config/serial-timeout` | 50–1000 through the API, after a restart |
 | `detection.allow_port_probe` | `POST /config/allow-port-probe` | Also needs the `superio-port-probe.conf.example` drop-in |
 | `detection.enable_nvidia_telemetry` | `POST /config/nvidia-telemetry` | Also needs the `nvidia-telemetry.conf.example` drop-in |
@@ -393,8 +393,8 @@ quietly stop. The unit file's own comments
   `ventulus: the daemon could not widen its watchdog for this sleep` or
   `ventulus: the daemon did not acknowledge the sleep within 2 s` when that went
   wrong, and a slow resume may then restart the daemon.
-- **After a resume or an OpenFan Controller reconnect,** the daemon cannot tell
-  whether each OpenFan channel it had written still runs at that speed. The
+- **After a resume or an OpenFAN controller reconnect,** the daemon cannot tell
+  whether each OpenFAN channel it had written still runs at that speed. The
   controller keeps its speeds when only USB drops, but restarts every fan at
   about 1000 rpm when its 12 V supply went off. So the daemon remembers the
   speed each channel had and writes it again: on the next tick for a channel
@@ -515,7 +515,7 @@ service is running.
 cleared state is saved, so a restart does not bring the profile back. Activating or
 deactivating clears every manual override. On the next tick each motherboard header
 and AMD GPU fan the old profile drove and the new one does not name is given back
-(§ Safety); an OpenFan channel, or a header with no automatic mode, is left at its
+(§ Safety); an OpenFAN channel, or a header with no automatic mode, is left at its
 last duty or the exit minimum, whichever is higher, or 100 % if its last duty is
 unknown.
 
@@ -709,7 +709,7 @@ That assignment is saved in `runtime.toml`, takes effect at once, and also earns
 the header the 30 % pump floor and the stop-snap exemption. Assigning `pump` to a
 header an identify is holding stopped releases that stop. The roles are `pump`,
 `cpu_fan`, `radiator_fan`, `chassis_fan`, `no_fan` (nothing plugged in) and
-`unknown`; `null` clears an assignment. An OpenFan channel (`openfan:ch00` to
+`unknown`; `null` clears an assignment. An OpenFAN channel (`openfan:ch00` to
 `openfan:ch09`) takes a role too, and `pump` is the only way the daemon can tell
 that a channel drives a pump.
 
@@ -735,14 +735,14 @@ curl -s --unix-socket $SOCK \
 
 ## Serial device setup (OpenFanController)
 
-**The OpenFan Controller is optional.** If you do not have one, nothing here
+**The OpenFAN controller is optional.** If you do not have one, nothing here
 applies and nothing is wrong: the daemon notes once at `info` that it found none,
 and motherboard and GPU fan control are unaffected.
 
 At startup the daemon lists the `/dev/ttyACM*` and `/dev/ttyUSB*` devices that
 exist, then opens each one in turn and asks it to identify itself. Only a device
-that answers as an OpenFan Controller is adopted; a configured `[serial] port` is
-tried first, but never alone, so a wrong value cannot remove OpenFan control. The
+that answers as an OpenFAN controller is adopted; a configured `[serial] port` is
+tried first, but never alone, so a wrong value cannot remove OpenFAN control. The
 API and the profile engine start whether or not a controller was found.
 
 If you have **other** USB-serial hardware attached (an Arduino, a 3D printer, a
@@ -969,7 +969,7 @@ not from the daemon's version number.
 | Change settings | `GET /config`, `POST /config/*` (§ Configuration), `POST /config/header-role` |
 | Describe a cooler and record it | `GET /inventory/cooling-devices`, `POST`/`DELETE /config/cooling-device`, `/validation/session` and `/validation/sessions` |
 | Test the hardware | `POST /hwmon/{header}/verify`, `/characterize`, `/discover-control-path` and `/stall-probe`; `POST /fans/openfan/{ch}/calibration`; `POST /gpu/{id}/fan/verify` and `/fan/reset`; `GET /diagnostics/preflight` first |
-| Look after the OpenFan Controller | `POST /fans/openfan/rescan`, `GET /fans/openfan/device`, `PUT /fans/openfan/firmware`, `/fans/openfan/maintenance` |
+| Look after the OpenFAN controller | `POST /fans/openfan/rescan`, `GET /fans/openfan/device`, `PUT /fans/openfan/firmware`, `/fans/openfan/maintenance` |
 | Pick up new hardware | `POST /hwmon/rescan`, `POST /fans/openfan/rescan` |
 
 The hardware tests move fans on purpose. Each one puts the fan back when it ends,
@@ -1000,7 +1000,7 @@ scripts and for reading a support bundle.
 | Field | What it means | What to do |
 |---|---|---|
 | `duty_not_holding: true` on an hwmon fan in `GET /fans` | Something else is writing this header. The daemon rewrote the duty it had set three times and the header did not keep it, so it has stopped fighting. It tries again when its curve asks for a different speed, and the flag clears when the header keeps a duty again. `duty_corrections` counts the rewrites since the daemon started. | Stop the other fan-control program (`fancontrol`, CoolerControl, CoreCtrl, `fan2go`, a vendor tool), or the BIOS/EC feature that drives the header. |
-| `skipped_controls[]` on `/status` | A control in the active profile has not been commanding its fans for at least 3 ticks, so they hold their last speed. `reason` says why: `curve_not_found` (the curve it names is gone), `sensor_unavailable` (its sensor is missing or has stopped updating), `mix_unresolvable` / `sync_unresolvable` (a combined curve cannot be worked out), or `backend_unavailable` (none of its fans can be reached, for example an OpenFan fan with no controller attached, or an AMD GPU the daemon cannot drive: an RX 6000 or older, or an RX 7000/9000 without its firmware fan curve). | Fix the profile or the sensor. A frozen sensor is the usual cause: see § Safety, "Stalled sensors stop driving curves". |
+| `skipped_controls[]` on `/status` | A control in the active profile has not been commanding its fans for at least 3 ticks, so they hold their last speed. `reason` says why: `curve_not_found` (the curve it names is gone), `sensor_unavailable` (its sensor is missing or has stopped updating), `mix_unresolvable` / `sync_unresolvable` (a combined curve cannot be worked out), or `backend_unavailable` (none of its fans can be reached, for example an OpenFAN fan with no controller attached, or an AMD GPU the daemon cannot drive: an RX 6000 or older, or an RX 7000/9000 without its firmware fan curve). | Fix the profile or the sensor. A frozen sensor is the usual cause: see § Safety, "Stalled sensors stop driving curves". |
 | `unavailable_sensors[]` on `/status` | A sensor the daemon found fails every read (a Wi-Fi card's temperature while the radio is off is the usual one) or reports an impossible temperature. It is logged once and left out of `GET /sensors`. | Nothing, unless a curve needs that sensor; then pick another. |
 | `runtime_config_degraded` on `/status` | The daemon could not read `runtime.toml`, which holds your header roles. | See § Runtime configuration, "When `runtime.toml` cannot be read". |
 
@@ -1021,7 +1021,7 @@ The GUI shows itself as disconnected, or `curl` cannot reach the socket:
 - a client started with a different socket path (`ventulus --socket <path>`) has
   to match `[ipc] socket_path`.
 
-### No OpenFan Controller is found
+### No OpenFAN controller is found
 
 See § Serial device setup. `journalctl -u ventulusd | grep -i openfan` shows
 `OpenFanController connected on <port>` once one is adopted; on a machine with
@@ -1078,7 +1078,7 @@ sudo pacman -R ventulusd
 The package stops and disables the service before it is removed. Stopping the
 daemon gives every motherboard fan header it took back to what it was doing
 before, usually its BIOS fan mode, both in-process as it exits and again through
-`ExecStopPost`. OpenFan channels and headers with no mode switch are left at the
+`ExecStopPost`. OpenFAN channels and headers with no mode switch are left at the
 exit minimum (§ Safety).
 
 pacman leaves behind what it did not install or what you changed:
@@ -1106,7 +1106,7 @@ The daemon enforces these rules whatever the GUI or the active profile asks for.
 None can be turned off; the only setting is the coolant limit.
 
 - **Thermal emergency.** If the hottest CPU temperature sensor reaches the
-  emergency limit, every OpenFan channel and writable motherboard fan header the
+  emergency limit, every OpenFAN channel and writable motherboard fan header the
   machine has is driven to 100 %. **The limit is at least 105 °C and is set per
   machine:** where the kernel reports the CPU's own design ceiling, the daemon
   raises the limit to `min(ceiling + 5 °C, 115 °C)`, because a modern part is
@@ -1124,7 +1124,7 @@ None can be turned off; the only setting is the coolant limit.
   stay at full speed with no real heat, look for the CPU sensor reporting the
   limit, and fix or report its driver. Every other fan the emergency took is
   given back at that point: a motherboard header to what it was doing before, an
-  OpenFan channel to its duty from before the emergency. **Both duties are floors
+  OpenFAN channel to its duty from before the emergency. **Both duties are floors
   over the active profile's output, never replacements for it**, so the rules can
   only raise a fan, never lower one. GPU fans are deliberately excluded: there is
   no GPU emergency threshold, because AMD's firmware protects the GPU itself by
@@ -1201,14 +1201,14 @@ None can be turned off; the only setting is the coolant limit.
   `GET /status` (`normal`, `emergency` or `no_sensor_fallback`), and the GUI shows
   a banner from it. The GUI has no fan-control loop of its own to pause; the daemon
   owns control throughout.
-- **OpenFan Controller stops are not time-limited.** A channel commanded to 0 %
+- **OpenFAN controller stops are not time-limited.** A channel commanded to 0 %
   stays stopped for as long as it is commanded; the daemon does not restart it
   after a fixed time. The 8-second stop timer (advertised as
   `limits.openfan_stop_timeout_s`) refuses only a 0 % command that would reach the
   device while an earlier stop is still timed as running, which no normal sequence
   of commands produces, because a repeated 0 % is never re-sent. A profile never
   stops a pump: pump and CPU members are held at or above the 30 % floor, whatever
-  the curve asks for. An OpenFan channel counts as a pump only once you assign it
+  the curve asks for. An OpenFAN channel counts as a pump only once you assign it
   the `pump` role (`POST /config/header-role`); the daemon has no other way to tell.
 - **Per-member minimum floors.** The daemon reports no per-*header* floor
   (`min_pwm_percent: 0` for every hwmon header), but it **does** enforce the
@@ -1249,8 +1249,8 @@ None can be turned off; the only setting is the coolant limit.
   restarting a daemon that stopped responding. The in-process one is bounded, so a
   restore that hangs cannot keep the daemon from exiting, and `ExecStopPost` from
   running.
-- **OpenFan fans, and motherboard headers with no mode switch, are left at a
-  minimum on stop.** These have no firmware behaviour to go back to (an OpenFan
+- **OpenFAN fans, and motherboard headers with no mode switch, are left at a
+  minimum on stop.** These have no firmware behaviour to go back to (an OpenFAN
   channel holds whatever it was last told, indefinitely), so on a clean stop
   (including `systemctl restart`, a reboot, or the watchdog restarting a daemon
   that stopped responding) each one the daemon drove is left at its last speed or
@@ -1259,8 +1259,8 @@ None can be turned off; the only setting is the coolant limit.
   `[shutdown] exit_floor_pct`. A fan whose last speed the daemon lost track of is
   left at 100 %; a fan it never drove is not touched, except an ARCTIC Fan
   Controller channel set to 100 % as above; 0 turns the minimum off. A crash or
-  SIGKILL cannot run this, because `ExecStopPost` cannot reach the OpenFan
-  Controller, so after one those fans keep their last speed until the daemon is
+  SIGKILL cannot run this, because `ExecStopPost` cannot reach the OpenFAN
+  controller, so after one those fans keep their last speed until the daemon is
   back.
 - **Neither guarantees the hardware actually came back.** Each restore step gives
   up after a few seconds so the daemon can always exit. If a chip or card has

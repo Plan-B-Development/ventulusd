@@ -2,7 +2,7 @@ ventulusd(1)
 
 # NAME
 
-ventulusd - fan control daemon for OpenFan, hwmon, and AMD GPU hardware
+ventulusd - fan control daemon for OpenFAN, hwmon, and AMD GPU hardware
 
 # SYNOPSIS
 
@@ -11,7 +11,7 @@ ventulusd - fan control daemon for OpenFan, hwmon, and AMD GPU hardware
 # DESCRIPTION
 
 *ventulusd* is the Ventulus fan control service. It manages fans via
-hwmon sysfs, OpenFanController serial protocol, and AMD GPU PMFW interfaces.
+hwmon sysfs, the OpenFAN controller's serial protocol, and AMD GPU PMFW interfaces.
 It serves an HTTP API over a Unix domain socket for client applications
 (such as ventulus and ventulus-tray) and is the only thing that
 writes fan speeds: while a profile is active it evaluates the profile's fan
@@ -20,7 +20,7 @@ only activate profiles, take short manual overrides and run diagnostics.
 
 The daemon owns thermal safety: the emergency limit (at least 105°C, raised
 per-machine to min(CPU-reported design ceiling + 5°C, 115°C) where the kernel
-publishes the ceiling) drives every OpenFan channel and writable hwmon header
+publishes the ceiling) drives every OpenFAN channel and writable hwmon header
 the machine has to 100% PWM, holds that until a fresh reading at or below
 80°C (a CPU sensor that stops updating or disappears does not release it),
 then returns to active control at once, and gives every other fan it took back
@@ -35,7 +35,7 @@ that it did not choose is set to 100% first.)
 Both duties are *floors* over the active profile's output, never
 replacements for it: each output receives max(commanded, forced), and at 100% an
 output no control commands still receives the forced duty. The ladder can therefore
-only raise a fan, never lower one. GPU fans are excluded by design — there is no
+only raise a fan, never lower one. GPU fans are excluded by design: there is no
 GPU emergency threshold, because AMD PMFW firmware owns GPU thermal protection
 independently of OS fan control.
 
@@ -193,7 +193,7 @@ _/usr/lib/modprobe.d/ventulus-superio.conf_, _/usr/lib/ventulus/ventulus-superio
 
 *SIGTERM*, *SIGINT*
 	Stop. The daemon leaves every fan it cannot give back to firmware (an
-	OpenFan channel, or a header with no mode switch) at its last speed or
+	OpenFAN channel, or a header with no mode switch) at its last speed or
 	the exit floor, whichever is higher, then gives every other header and
 	GPU fan back to what it had before the daemon took it. *systemctl stop*
 	sends *SIGTERM*.

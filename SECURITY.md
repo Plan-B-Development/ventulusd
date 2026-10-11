@@ -1,6 +1,6 @@
 # Security Policy
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
 If you discover a security vulnerability in Ventulus daemon, please
 report it privately:
@@ -29,27 +29,27 @@ are:
 | Unix socket | World-readable (`0666`) by design: any local user can connect, and the daemon assumes no more trust than that. Client authentication is out of scope; endpoints where one user could affect another check the caller's uid (see *Profile search dirs* below). |
 | Profile search dirs | `POST /config/profile-search-dirs` checks the caller's uid (from `SO_PEERCRED`). A non-root caller may add only directories that exist and resolve to inside its **own home directory**, at most 4 of them; root and CLI callers are exempt, and the check fails closed when the uid or home cannot be resolved. The daemon stores the resolved path and skips a directory whose real path has changed since. It refuses to read a profile that is a symlink, a FIFO or anything but a regular file, or that its directory's owner does not own. So one user cannot point the daemon at another user's files, directly or through a link planted later. Reads from a user's directory run off the async runtime, time-limited and one at a time per directory, so a mount that stops answering costs one thread and is then skipped. Root's directories are never skipped, so a stalled store cannot let a same-id file in a user's directory stand in for a stored profile. Paths a client supplies are resolved in a separate pool, one at a time per uid. |
 | Sysfs writes | The daemon writes to `/sys/class/hwmon/*/pwm*`, `/sys/class/hwmon/*/pwm*_enable`, and `/sys/class/drm/*/device/gpu_od/fan_ctrl/fan_curve`. All writes are bounded by hardcoded validation (PWM 0–255, percent 0–100). |
-| Serial I/O | `/dev/ttyACM*` and `/dev/ttyUSB*` access for the OpenFanController, scoped via systemd `DeviceAllow=`; the service runs as root, so no serial group is involved. |
+| Serial I/O | `/dev/ttyACM*` and `/dev/ttyUSB*` access for the OpenFAN controller, scoped via systemd `DeviceAllow=`; the service runs as root, so no serial group is involved. |
 | Opt-in `/dev/port` (Super-I/O probe) | The active Super-I/O probe identifies an *unbound* chip by reading its chip-ID registers at the two config ports (`0x2E`/`0x4E`), writing only the vendor-standard unlock/exit sequences needed to enter and cleanly leave config mode (hence the drop-in grants `/dev/port rw`). **Off by default**; requires `[detection] allow_port_probe` **and** `CAP_SYS_RAWIO`, granted only via the opt-in `superio-port-probe.conf.example` systemd drop-in. It never writes a configuration value or `force_id`, and refuses any port claimed by a bound driver or ACPI. |
-| Opt-in `/dev/nvidia*` (NVML) | The NVML telemetry backend loads `libnvidia-ml.so.1`, which needs **`rw`** access to the NVIDIA device nodes (standard for NVML, even for pure telemetry — hence the drop-in grants `rw`). The daemon resolves and calls **only read-side** NVML symbols (temperatures + fan duty); no fan-write or state-changing path exists. **Off by default**; requires `[detection] enable_nvidia_telemetry` plus the opt-in `nvidia-telemetry.conf.example` drop-in. The open `nouveau` driver needs neither (read via hwmon). |
-| Opt-in USB devices (OpenFAN firmware write) | The daemon can write the OpenFAN firmware itself through the RP2040 bootloader's PICOBOOT interface, which needs **`rw`** access to the USB device nodes — granted only by the opt-in `openfan-firmware-write.conf.example` drop-in (`DeviceAllow=char-usb_device rw`). **Off by default**: without it an update ends with the user copying the file by hand. It writes **only published OpenFAN releases it knows by SHA-256** (the 2023 FW_01 binary is refused outright); the file arrives over the socket (`PUT /fans/openfan/firmware`, at most 1 MiB) and is parsed by the daemon itself, which refuses any block outside the board's 4 MiB flash. It opens only an RP2040 bootloader (`2e8a:0003`) on the controller's own USB port, claims only its PICOBOOT interface, reads the flash's unique id before erasing anything and refuses a flash that is not the board's, and reads every byte back before restarting the board. Whether it may open USB devices is asked of `access(2)` on a root hub — no device is opened for it. |
+| Opt-in `/dev/nvidia*` (NVML) | The NVML telemetry backend loads `libnvidia-ml.so.1`, which needs **`rw`** access to the NVIDIA device nodes (standard for NVML, even for pure telemetry, which is why the drop-in grants `rw`). The daemon resolves and calls **only read-side** NVML symbols (temperatures + fan duty); no fan-write or state-changing path exists. **Off by default**; requires `[detection] enable_nvidia_telemetry` plus the opt-in `nvidia-telemetry.conf.example` drop-in. The open `nouveau` driver needs neither (read via hwmon). |
+| Opt-in USB devices (OpenFAN firmware write) | The daemon can write the OpenFAN firmware itself through the RP2040 bootloader's PICOBOOT interface, which needs **`rw`** access to the USB device nodes, and only the opt-in `openfan-firmware-write.conf.example` drop-in grants it (`DeviceAllow=char-usb_device rw`). **Off by default**: without it an update ends with the user copying the file by hand. It writes **only published OpenFAN releases it knows by SHA-256** (the 2023 FW_01 binary is refused outright); the file arrives over the socket (`PUT /fans/openfan/firmware`, at most 1 MiB) and is parsed by the daemon itself, which refuses any block outside the board's 4 MiB flash. It opens only an RP2040 bootloader (`2e8a:0003`) on the controller's own USB port, claims only its PICOBOOT interface, reads the flash's unique id before erasing anything and refuses a flash that is not the board's, and reads every byte back before restarting the board. Whether it may open USB devices is asked of `access(2)` on a root hub. No device is opened for it. |
 | Config parsing | TOML deserialization of `daemon.toml` / `runtime.toml`. These config structs refuse unknown fields (`#[serde(deny_unknown_fields)]`). |
 | Profile parsing | JSON deserialization of operator-supplied profiles. Profiles **intentionally do not** use `deny_unknown_fields`: every field is `#[serde(default)]` and unknown curve types fall through, so newer profiles stay forward-compatible on older daemons. Safety comes from explicit validation (bounds, floors, filesystem-safe ids), not from rejecting unknown keys. |
 | Persistence | Atomic tmp+rename writes with `0600` permissions for `daemon_state.json` and `runtime.toml`. |
 
 The daemon never executes operator-supplied code, never opens network
-sockets, and never modifies files outside its declared write paths
-(`ReadWritePaths=/sys/devices` — the device tree the fan `pwm*`/`fan_curve`
-nodes physically live under; the `/sys/class/hwmon` and `/sys/class/drm`
-paths are only symlinks that resolve here — and the
-`StateDirectory=`/`RuntimeDirectory=` directories provided by systemd).
+sockets, and never modifies files outside its declared write paths:
+`ReadWritePaths=/sys/devices`, the device tree the fan `pwm*`/`fan_curve`
+nodes physically live under (the `/sys/class/hwmon` and `/sys/class/drm`
+paths are only symlinks that resolve here), and the
+`StateDirectory=`/`RuntimeDirectory=` directories provided by systemd.
 
 The systemd unit applies a hardening set (`ProtectSystem=strict`,
 `NoNewPrivileges=true`, `RestrictNamespaces=true`,
-`SystemCallFilter=@system-service`, etc.) — see
+`SystemCallFilter=@system-service`, etc.). See
 `packaging/ventulusd.service` for the full list.
 
-## Supported Versions
+## Supported versions
 
 | Version | Supported |
 |---------|-----------|
@@ -58,7 +58,7 @@ The systemd unit applies a hardening set (`ProtectSystem=strict`,
 
 Only the latest published release receives security fixes. Older
 releases, including earlier patch versions of the current major line,
-are not separately supported — upgrade to the current release.
+are not separately supported. Upgrade to the current release.
 
 ## Companion project
 
