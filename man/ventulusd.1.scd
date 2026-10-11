@@ -10,7 +10,7 @@ ventulusd - fan control daemon for OpenFan, hwmon, and AMD GPU hardware
 
 # DESCRIPTION
 
-Ventulus daemon is a Rust service that manages hardware fan control via
+*ventulusd* is the Ventulus fan control service. It manages fans via
 hwmon sysfs, OpenFanController serial protocol, and AMD GPU PMFW interfaces.
 It serves an HTTP API over a Unix domain socket for client applications
 (such as ventulus and ventulus-tray) and is the only thing that
