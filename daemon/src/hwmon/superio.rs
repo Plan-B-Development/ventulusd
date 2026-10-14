@@ -616,7 +616,11 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
          Builds from 2026-09-09 (it87 v2.0) on name Gigabyte chips with a board \
          suffix (e.g. it8696_a008090a); this daemon strips it, so fan header \
          ids, pump roles and profile members stay the same across the \
-         rebuild. Do not \
+         rebuild. On Intel 800-series boards (Z890 / B860), builds from \
+         2026-09-09 to 2026-10-01 can fail outright — `modprobe it87` reports \
+         'Invalid argument' after an 'H2RAM set_slot … failed' line, or the chip \
+         is found but never registers — a driver bug fixed on 2026-10-02 (it87 \
+         PR #140), so update first. Do not \
          pass force_id, and do not add `mmio=on` (it is already the driver \
          default). If the chip still does not bind, the usual cause on these \
          boards is an ITE eSPI-to-LPC bridge latched in configuration mode in \
@@ -632,7 +636,10 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
         " For newer Gigabyte ITE boards the in-tree it87 often cannot drive the \
          chip — install the it87-dkms-git build (builds from 2026-09-09 name \
          Gigabyte chips with a board suffix, e.g. it8696_a008090a, which this \
-         daemon strips, so ids do not change). (Do not add \
+         daemon strips, so ids do not change). On Intel 800-series boards \
+         (Z890 / B860) use a build from 2026-10-02 or later: builds from \
+         2026-09-09 to 2026-10-01 can fail to load ('Invalid argument') or bind \
+         nothing there (it87 PR #140). (Do not add \
          `mmio=on`: it is already the driver default, DEC-326.) Do not pass \
          force_id. If the chip still does not bind, the usual cause on these \
          boards is an ITE eSPI-to-LPC bridge latched in configuration mode in \
@@ -1316,6 +1323,31 @@ mod tests {
         // `HOST-d` is explicit that this half stays, on BOTH branches. It is
         // correct, well-tested, and independently reconfirmed by DEC-326.
         assert!(already.contains("force_id") && not_yet.contains("force_id"));
+    }
+
+    /// `BLD-01` / `BRD-m` (it87 #139, #138): on Intel 800-series boards the fork's
+    /// builds from 2026-09-09 to 2026-10-01 fail to load or bind nothing — a driver
+    /// bug PR #140 fixed — so before the bridge-latch recovery, both branches must
+    /// tell the user which builds to avoid, and the out-of-tree branch to update.
+    #[test]
+    fn the_unbound_tail_names_the_intel_800_series_build_window() {
+        for (oot, tail) in [
+            (true, ite_unbound_tail(true)),
+            (false, ite_unbound_tail(false)),
+        ] {
+            assert!(tail.contains("Z890 / B860"), "oot={oot}: {tail}");
+            assert!(
+                tail.contains("2026-09-09 to 2026-10-01"),
+                "oot={oot}: {tail}"
+            );
+            assert!(tail.contains("PR #140"), "oot={oot}: {tail}");
+            // The build-window advice comes BEFORE the latch recovery, so a user
+            // on a broken build is not sent to power-cycle first.
+            let window = tail.find("Z890 / B860").unwrap();
+            let latch = tail.find("eSPI-to-LPC bridge").unwrap();
+            assert!(window < latch, "oot={oot}: {tail}");
+        }
+        assert!(ite_unbound_tail(true).contains("update first"));
     }
 
     /// The CALL-SITE test. The detector and the tail each have their own

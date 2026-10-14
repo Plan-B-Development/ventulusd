@@ -68,9 +68,12 @@ pub fn parse_siv_word(mgid: u32) -> Option<GigabyteSiv> {
 
 /// Parse the sysfs attribute's text.
 ///
-/// The driver formats it with `sprintf(buf, "%08X\n", ...)`, so the expected
-/// shape is eight upper-case hex digits and a newline — but this accepts a
-/// `0x` prefix and either case as well, because the format of a sysfs attribute
+/// The driver formatted it with `sprintf(buf, "%08X\n", ...)` of a 32-bit word
+/// until it87 PR #140 (2026-10-02); since then it prints `%08llX` of the full
+/// 64-bit firmware register, which is still eight digits while the upper half is
+/// zero (a longer word is rejected here — `BLD-06`, unconfirmed on real boards).
+/// So the expected shape is eight upper-case hex digits and a newline — but this
+/// accepts a `0x` prefix and either case as well, because the format of a sysfs attribute
 /// is not a stable ABI and a stricter parser would fail closed on a cosmetic
 /// change. It stays strict about the one thing that matters: anything that is
 /// not a hex word yields `None` rather than a partial number.

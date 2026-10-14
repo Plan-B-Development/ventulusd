@@ -130,7 +130,12 @@ sudo systemctl restart ventulusd
 
 **ACPI conflicts.** If a Super-I/O module fails to bind with `ACPI resource
 conflict` or *Device or resource busy* in the kernel log, update the driver first:
-current `it87-dkms-git` builds sidestep most conflicts through MMIO. For `it87`,
+current `it87-dkms-git` builds avoid the conflict through MMIO on IT8688E,
+IT8689E, IT8696E and IT8698E chips. Boards with an IT8686E, or with an IT8792E or
+IT87952E second chip, can still need the option below (it87 PRs
+[#135](https://github.com/frankcrawford/it87/pull/135) and
+[#141](https://github.com/frankcrawford/it87/pull/141), X399 boards; issue
+[#139](https://github.com/frankcrawford/it87/issues/139), Z890). For `it87`,
 prefer the driver-local `options it87 ignore_resource_conflict=1` in
 `/etc/modprobe.d/it87.conf`; the it87 documentation notes that the system-wide
 `acpi_enforce_resources=lax` can cause boot failures on some systems. The Nuvoton
@@ -148,6 +153,10 @@ covers installing, signing and verifying them. Two things to know:
   names, such as `it8696_a008090a`. The daemon strips that suffix, so fan header,
   sensor and voltage ids, and the pump roles, fan names and profiles that use
   them, do not change.
+- On Intel Z890 / B860 Gigabyte boards, `it87-dkms-git` builds from 2026-09-09 to
+  2026-10-01 can fail to load ("Invalid argument") or bind no chip. Rebuild from
+  2026-10-02 or later ([it87 PR #140](https://github.com/frankcrawford/it87/pull/140)).
+  Current builds need kernel 6.4 or newer.
 - Never load `nct6687` with `force=1` on a board whose chip is an NCT679x.
 
 ### What the daemon detects, and what it deliberately doesn't

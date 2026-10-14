@@ -588,11 +588,13 @@ const SIO_IO_RANGES: &[(&str, u16, u16)] = &[
     ("it87", 0x0A20, 0x0A2F),
     ("it87", 0x0A40, 0x0A4F),
     ("it87", 0x0A60, 0x0A6F),
-    // `BRD-k`: the Z790 AORUS MASTER's IT87952E sits here (it87 #22,
-    // `it87952-isa-0b10`). The one Intel dual-chip secondary base any report
-    // names; every AMD-board secondary reported (it87 #15/#39/#51/#70/#73/#89/
-    // #93/#103) is at 0x0A60, above. The other Intel dual-chip rows' bases are
-    // unknown — no `sensors` output for them exists (searched 2026-10-01).
+    // `BRD-k`: the Intel IT87952E secondaries sit here — the Z790 AORUS MASTER
+    // (it87 #22, `it87952-isa-0b10`) and the Z890 AORUS MASTER (it87 #139,
+    // "Found IT87952E chip at 0xb10"). Every AMD-board secondary reported
+    // (it87 #15/#39/#51/#70/#73/#89/#93/#103) is at 0x0A60, above, and so is the
+    // one Intel IT8792E reported (a W480 board, it87 #86: sensors-detect
+    // "address 0xa60"). The other Intel dual-chip rows' bases are unknown — no
+    // capture for them exists (searched 2026-10-15; `BRD-ab`).
     ("it87", 0x0B10, 0x0B1F),
 ];
 
@@ -838,6 +840,69 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         fanless: &[],
         alt_primary: &[],
     },
+    // `BLD-10` (curator 2026-10-15): the 2026 AM5 800-series boards whose SIV has
+    // both an `it8696_<siv>` and an `it87952_<siv>` stanza in the it87 fork's
+    // `Sensors configs/Gigabyte/configs/gigabyte-it87-amd.conf` (bd7a566, =
+    // 626ad08), each secondary carrying SYS_FAN5/6_PUMP. No exact-board log —
+    // Evidence C, the tier the Z890 rows were enrolled on. Each name matches only
+    // itself (and its ICE edition, same SIV) among the catalogue's 766 names.
+    // SIV 0xA0080908 — the X870E AORUS ELITE X3D / PRO X3D SIV. "X870 AORUS ELITE
+    // X3D" also covers the X3D ICE.
+    DualChipEntry {
+        board_name: "X870 AORUS ELITE X3D",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    DualChipEntry {
+        board_name: "B850 AORUS ELITE X3D",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    // Not "X870 EAGLE WIFI7" (single IT8696E); "X870E EAGLE WIFI7" is not a
+    // substring of "X870E EAGLE X3D WIFI7", so both are listed.
+    DualChipEntry {
+        board_name: "X870E EAGLE WIFI7",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    DualChipEntry {
+        board_name: "X870E EAGLE X3D WIFI7",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    // SIV 0xA3080908; "DARK" sits inside the name, so both are listed.
+    DualChipEntry {
+        board_name: "X870E AERO X3D WOOD",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    DualChipEntry {
+        board_name: "X870E AERO X3D DARK WOOD",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    // SIV 0xA108090A, shared with the B850 AI TOP row (it87 #93, Evidence A).
+    DualChipEntry {
+        board_name: "X870 AORUS TACHYON ICE",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    // SIV 0xA10C0908 (secondary also carries SYS_FAN7/8_PUMP, DDR_FAN, M2_FAN).
+    // The "X870E AORUS XTREME AI TOP" row above does not match it ("X3D" sits
+    // inside the name).
+    DualChipEntry {
+        board_name: "X870E AORUS XTREME X3D AI TOP",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
     // ── AM5 600-series (IT8689E + IT8792E — NOT IT87952E) ───────
     // DEC-421: the secondary on these boards is an IT8792E/IT8795E (ID 0x8733),
     // which hwmon names `it8792`. it87 #96 and #15 dmesg on the X670E AORUS
@@ -918,8 +983,11 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         alt_primary: &[],
     },
     // ── LGA1851 Z890 (IT8696E + IT87952E) ──────────────────────
-    // LHM PR #2512 (MASTER / MASTER-CF / MASTER AI TOP) + SIV 0xA00A090B.
-    // Evidence B. NOT "Z890 AORUS ELITE": the ELITE WIFI7 (ICE / PLUS / DUO X) is
+    // it87 #139 dmesg (BIOS F18 PI, SIV A00A090B): "Found IT8696E chip at 0xa40"
+    // + "Found IT87952E chip at 0xb10". Evidence A (raised from B, 2026-10-15).
+    // Also LHM PR #2512 (MASTER / MASTER-CF / MASTER AI TOP; still unmerged), whose
+    // AI TOP edition rests on that PR and the SIV catalogue alone.
+    // NOT "Z890 AORUS ELITE": the ELITE WIFI7 (ICE / PLUS / DUO X) is
     // a single IT8696E (SIV 0xA0060607) and is deliberately absent.
     DualChipEntry {
         board_name: "Z890 AORUS MASTER",
@@ -994,7 +1062,11 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     //
     // `DC-cp` (`U14`): the catalogue (`gigabyte-it87-intel.conf`, 626ad08) gives
     // the Z390 SIVs 0x4008090B and 0x4008090A an `it8686` stanza beside the
-    // `it8688` one, so every Z390 row accepts either as its primary.
+    // `it8688` one, so every Z390 row accepts either as its primary. That stanza
+    // is weak evidence (`BLD-12`, 2026-10-15): it is one voltage-only stanza
+    // shared by eleven SIVs, single-chip boards included, ignoring every temp, fan
+    // and pwm; no Z390 board has been seen binding an IT8686E, and it87 PR #143
+    // shows an IT8688E on a Z390 AORUS PRO WIFI. Accepting it stays harmless.
     DualChipEntry {
         board_name: "Z390 AORUS MASTER",
         chips: &["it8688", "it8792"],
@@ -1166,6 +1238,23 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         fanless: &[],
         alt_primary: &[],
     },
+    // ── sTR5 TRX50 (IT8689E + IT87952E) ────────────────────────
+    // `BLD-10`: TRX50 AI TOP — it87 #73 `sensors` (`it8689-isa-0a40` +
+    // `it87952-isa-0a60`; the secondary appeared intermittently) and SIV
+    // 0x9A0B0908 (it8689 + it87952 stanzas). Evidence B.
+    DualChipEntry {
+        board_name: "TRX50 AI TOP",
+        chips: &["it8689", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    // SIV 0x9A0A0908 only (it8689 + it87952 stanzas). Evidence C.
+    DualChipEntry {
+        board_name: "TRX50 AERO D",
+        chips: &["it8689", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
     // ── AM4 400-series AORUS boards (IT8686E + IT8792E) ────────
     // X470 AORUS ULTRA GAMING: upstream lm-sensors config
     // (`configs/Gigabyte/X470-AORUS-ULTRA-GAMING.conf`, `it8686-isa-0a40` +
@@ -1217,7 +1306,8 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
         alt_primary: &[],
     },
     // it87 #135 dmesg (PRO-CF: "IT8686E at 0xa40, revision 2 / IT8792E/IT8795E
-    // at 0xa60, revision 3"); hw-probe (PRO, XTREME, Gaming 7). Evidence A.
+    // at 0xa60, revision 3"); hw-probe (PRO, XTREME, Gaming 7); it87 PR #141 dmesg
+    // (Gaming 7, the same pair, SIV 2008090D). Evidence A.
     DualChipEntry {
         board_name: "X399 AORUS PRO",
         chips: &["it8686", "it8792"],
@@ -1329,6 +1419,25 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     // owner-confirmed working it8696+it87952 pairing (#89, both chips, control
     // working), so the correct unit of judgement is the board pairing, never
     // "X870E" or "dual ITE".
+    //
+    // `BLD-10` (curator 2026-10-15): the non-ICE X870 AORUS STEALTH and the B850
+    // AORUS STEALTH (ICE) share the STEALTH ICE's SIV, 0xA208090A (it8696 +
+    // it87952 stanzas in the it87 SIV catalogue). Evidence C. Each name also
+    // covers its ICE edition (the STEALTH ICE row above is the first match for
+    // that board, same complement); "B850 AORUS STEALTH" cannot match the B850M
+    // AORUS STEALTH ("B850M"), a separate SIV.
+    DualChipEntry {
+        board_name: "X870 AORUS STEALTH",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
+    DualChipEntry {
+        board_name: "B850 AORUS STEALTH",
+        chips: &["it8696", "it87952"],
+        fanless: &[],
+        alt_primary: &[],
+    },
 ];
 
 /// Look up the chip names a known Gigabyte dual-chip board is expected to
@@ -2517,6 +2626,39 @@ mod tests {
              their missing headers, and enrolment is also what puts the board \
              behind the modprobe guard"
         );
+    }
+
+    #[test]
+    fn the_2026_10_15_enrolments_resolve_to_their_catalogue_pairs() {
+        // `BLD-10`: every name the it87 SIV catalogue (bd7a566) gives a dual
+        // stanza pair, ICE editions included, must reach a row with that pair —
+        // and the single-chip neighbours named in the row comments must not.
+        let gb = "Gigabyte Technology Co., Ltd.";
+        let am5 = ["it8696".to_string(), "it87952".to_string()];
+        for board in [
+            "X870 AORUS ELITE X3D",
+            "X870 AORUS ELITE X3D ICE",
+            "B850 AORUS ELITE X3D",
+            "X870E EAGLE WIFI7",
+            "X870E EAGLE X3D WIFI7",
+            "X870E AERO X3D WOOD",
+            "X870E AERO X3D DARK WOOD",
+            "X870 AORUS TACHYON ICE",
+            "X870E AORUS XTREME X3D AI TOP",
+            "X870 AORUS STEALTH",
+            "B850 AORUS STEALTH",
+            "B850 AORUS STEALTH ICE",
+        ] {
+            assert_eq!(listed_chips_for_board(gb, board), am5, "{board}");
+        }
+        let trx50 = ["it8689".to_string(), "it87952".to_string()];
+        for board in ["TRX50 AI TOP", "TRX50 AERO D"] {
+            assert_eq!(listed_chips_for_board(gb, board), trx50, "{board}");
+        }
+        // Single IT8696E boards (catalogue `it8696` stanza only) stay out.
+        for board in ["X870 EAGLE WIFI7", "B850M AORUS STEALTH ICE"] {
+            assert!(listed_chips_for_board(gb, board).is_empty(), "{board}");
+        }
     }
 
     #[test]
