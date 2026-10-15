@@ -5,6 +5,13 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Changed
+
+- **Driver hints name the upstream project, not an Arch package.** The unbound-chip hint and the it87
+  risk note say to build the driver from `frankcrawford/it87` or `Fred78290/nct6687d` with DKMS, where
+  they named `it87-dkms-git` and `nct6687d-dkms-git`, which exist only in the AUR. The GUI adds the
+  install steps for your distribution beside the hint.
+
 ## [5.1.0] — 2026-10-15
 
 Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.1.0 is the matching release.

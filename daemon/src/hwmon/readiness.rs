@@ -913,7 +913,7 @@ mod tests {
                 recommendation: Some(SuperIoRecommendation {
                     module: "it87".into(),
                     in_mainline: false,
-                    load_hint: "install it87-dkms-git".into(),
+                    load_hint: "build it87 from frankcrawford/it87".into(),
                     reason: "board lists it8688".into(),
                     risk_notes: vec![],
                 }),

@@ -210,8 +210,8 @@ const SUPERIO_ALLOWLIST: &[AllowlistEntry] = &[
         module: "it87",
         vendor: SuperIoVendor::Ite,
         risk_note: "Newer ITE chips (e.g. IT8686E/IT8688E/IT8696E) are supported only by the \
-                    out-of-tree it87-dkms-git driver; mainline it87 will not bind them. Never use \
-                    force_id — it misroutes every register access.",
+                    out-of-tree it87 driver (frankcrawford/it87); mainline it87 will not bind \
+                    them. Never use force_id — it misroutes every register access.",
     },
     AllowlistEntry {
         module: "nct6775",
@@ -586,6 +586,21 @@ impl DriverState {
     }
 }
 
+/// The upstream project an out-of-tree module is built from (DEC-499).
+///
+/// Hints name the project, never a distribution's package for it: the daemon
+/// does not know the distribution, and the Arch package names hints used to give
+/// told Debian and Fedora users to install something that does not exist there.
+/// The GUI, which reads the machine's os-release, adds that distribution's
+/// install steps beside the hint.
+pub(crate) fn out_of_tree_source(module: &str) -> &'static str {
+    match module {
+        "it87" => "frankcrawford/it87",
+        "nct6687" => "Fred78290/nct6687d",
+        _ => "its upstream project",
+    }
+}
+
 /// The ITE-specific tail of the "loaded but did not bind" hint.
 ///
 /// Extracted so the branch is testable on its own — the surrounding
@@ -608,11 +623,11 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
         // this daemon absorbs (DEC-442) — so the text says so, rather than
         // telling the user to re-check ids that no longer change.
         " You are already running an out-of-tree `it87` build, so reinstalling \
-         the same build will not change anything — the plain 'install \
-         it87-dkms-git' advice is for somebody still on the in-tree driver. If \
-         yours is old, updating is still worth doing: `it87-dkms-git` is a \
-         `-git` package, so reinstalling it rebuilds the current upstream \
-         snapshot, and several secondary-chip fixes landed in 2026-03 and later. \
+         the same build will not change anything — the plain 'install the \
+         out-of-tree driver' advice is for somebody still on the in-tree driver. \
+         If yours is old, updating is still worth doing: rebuilding it from \
+         frankcrawford/it87's current source picks up several secondary-chip \
+         fixes that landed in 2026-03 and later. \
          Builds from 2026-09-09 (it87 v2.0) on name Gigabyte chips with a board \
          suffix (e.g. it8696_a008090a); this daemon strips it, so fan header \
          ids, pump roles and profile members stay the same across the \
@@ -634,7 +649,8 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
          Troubleshooting guide."
     } else {
         " For newer Gigabyte ITE boards the in-tree it87 often cannot drive the \
-         chip — install the it87-dkms-git build (builds from 2026-09-09 name \
+         chip — install the out-of-tree it87 driver from frankcrawford/it87 \
+         (builds from 2026-09-09 name \
          Gigabyte chips with a board suffix, e.g. it8696_a008090a, which this \
          daemon strips, so ids do not change). On Intel 800-series boards \
          (Z890 / B860) use a build from 2026-10-02 or later: builds from \
@@ -700,11 +716,12 @@ fn build_recommendation(
              before the fans/sensors appear."
         )
     } else {
+        let source = out_of_tree_source(module);
         format!(
-            "This chip needs the out-of-tree DKMS driver — install the vendor DKMS package (e.g. \
-             `it87-dkms-git` for ITE, `nct6687d-dkms-git` for MSI Nuvoton), then load `{module}`. \
-             Do not pass force_id to bind an unrecognized chip ID — it misroutes every register \
-             access."
+            "This chip needs an out-of-tree driver: build `{module}` from {source} with DKMS \
+             (your distribution's `dkms` package and the headers for your running kernel), then \
+             load `{module}`. Do not pass force_id to bind an unrecognized chip ID — it misroutes \
+             every register access."
         )
     };
 
@@ -1030,7 +1047,11 @@ mod tests {
         assert_eq!(rec.module, "it87");
         assert!(!rec.in_mainline, "it8688 is DKMS-only (DEC-144)");
         assert!(rec.load_hint.contains("DKMS"));
-        assert!(rec.risk_notes.iter().any(|n| n.contains("it87-dkms-git")));
+        assert!(rec.load_hint.contains("frankcrawford/it87"));
+        assert!(rec
+            .risk_notes
+            .iter()
+            .any(|n| n.contains("frankcrawford/it87")));
     }
 
     #[test]
@@ -1315,7 +1336,7 @@ mod tests {
             "do not point users at a closed issue as the tracking thread"
         );
         assert!(
-            not_yet.contains("install the it87-dkms-git build"),
+            not_yet.contains("install the out-of-tree it87 driver"),
             "the in-tree branch must still offer the install that DOES help"
         );
         // The opposite branch, or a predicate stuck on one answer passes above.
@@ -1382,12 +1403,12 @@ mod tests {
         let (dkms_hint, in_tree_hint) = (hint(&dkms), hint(&in_tree));
 
         assert!(
-            !dkms_hint.contains("install the it87-dkms-git build"),
+            !dkms_hint.contains("install the out-of-tree it87 driver"),
             "the user is already running an out-of-tree build; telling them to \
              install one is the loop HOST-d exists to break. got: {dkms_hint}"
         );
         assert!(
-            in_tree_hint.contains("install the it87-dkms-git build"),
+            in_tree_hint.contains("install the out-of-tree it87 driver"),
             "somebody still on the in-tree driver must still be told to install \
              it. got: {in_tree_hint}"
         );
@@ -1798,5 +1819,92 @@ mod tests {
         // field, not a bare const) rather than hard-coding `true`.
         let r = detect_superio(&FakeEvidence::default());
         assert_eq!(r.arch_supported, SUPERIO_ARCH_SUPPORTED);
+    }
+
+    /// DEC-499: every out-of-tree recommendation names the upstream project the
+    /// module is built from, on every driver state that reaches the install text.
+    #[test]
+    fn out_of_tree_hints_name_the_upstream_project() {
+        for (module, project) in [
+            ("it87", "frankcrawford/it87"),
+            ("nct6687", "Fred78290/nct6687d"),
+        ] {
+            assert_eq!(out_of_tree_source(module), project);
+            let mut caveats = Vec::new();
+            let ev = EvidenceAcc {
+                dmi: true,
+                ..Default::default()
+            };
+            // A chip whose driver is not in mainline, with nothing loaded.
+            let chip = if module == "it87" {
+                "it8696"
+            } else {
+                "nct6687"
+            };
+            let rec = build_recommendation(
+                chip,
+                module,
+                &ev,
+                DriverState::NotLoaded,
+                &[],
+                &[],
+                false,
+                &mut caveats,
+            )
+            .expect("allowlisted module → recommendation");
+            assert!(!rec.in_mainline, "{chip} precondition: out-of-tree");
+            assert!(
+                rec.load_hint.contains(project),
+                "{module}: {}",
+                rec.load_hint
+            );
+        }
+    }
+
+    /// DEC-499 (`XD-1`): the daemon does not know the distribution, so no text it
+    /// produces may name a distribution's package for a driver. The Arch package
+    /// names it used to give do not exist on Debian or Fedora. Walks the source trees of
+    /// both crates rather than listing files, so a new module is covered; the
+    /// needles are assembled at run time so this test does not match itself.
+    #[test]
+    fn no_source_names_an_aur_package() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("source dir is readable") {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        walk(&root.join("../tray/src"), &mut files);
+        assert!(
+            files.iter().any(|f| f.ends_with("hwmon/superio.rs")),
+            "precondition: the walk found this file"
+        );
+        let package_suffix = ["-dkms", "-git"].concat();
+        let aur = ["A", "UR"].concat();
+        let names_aur = |line: &str| {
+            line.match_indices(aur.as_str()).any(|(i, _)| {
+                let before = line[..i].chars().next_back();
+                let after = line[i + aur.len()..].chars().next();
+                !before.is_some_and(char::is_alphanumeric)
+                    && !after.is_some_and(char::is_alphanumeric)
+            })
+        };
+        let mut offenders = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if line.contains(package_suffix.as_str()) || names_aur(line) {
+                    offenders.push(format!("{}:{}", file.display(), n + 1));
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{offenders:#?}");
     }
 }

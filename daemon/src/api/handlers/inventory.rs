@@ -841,9 +841,11 @@ fn probed_to_superio_chip(
                  {expected_module}`."
             )
         } else {
-            "This ITE chip needs the out-of-tree it87-dkms-git driver — install it, then load \
-             `it87`. Do not pass force_id."
-                .to_string()
+            format!(
+                "This ITE chip needs the out-of-tree it87 driver: build it from {} with DKMS, \
+                 then load `it87`. Do not pass force_id.",
+                superio::out_of_tree_source("it87")
+            )
         };
         Some(superio::SuperIoRecommendation {
             module: expected_module.clone(),
@@ -1120,7 +1122,7 @@ mod tests {
                 recommendation: Some(SuperIoRecommendation {
                     module: "it87".into(),
                     in_mainline: false,
-                    load_hint: "install it87-dkms-git".into(),
+                    load_hint: "build it87 from frankcrawford/it87".into(),
                     reason: "board lists it8688".into(),
                     risk_notes: vec!["risk".into()],
                 }),
@@ -1165,7 +1167,7 @@ mod tests {
             .expect("unbound probed chip → recommendation");
         assert_eq!(rec.module, "it87");
         assert!(!rec.in_mainline, "it8688 is DKMS-only");
-        assert!(rec.load_hint.contains("it87-dkms-git"));
+        assert!(rec.load_hint.contains("frankcrawford/it87"));
         assert!(rec.reason.contains("active port probe"));
     }
 
