@@ -842,8 +842,9 @@ const GIGABYTE_DUAL_CHIP_BOARDS: &[DualChipEntry] = &[
     },
     // `BLD-10` (curator 2026-10-15): the 2026 AM5 800-series boards whose SIV has
     // both an `it8696_<siv>` and an `it87952_<siv>` stanza in the it87 fork's
-    // `Sensors configs/Gigabyte/configs/gigabyte-it87-amd.conf` (bd7a566, =
-    // 626ad08), each secondary carrying SYS_FAN5/6_PUMP. No exact-board log —
+    // `Sensors configs/Gigabyte/configs/gigabyte-it87-amd.conf` (as of 626ad08,
+    // its last change; unchanged at HEAD bd7a566), each secondary carrying
+    // SYS_FAN5/6_PUMP. No exact-board log —
     // Evidence C, the tier the Z890 rows were enrolled on. Each name matches only
     // itself (and its ICE edition, same SIV) among the catalogue's 766 names.
     // SIV 0xA0080908 — the X870E AORUS ELITE X3D / PRO X3D SIV. "X870 AORUS ELITE
@@ -2630,7 +2631,7 @@ mod tests {
 
     #[test]
     fn the_2026_10_15_enrolments_resolve_to_their_catalogue_pairs() {
-        // `BLD-10`: every name the it87 SIV catalogue (bd7a566) gives a dual
+        // `BLD-10`: every name the it87 SIV catalogue (626ad08) gives a dual
         // stanza pair, ICE editions included, must reach a row with that pair —
         // and the single-chip neighbours named in the row comments must not.
         let gb = "Gigabyte Technology Co., Ltd.";
