@@ -2,7 +2,7 @@
 
 *Formerly Control-OFC (`control-ofc-daemon`, `control-ofc-tray`).*
 
-**Latest release:** v5.0.0 — 2026-10-10. Pairs with `ventulus` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover); version numbers carry on from Control-OFC.
+**Latest release:** v5.1.0 — 2026-10-15. Pairs with `ventulus` ≥ v2.23.0 (the recommended capability floor; the package itself only hard-blocks GUIs < 2.0.0, the sole-writer cutover); version numbers carry on from Control-OFC.
 
 `ventulusd` is the fan control daemon behind [Ventulus](https://github.com/Plan-B-Development/ventulus).
 It runs as a systemd service, reads your temperature sensors and drives your fans

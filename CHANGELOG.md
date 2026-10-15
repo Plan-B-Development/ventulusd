@@ -5,6 +5,11 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+## [5.1.0] — 2026-10-15
+
+Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.1.0 is the matching release.
+Board, GPU-naming and guidance updates. No API, capability, curve, floor or thermal-safety change.
+
 ### Changed
 
 - **More Gigabyte two-chip boards are recognised.** The board table now lists the TRX50 AI TOP and
