@@ -19,7 +19,10 @@
 #   telemetry and accept that trade-off.
 #
 # ────────────────────────────  TO ENABLE  ─────────────────────────────
-#   0. Install nvidia-utils, which provides libnvidia-ml.so.1.
+#   0. Have the NVIDIA userspace package matching your driver installed; it
+#      provides libnvidia-ml.so.1 (on Arch: nvidia-utils for Turing and newer,
+#      AUR nvidia-580xx-utils for Maxwell/Pascal/Volta). A working proprietary
+#      driver already has it.
 #   1. Set the config flag in /etc/ventulus/daemon.toml:
 #          [detection]
 #          enable_nvidia_telemetry = true

@@ -18,6 +18,15 @@ rename. Version numbers carry on from Control-OFC.
   bug fixed upstream on 2026-10-02. The unbound-chip hint and the User Guide now say to update first,
   before the bridge-latch recovery. The User Guide also notes that current builds need kernel 6.4 or
   newer, and which ITE chips MMIO keeps clear of ACPI conflicts.
+- **Intel Arc cards are named when the PCI ID database names them.** Besides the B580, the B570,
+  Pro B50, B60, B65 and B70 and the A-series A770, A750, A580, A380, A310 and Pro A30M–A60 now
+  show their model instead of "Intel D-GPU".
+- **GPU guidance updated (checked 2026-10-15).** The daemon's messages, README, User Guide, man
+  page and install notes recommend `amdgpu.ppfeaturemask=0xfff7ffff` (any mask with bit 14 still
+  works) and explain the kernel's "Overdrive is enabled" taint message. The GPU fan test no longer
+  names an SMU version mismatch as a cause of an ignored write, and no longer says resume hands
+  the fan back. The NVIDIA notes say `nouveau` gives no sensors on Turing and newer, and that
+  NVML's fan duty and RPM are the driver's intended speed, not a measurement.
 
 ## [5.0.0] — 2026-10-10
 

@@ -29,15 +29,15 @@ so can your scripts be (§ Scripting the daemon). No client writes a fan.
 | Device | Read | Write |
 |---|---|---|
 | CPU temperature (`k10temp`, `coretemp`) | Yes | — |
-| GPU temperature (AMD `amdgpu`, Intel Arc `xe` / `i915`, NVIDIA `nouveau` or opt-in NVML) | Yes | — |
+| GPU temperature (AMD `amdgpu`, Intel Arc `xe` / `i915`, NVIDIA `nouveau` on cards older than Turing, or opt-in NVML) | Yes | — |
 | Disk temperature (NVMe) | Yes | — |
 | Motherboard temperatures (ITE, Nuvoton) | Yes | — |
 | OpenFAN controller fans | Yes | Yes |
 | Motherboard fan headers (hwmon) | Yes | Yes |
 | AMD GPU fans, RX 7000 / RX 9000 | Yes | Yes, through the firmware (PMFW) fan curve |
 | AMD GPU fans, RX 6000 and older | Yes | Fan test and reset only. No profile drives them, so the card's own curve stays in charge |
-| Intel Arc GPU fans | RPM | No: the firmware manages them and the kernel exposes no PWM control |
-| NVIDIA GPU fans | RPM, plus the firmware-measured duty through NVML | No: there is no kernel write path |
+| Intel Arc GPU fans | RPM | No: the firmware manages them and no mainline kernel exposes PWM control |
+| NVIDIA GPU fans | RPM, plus the driver's duty through NVML (NVIDIA's *intended* speed, not a measurement) | No: there is no kernel write path, and the daemon does not use NVML's privileged one |
 | ARCTIC Fan Controller (`arctic_fan`, Linux 7.2 and later) | Yes | Yes. Every write carries all ten channels, so the daemon first sets each channel reading 0 that it did not choose to 100 %. A channel your profile does not control therefore runs at full speed; control all ten to keep them quiet |
 | Liquid coolers with an hwmon driver | Coolant temperature and pump RPM | Pump speed, fixed or on a curve, never below 30 %; the GUI's **Configure AIO** sets it up. A pump on a motherboard header is set up the same way once the header has the `pump` role (§ Identifying a fan) |
 
@@ -892,13 +892,18 @@ The control method depends on the AMD GPU's generation:
 
 - **RX 7000 / RX 9000 (RDNA3 and later)** use the firmware's `fan_curve` sysfs
   interface. It needs the `amdgpu.ppfeaturemask` kernel parameter with bit 14 set
-  (`0x4000`, `PP_OVERDRIVE_MASK`). The recommended value enables every flag;
-  narrower masks work as long as bit 14 is set, but `0xffffffff` is what the
-  daemon's diagnostics and the GUI suggest, what most distributions document, and
-  what the daemon's error message points at:
+  (`0x4000`, `PP_OVERDRIVE_MASK`). The recommended value is the kernel's default
+  mask, `0xfff7bfff`, with that bit added, the value AMD's engineers give, and the
+  one the daemon's diagnostics, its error messages and the GUI suggest:
   ```
-  amdgpu.ppfeaturemask=0xffffffff
+  amdgpu.ppfeaturemask=0xfff7ffff
   ```
+  Any mask with bit 14 set works, including a `0xffffffff` you already use (it
+  also turns on bit 19, GFX DCS, which the kernel leaves off by default and RX
+  7000 / RX 9000 cards do not use). From Linux 6.13 enabling OverDrive marks the
+  kernel tainted and logs `amdgpu: Overdrive is enabled, please disable it before
+  reporting any bugs unrelated to overdrive.` That is expected; mention the
+  parameter when you report a kernel bug.
   The firmware curve is the **only** path the daemon writes on these cards. An
   RX 7000 also exposes `pwm1` and `pwm1_enable`, but a write there can succeed and
   change nothing, so without a `fan_curve` the daemon reports the fan as

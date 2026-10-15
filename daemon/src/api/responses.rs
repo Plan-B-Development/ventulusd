@@ -457,8 +457,9 @@ pub struct FanEntry {
     pub rpm: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_commanded_pwm: Option<u8>,
-    /// Firmware-reported current fan duty % (measured, not commanded) — present
-    /// only for sources that expose a duty readback (NVIDIA via NVML, DEC-204).
+    /// Driver-reported current fan duty % (not commanded; NVIDIA's *intended*
+    /// speed per `nvml.h`, not a measurement) — present only for sources that
+    /// expose a duty readback (NVIDIA via NVML, DEC-204).
     /// Distinct from `last_commanded_pwm`. May exceed 100 (NVML expresses it as
     /// a % of max noise tolerance). Additive/optional (API v1).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4821,7 +4822,7 @@ mod tests {
         assert!(json.get("last_commanded_pwm").is_none());
         assert!(json.get("duty_pct").is_none());
 
-        // A read-only NVIDIA fan surfaces its measured duty % (DEC-204).
+        // A read-only NVIDIA fan surfaces its driver-reported duty % (DEC-204).
         let nvidia = FanEntry {
             id: "nvidia_gpu:0000:03:00.0".into(),
             source: "nvidia_gpu".into(),

@@ -801,8 +801,9 @@ fn classify_gpu_verify_result(
     // Legacy path: pwm1_enable left manual (1) during the test. `BRD-o`: what
     // reads back here is the card's own driver/SMU state, never motherboard
     // firmware — so a BIOS "Smart Fan" option, which this text used to blame,
-    // is not a cause. Another GPU fan tool, or the driver re-initialising the
-    // card (resume, GPU reset), is. 0 is "no fan control" (full speed), not
+    // is not a cause. Another GPU fan tool, or a GPU reset, is. (Resume from
+    // suspend is not: on SMU11 the driver's restore path leaves a manual fan
+    // manual, curator GPD-12.) 0 is "no fan control" (full speed), not
     // automatic, so the value is named rather than assumed.
     if let Some(en) = final_state.pwm_enable {
         if en != 1 {
@@ -817,10 +818,9 @@ fn classify_gpu_verify_result(
                     "pwm1_enable changed from 1 (manual) to {mode} during the test, so \
                      something other than this test changed the card's fan mode. The usual \
                      cause is another GPU fan tool (for example LACT, CoreCtrl or amdgpu-fan): \
-                     stop it, then re-test. The amdgpu driver also hands the fan back to the \
-                     card's own automatic control when the GPU re-initialises (resume from \
-                     suspend, a GPU reset). Motherboard BIOS fan settings do not drive a \
-                     graphics card's fan."
+                     stop it, then re-test. A GPU reset also hands the fan back to the \
+                     card's own automatic control. Motherboard BIOS fan settings do not drive \
+                     a graphics card's fan."
                 ),
             );
         }
@@ -841,8 +841,9 @@ fn classify_gpu_verify_result(
             format!(
                 "Requested {test_speed}% but the read-back fan speed was {seen}. The write was \
                  accepted at sysfs but silently not applied — typically amdgpu.ppfeaturemask bit \
-                 14 (0x4000) is unset, an SMU firmware/driver mismatch, or a BIOS overdrive lock. \
-                 Add 'amdgpu.ppfeaturemask=0xffffffff' to the kernel parameters and reboot."
+                 14 (0x4000) is unset or a BIOS overdrive lock. Add \
+                 'amdgpu.ppfeaturemask=0xfff7ffff' (or any mask with bit 14 set) to the kernel \
+                 parameters and reboot."
             ),
         );
     }

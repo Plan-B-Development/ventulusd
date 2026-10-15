@@ -730,7 +730,8 @@ fn read_nouveau_fan_states(gpus: &[NouveauGpuInfo]) -> Vec<AmdGpuFanState> {
 /// Read NVIDIA telemetry from the (opt-in) NVML backend into the poll pipeline
 /// (DEC-204). Produces GPU temperature `SensorReading`s (source `NvidiaGpu`,
 /// kind `GpuTemp`) plus read-only fan states (`nvidia_gpu:<BDF>`) carrying the
-/// firmware-reported `duty_pct` and — on driver R565+ — `rpm`. Returns empty
+/// driver-reported `duty_pct` and — on driver R565+ — `rpm` (both NVIDIA's
+/// *intended* speed per `nvml.h`, not a measurement). Returns empty
 /// vecs when NVML is disabled/absent. Runs on the blocking poll thread.
 fn read_nvml_states(backend: &dyn NvmlBackend) -> (Vec<SensorReading>, Vec<AmdGpuFanState>) {
     let now_sys = std::time::SystemTime::now();

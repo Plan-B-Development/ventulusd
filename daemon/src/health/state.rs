@@ -186,9 +186,10 @@ pub struct AmdGpuFanState {
     /// Always `None` for read-only sources (Intel, NVIDIA).
     pub last_commanded_pct: Option<u8>,
     /// Firmware-**reported** current fan duty %, when the source exposes it
-    /// (NVML `nvmlDeviceGetFanSpeed_v2`, DEC-204). A *measured* value distinct
-    /// from `last_commanded_pct` — never conflate the two. `None` for AMD/Intel
-    /// (which report RPM, not a duty readback). Per NVML this may exceed 100 (it
+    /// (NVML `nvmlDeviceGetFanSpeed_v2`, DEC-204). A reported value distinct
+    /// from `last_commanded_pct` — never conflate the two. `nvml.h` documents it
+    /// as the *intended* fan speed, not a measurement (a blocked fan reports it).
+    /// `None` for AMD/Intel (which report RPM, not a duty readback). Per NVML this may exceed 100 (it
     /// is a % of the product's max-noise-tolerance fan speed).
     pub duty_pct: Option<u8>,
     /// When this reading was taken.

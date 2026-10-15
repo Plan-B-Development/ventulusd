@@ -147,8 +147,9 @@ impl AmdGpuInfo {
             format!(
                 "GPU {bdf} fan control is read-only: an RDNA3/RDNA4 fan is writable only \
                  through the PMFW fan_curve, which needs overdrive (amdgpu.ppfeaturemask \
-                 bit 14, 0x4000). Add 'amdgpu.ppfeaturemask=0xffffffff' to the kernel \
-                 parameters and reboot to enable PMFW fan control."
+                 bit 14, 0x4000). Add 'amdgpu.ppfeaturemask=0xfff7ffff' (the kernel's \
+                 default mask plus bit 14) to the kernel parameters and reboot to enable \
+                 PMFW fan control."
             )
         })
     }
@@ -1088,7 +1089,7 @@ mod tests {
                     .rdna_read_only_reason()
                     .unwrap_or_else(|| panic!("{id} overdrive={overdrive}: no reason"));
                 assert_eq!(
-                    reason.contains("amdgpu.ppfeaturemask=0xffffffff"),
+                    reason.contains("amdgpu.ppfeaturemask=0xfff7ffff"),
                     !overdrive,
                     "{id} overdrive={overdrive}: {reason}"
                 );

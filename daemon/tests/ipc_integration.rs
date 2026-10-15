@@ -991,7 +991,7 @@ async fn sensors_endpoint_tags_nvidia_gpu_source() {
 
 #[tokio::test]
 async fn fans_endpoint_serializes_duty_pct_including_zero() {
-    // DEC-204: NVML-measured `duty_pct` must serialize even when 0 (only None is
+    // DEC-204: NVML-reported `duty_pct` must serialize even when 0 (only None is
     // skipped by skip_serializing_if) and round-trip other values. Treating 0 as
     // "absent" would hide a genuinely-stopped NVIDIA fan in the GUI.
     let state = test_app_state();
@@ -2039,7 +2039,7 @@ async fn gpu_reset_fan_unsupported_returns_400_feature_unavailable() {
 
 /// Construct an `AppState` with one read-only RDNA3/4 GPU: `pwm1` exists but
 /// `pwm1_enable` does NOT, and there is no PMFW `fan_curve` either. This is
-/// the bare-RDNA4 shape on a kernel without `amdgpu.ppfeaturemask=0xffffffff`.
+/// the bare-RDNA4 shape on a kernel without OverDrive (`amdgpu.ppfeaturemask` bit 14).
 /// Before DEC-098 the handlers fell through to `set_legacy_pwm` here and
 /// returned a misleading 503 hardware_unavailable when the `pwm1_enable`
 /// write hit ENOENT; the canonical answer is 400 feature_unavailable.

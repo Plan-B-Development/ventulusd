@@ -230,31 +230,43 @@ fn read_pci_hex32(path: &Path) -> Option<u32> {
 /// Map a PCI device ID (vendor 0x8086) to an Intel discrete GPU marketing name.
 ///
 /// Conservative on purpose: the kernel ID headers carry raw device IDs only,
-/// not per-SKU marketing names. Only `0xE20B` → "Arc B580" is authoritatively
-/// verifiable (lspci `8086:e20b` reports "Battlemage G21 [Arc B580]", and the
-/// linux-firmware fan-control blob is named `fan_control_8086_e20b_*.bin`).
+/// not per-SKU marketing names, so a name is given only where the PCI ID
+/// database (`pci.ids`, version 2026.10.14, `https://pci-ids.ucw.cz/`) names
+/// the device ID itself. IDs it lists only as "Intel Graphics" (0xE202,
+/// 0xE20D, 0xE210, 0xE215, 0xE216, 0xE220, 0xE221) and IDs it does not list
+/// (0xE209) return `None` and fall back to the generic "Intel D-GPU" label,
+/// rather than guess an SKU. Curator GPD-10, 2026-10-15.
 ///
-/// All other Battlemage IDs (e.g. B570 and the workstation `0xE22x` group) and
-/// Alchemist (DG2) IDs deliberately return `None` and fall back to the generic
-/// "Intel D-GPU" display label, rather than guess an unverified SKU name. This
-/// honours the project rule "do not claim … unless … truthful". REVIEW: extend
-/// the table only with device-ID→name pairs confirmed against an authoritative
-/// source (e.g. systemd/hwdata `pci.ids`).
-///
-/// Verified Battlemage (BMG) discrete device IDs from
-/// `include/drm/intel/pciids.h` (`INTEL_BMG_IDS`): 0xE202, 0xE209, 0xE20B,
-/// 0xE20C, 0xE20D, 0xE210, 0xE211, 0xE212, 0xE216, 0xE220, 0xE221, 0xE222,
-/// 0xE223.
+/// Battlemage (BMG) discrete device IDs from `include/drm/intel/pciids.h`
+/// (`INTEL_BMG_IDS`): G21 0xE202, 0xE209, 0xE20B, 0xE20C, 0xE20D, 0xE210,
+/// 0xE211, 0xE212, 0xE216; G31 0xE220, 0xE221, 0xE222, 0xE223 (pci.ids calls
+/// the 0xE22x group "Battlemage G31"). Alchemist (DG2) desktop and Pro IDs are
+/// named from the same `pci.ids` version.
 fn lookup_marketing_name(device_id: u16) -> Option<String> {
-    match device_id {
-        // Battlemage G21 — Arc B580 (verified). The only per-SKU mapping we
-        // can ground in an authoritative source.
-        0xE20B => Some("Arc B580".into()),
+    let name = match device_id {
+        // Battlemage G21 / G31 (pci.ids: "Battlemage G21 [Arc B580]" …).
+        0xE20B => "Arc B580",
+        0xE20C => "Arc B570",
+        0xE211 => "Arc Pro B60",
+        0xE212 => "Arc Pro B50",
+        0xE222 => "Arc Pro B65",
+        0xE223 => "Arc Pro B70",
+        // Alchemist DG2 (pci.ids: "DG2 [Arc A770]" …).
+        0x56A0 => "Arc A770",
+        0x56A1 => "Arc A750",
+        0x56A2 => "Arc A580",
+        0x56A5 => "Arc A380",
+        0x56A6 => "Arc A310",
+        0x56B0 => "Arc Pro A30M",
+        0x56B1 => "Arc Pro A40/A50",
+        0x56B2 => "Arc Pro A60M",
+        0x56B3 => "Arc Pro A60",
         _ => {
             log::debug!("Unknown/unmapped Intel GPU device ID: {device_id:#06x}");
-            None
+            return None;
         }
-    }
+    };
+    Some(name.into())
 }
 
 /// Select the primary (preferred) Intel GPU from detected GPUs.
@@ -316,10 +328,42 @@ mod tests {
         assert_eq!(lookup_marketing_name(0xE20B), Some("Arc B580".to_string()));
     }
 
+    /// GPD-10: every ID `pci.ids` 2026.10.14 names gets that name; the table
+    /// is the right-hand side, typed from the database, not from the code.
+    #[test]
+    fn pci_ids_named_devices_map_to_their_names() {
+        for (id, name) in [
+            (0xE20Bu16, "Arc B580"),
+            (0xE20C, "Arc B570"),
+            (0xE211, "Arc Pro B60"),
+            (0xE212, "Arc Pro B50"),
+            (0xE222, "Arc Pro B65"),
+            (0xE223, "Arc Pro B70"),
+            (0x56A0, "Arc A770"),
+            (0x56A1, "Arc A750"),
+            (0x56A2, "Arc A580"),
+            (0x56A5, "Arc A380"),
+            (0x56A6, "Arc A310"),
+            (0x56B0, "Arc Pro A30M"),
+            (0x56B1, "Arc Pro A40/A50"),
+            (0x56B2, "Arc Pro A60M"),
+            (0x56B3, "Arc Pro A60"),
+        ] {
+            assert_eq!(
+                lookup_marketing_name(id).as_deref(),
+                Some(name),
+                "id {id:#06x}"
+            );
+        }
+    }
+
     #[test]
     fn other_battlemage_ids_fall_back_to_generic() {
-        // Verified BMG IDs that we deliberately do not name per-SKU.
-        for id in [0xE202u16, 0xE209, 0xE20C, 0xE210, 0xE216, 0xE220, 0xE223] {
+        // BMG IDs pci.ids lists only as "Intel Graphics" (or not at all, 0xE209):
+        // no SKU is guessed.
+        for id in [
+            0xE202u16, 0xE209, 0xE20D, 0xE210, 0xE215, 0xE216, 0xE220, 0xE221,
+        ] {
             assert_eq!(lookup_marketing_name(id), None, "id {id:#06x}");
         }
     }
@@ -366,7 +410,7 @@ mod tests {
             "hwmon2",
             "i915",
             "0000:03:00.0",
-            "0x56a0", // Arc A770 (unmapped → generic label)
+            "0x56a0", // Arc A770
             "0x08",
             "0x030000",
             true,
@@ -376,9 +420,8 @@ mod tests {
         assert_eq!(gpus.len(), 1);
         let gpu = &gpus[0];
         assert_eq!(gpu.driver, "i915");
-        // Unmapped device ID → generic, truthful label.
-        assert!(gpu.marketing_name.is_none());
-        assert_eq!(gpu.display_label(), "Intel D-GPU");
+        assert_eq!(gpu.marketing_name.as_deref(), Some("Arc A770"));
+        assert_eq!(gpu.display_label(), "Arc A770");
         assert!(gpu.has_fan_rpm);
         assert_eq!(gpu.fan_control_method(), "read_only");
     }

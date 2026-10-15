@@ -367,8 +367,8 @@ impl NvmlLib {
         Ok(n)
     }
 
-    /// `nvmlDeviceGetFanSpeed_v2()` — duty as a percentage of max noise
-    /// tolerance (can exceed 100 on some parts).
+    /// `nvmlDeviceGetFanSpeed_v2()` — the *intended* duty as a percentage of
+    /// max noise tolerance (can exceed 100 on some parts); not a measurement.
     pub fn fan_duty_pct(&self, dev: NvmlHandle, fan: u32) -> Result<u32, NvmlError> {
         let mut pct: c_uint = 0;
         // SAFETY: valid handle + out-pointer; `fan` is a fan index < num_fans.
@@ -379,7 +379,8 @@ impl NvmlLib {
         Ok(pct)
     }
 
-    /// `nvmlDeviceGetFanSpeedRPM()` — per-fan RPM (driver R565+). Returns
+    /// `nvmlDeviceGetFanSpeedRPM()` — per-fan *intended* RPM (driver R565+;
+    /// `nvml.h` documents it as intended, not measured). Returns
     /// `Ok(None)` when the symbol is absent or the driver reports the versioned
     /// struct / feature is unsupported.
     pub fn fan_rpm(&self, dev: NvmlHandle, fan: u32) -> Result<Option<u32>, NvmlError> {

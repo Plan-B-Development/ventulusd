@@ -61,7 +61,7 @@ GUI's **Hardware** page reports what yours needs. The usual extras:
 | An out-of-tree driver (`it87-dkms-git`, `nct6687d-dkms-git`) | Most 2022-and-later Gigabyte and MSI boards, many ASRock boards, ASUS AM4 300/400-series | [Driver Setup][driver-setup] |
 | Signed DKMS modules, or Secure Boot off | An out-of-tree driver with Secure Boot on | [Secure Boot and DKMS modules][secure-boot] |
 | Sensible BIOS fan settings | Every board: the BIOS still runs the fans at boot, so never give its curve a 0 % point | [BIOS settings][bios] |
-| `amdgpu.ppfeaturemask=0xffffffff` | Fan control on an RX 7000 or RX 9000 | [AMD GPU prerequisite][amd-gpu] |
+| `amdgpu.ppfeaturemask=0xfff7ffff` (any mask with bit `0x4000`) | Fan control on an RX 7000 or RX 9000 | [AMD GPU prerequisite][amd-gpu] |
 | A driver option for an ACPI resource conflict | A driver that fails with *Device or resource busy* | [Module parameters][module-params] |
 | A full power cut | A dual-chip Gigabyte board whose second fan chip has vanished | [Missing fan headers][missing-headers] |
 

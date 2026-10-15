@@ -25,9 +25,12 @@ use crate::hwmon::nvml_sys::NvmlLib;
 
 /// One NVIDIA GPU's current telemetry snapshot. Every field is best-effort —
 /// `None` means "not available this tick" (unsupported, transient error, or no
-/// fan). `fan_duty_pct` is the firmware-reported current duty as a percentage of
+/// fan). `fan_duty_pct` is the driver-reported current duty as a percentage of
 /// max noise tolerance — distinct from any daemon-commanded value, and per NVML
-/// it **may exceed 100** on some parts. `fan_rpm` needs driver R565+.
+/// it **may exceed 100** on some parts. `fan_rpm` needs driver R565+. Both are
+/// what `nvml.h` calls the *intended* fan speed, not a tachometer reading: "If
+/// the fan is physically blocked and unable to spin, the output will not match
+/// the actual fan speed." A stalled fan does not show here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NvmlReading {
     /// PCI BDF (e.g. `0000:03:00.0`), used to form the `nvidia_gpu:<BDF>` id.

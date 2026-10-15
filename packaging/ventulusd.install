@@ -122,8 +122,10 @@ post_install() {
      * Gigabyte:         the package keeps nct6775/w83627ehf from probing
                          (journalctl -b -t ventulus-superio-guard); an empty
                          /etc/modprobe.d/ventulus-superio.conf turns that off.
-     * AMD RDNA3+ GPU:   PMFW fan curves need 'amdgpu.ppfeaturemask=0xffffffff'
-                         on the kernel command line.
+     * AMD RDNA3+ GPU:   PMFW fan curves need 'amdgpu.ppfeaturemask=0xfff7ffff'
+                         (any mask with bit 0x4000) on the kernel command
+                         line; from Linux 6.13 the kernel then logs
+                         'Overdrive is enabled' and is marked tainted.
    The GUI's Hardware page (readiness + Super-I/O detection) detects each of
    these and shows the exact driver + fix for your machine.
 

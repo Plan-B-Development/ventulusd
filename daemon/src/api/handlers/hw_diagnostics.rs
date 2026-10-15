@@ -207,9 +207,9 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
                 fan_control_method: gpu.fan_control_method().to_string(),
                 fan_rpm_available: gpu.has_fan_rpm,
                 fan_control_note:
-                    "Intel GPU fan control is managed autonomously by on-card firmware and is \
-                     not exposed to Linux userspace (the xe/i915 drivers register no PWM \
-                     interface). Temperature and fan RPM are read-only."
+                    "Intel GPU fan control is managed autonomously by on-card firmware: the \
+                     mainline xe/i915 drivers register no PWM interface, so nothing can set \
+                     the fan on a stock kernel. Temperature and fan RPM are read-only."
                         .to_string(),
             }
         });
@@ -228,9 +228,10 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
                 fan_rpm_available: gpu.fan_rpm_available,
                 fan_control_note:
                     "NVIDIA GPU fan control is not exposed to this daemon: the open nouveau \
-                     driver's writable pwm1 is deliberately excluded for safety, and the \
-                     proprietary NVML backend is read-only telemetry. Temperature and fan \
-                     telemetry are read-only."
+                     driver's writable pwm1 (some cards older than Turing) is deliberately \
+                     excluded for safety, and the proprietary NVML backend is read-only \
+                     telemetry, whose fan duty and RPM are the driver's intended speed, not \
+                     a measurement. Temperature and fan telemetry are read-only."
                         .to_string(),
             }
         });

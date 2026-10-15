@@ -232,8 +232,13 @@ The PMFW *fan_curve* sysfs node is gated behind the kernel command-line
 parameter:
 
 ```
-amdgpu.ppfeaturemask=0xffffffff
+amdgpu.ppfeaturemask=0xfff7ffff
 ```
+
+That is the kernel's default mask with bit 14 (*0x4000*, OverDrive) added;
+any mask with bit 14 set works. From Linux 6.13 enabling OverDrive marks the
+kernel tainted and logs "Overdrive is enabled, please disable it before
+reporting any bugs unrelated to overdrive."; that is expected.
 
 Without this, RDNA3+ fan control is read-only -- the GUI displays RPM
 but cannot write a curve. Pre-RDNA3 cards do not require this parameter.

@@ -1998,7 +1998,7 @@ mod tests {
             assert_eq!(e.source.as_str(), expected_source, "source for {id}");
             // GPU fan telemetry here is read-only — no commanded PWM.
             assert_eq!(e.last_commanded_pwm, None);
-            // The measured duty % must route from the cache to the wire (DEC-204).
+            // The reported duty % must route from the cache to the wire (DEC-204).
             assert_eq!(e.duty_pct, Some(33), "duty_pct for {id}");
         }
     }

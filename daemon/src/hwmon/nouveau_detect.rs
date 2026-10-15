@@ -8,14 +8,20 @@
 //!
 //! ## Read-only by design (Phase 1)
 //!
-//! nouveau *does* expose a writable `pwm1`/`pwm1_enable` on cards with
-//! controllable fans, but Phase-1 NVIDIA support is telemetry-only: this
+//! nouveau *does* expose a writable `pwm1`/`pwm1_enable` on some cards older
+//! than Turing, but Phase-1 NVIDIA support is telemetry-only: this
 //! detector models only the readable `fan1_input` (RPM). The `nouveau` chip is
 //! excluded from hwmon PWM-header and monitor-only-fan discovery via
 //! [`crate::hwmon::is_gpu_owned_hwmon_chip`] (mirroring the `amdgpu` DEC-102
 //! exclusion), so the profile engine can never drive that `pwm1`. GPU
 //! temperatures flow through the normal sensor pipeline tagged
 //! `SensorSource::NvidiaGpu` (see `discovery.rs`).
+//!
+//! On Turing and newer nouveau runs NVIDIA's GSP firmware (always on Ada and
+//! later, the default on Turing/Ampere since Linux 6.18, `e0ed674acbac`), its
+//! therm subdevice is not created (`gp100_therm_new` returns `-ENODEV` under
+//! GSP-RM) and `nouveau_hwmon_init` registers no hwmon device at all, so this
+//! detector finds nothing for those cards; only the NVML leg sees them.
 //!
 //! Identity is deliberately minimal here — just enough to form a stable
 //! `nvidia_gpu:<BDF>` fan id. PCI device-ID / marketing-name resolution and the
