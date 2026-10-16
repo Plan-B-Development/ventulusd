@@ -43,14 +43,28 @@ so can your scripts be (§ Scripting the daemon). No client writes a fan.
 
 ## Installation
 
-Install the package from the signed Ventulus pacman repository: the GUI manual's
+Install the package from the signed Ventulus repository for your distribution:
+pacman on Arch Linux and its derivatives, APT on Debian 13 and Ubuntu 26.04, DNF
+on Fedora 44. The GUI manual's
 [Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#installation)
-has the steps. A headless machine needs only `ventulusd`:
+has the steps, a tarball for Debian, Ubuntu and Fedora without a repository, and
+the distributions that are not supported. A headless machine needs only
+`ventulusd`:
 
 ```bash
-sudo pacman -Syu ventulusd
-sudo systemctl enable --now ventulusd
+sudo pacman -Syu ventulusd               # Arch
+sudo apt install ventulusd               # Debian, Ubuntu
+sudo dnf install ventulusd               # Fedora
+sudo systemctl enable --now ventulusd    # Arch, Fedora and the tarball
 ```
+
+Each platform starts the service its own way. The Debian and Ubuntu package
+enables and starts it as it installs, and restarts it after an upgrade. Fedora
+and the tarball's `install.sh` leave a new install disabled, and restart the
+daemon after an upgrade only if it was running. Arch leaves a new install
+disabled and does not restart the daemon after an upgrade: pacman prints
+`sudo systemctl restart ventulusd` for you to run. Every one of those stops is a
+systemd stop, so the daemon's hand-back (§ Safety) runs on each.
 
 Do not install by copying the binary and unit file in by hand. The unit runs
 `/usr/bin/ventulusd` and, after every stop, `/usr/bin/ventulus-restore-auto`,
@@ -72,15 +86,16 @@ itself, because the chips sit on ISA ports:
 | Module | Chipset | Common boards |
 |--------|---------|---------------|
 | `nct6775` | Nuvoton NCT6775–NCT6799 (incl. NCT5585D and the ASUS NCT6701D, which it reports as `nct6799`) | ASUS (AM4 500-series onward, Intel), ASRock, older MSI (AM4 300/400, the original X570 boards, Intel ≤ 300-series) |
-| `it87` | ITE IT87xx/IT86xx: the in-kernel driver covers only older parts plus IT8689E (7.1+) and IT87952E (6.3+); IT8686E/IT8688E/IT8696E/IT8665E need `it87-dkms-git` | Gigabyte; ASUS AM4 300/400-series (IT8665E) |
+| `it87` | ITE IT87xx/IT86xx: the in-kernel driver covers only older parts plus IT8689E (7.1+) and IT87952E (6.3+); IT8686E/IT8688E/IT8696E/IT8665E need the out-of-tree `frankcrawford/it87` | Gigabyte; ASUS AM4 300/400-series (IT8665E) |
 | `w83627ehf` | Winbond W83627EHF/DHG | Older boards |
 | `drivetemp` | SATA/SAS drive temperature | All SATA drives |
 
 To stop loading one, comment out its line and run
 `sudo systemctl restart systemd-modules-load` (`start` does nothing once the unit
-has run) or reboot. Do not rename or delete the file: pacman restores a missing
-one at the next upgrade, and keeps an edited one, delivering a new version as
-`ventulus.conf.pacnew`.
+has run) or reboot. Do not rename or delete the file: pacman, dnf and the
+tarball's `install.sh` put a missing one back at the next upgrade (apt leaves it
+deleted). Every format keeps an edited one, delivering a changed default beside
+it as `ventulus.conf.pacnew`, `.rpmnew` or `.new`; apt asks which to keep.
 
 CPU temperature modules (`coretemp` for Intel, `k10temp` for AMD) and SMBus
 adapter modules (`i2c-i801`, `i2c-piix4`) load automatically through PCI/ACPI
@@ -130,7 +145,7 @@ sudo systemctl restart ventulusd
 
 **ACPI conflicts.** If a Super-I/O module fails to bind with `ACPI resource
 conflict` or *Device or resource busy* in the kernel log, update the driver first:
-current `it87-dkms-git` builds avoid the conflict through MMIO on IT8688E,
+current builds of the out-of-tree it87 driver avoid the conflict through MMIO on IT8688E,
 IT8689E, IT8696E and IT8698E chips. Boards with an IT8686E, or with an IT8792E or
 IT87952E second chip, can still need the option below (it87 PRs
 [#135](https://github.com/frankcrawford/it87/pull/135) and
@@ -144,16 +159,20 @@ drivers (`nct6775`, `nct6687`) have no driver-local option, so for them
 remedy.
 
 **Out-of-tree modules.** Newer boards need drivers that are not in the mainline
-kernel, built with DKMS from the AUR: `it87-dkms-git` for newer ITE chips,
-`nct6687d-dkms-git` for MSI NCT6687D boards and some ASRock NCT6686D boards. The
-GUI manual's [Driver Setup](https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md)
-covers installing, signing and verifying them. Two things to know:
+kernel, built with DKMS from their upstream projects:
+[`frankcrawford/it87`](https://github.com/frankcrawford/it87) for newer ITE chips,
+[`Fred78290/nct6687d`](https://github.com/Fred78290/nct6687d) for MSI NCT6687D boards
+and some ASRock NCT6686D boards (on Arch, the AUR packages `it87-dkms-git` and
+`nct6687d-dkms-git`). The GUI manual's
+[Driver Setup](https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md)
+covers installing, signing and verifying them on each distribution, and the GUI's
+Hardware page shows the steps for the one it runs on. Things to know:
 
-- `it87-dkms-git` builds from 2026-09-09 (it87 v2.0) give Gigabyte chips longer
+- it87 builds from 2026-09-09 (it87 v2.0) give Gigabyte chips longer
   names, such as `it8696_a008090a`. The daemon strips that suffix, so fan header,
   sensor and voltage ids, and the pump roles, fan names and profiles that use
   them, do not change.
-- On Intel Z890 / B860 Gigabyte boards, `it87-dkms-git` builds from 2026-09-09 to
+- On Intel Z890 / B860 Gigabyte boards, it87 builds from 2026-09-09 to
   2026-10-01 can fail to load ("Invalid argument") or bind no chip. Rebuild from
   2026-10-02 or later ([it87 PR #140](https://github.com/frankcrawford/it87/pull/140)).
   Current builds need kernel 6.4 or newer.
@@ -186,8 +205,8 @@ The daemon publishes a **read-only** view of your cooling hardware for the GUI
 ## Configuration
 
 Configuration is optional. The package installs `/etc/ventulus/daemon.toml` with
-every key commented out, so the defaults apply until you uncomment one, and pacman
-keeps your edits on upgrade. With no file at all the daemon also runs on defaults.
+every key commented out, so the defaults apply until you uncomment one, and every
+package format keeps your edits on upgrade. With no file at all the daemon also runs on defaults.
 
 The file's location can be changed with `--config <path>` or `VENTULUS_CONFIG`
 (the flag wins). Under systemd, set either in a drop-in
@@ -870,8 +889,8 @@ and `/dev/serial/` paths, so a custom udev symlink such as
 
 The package installs an example rule, as documentation only, at
 `/usr/share/doc/ventulusd/99-ventulus.rules.example`. To use it, copy it into
-`/etc/udev/rules.d/` and edit it there (pacman overwrites the shipped example on
-upgrade):
+`/etc/udev/rules.d/` and edit it there (an upgrade overwrites the shipped
+example):
 
 ```bash
 sudo install -m644 \
@@ -1086,23 +1105,32 @@ page detects a missing Super-I/O driver, an ACPI conflict or a missing
 ## Uninstall
 
 ```bash
-sudo pacman -R ventulusd
+sudo pacman -R ventulusd                 # Arch
+sudo apt remove ventulusd                # Debian, Ubuntu
+sudo dnf remove ventulusd                # Fedora
+sudo /usr/lib/ventulus/uninstall         # the tarball
 ```
 
-The package stops and disables the service before it is removed. Stopping the
-daemon gives every motherboard fan header it took back to what it was doing
-before, usually its BIOS fan mode, both in-process as it exits and again through
-`ExecStopPost`. OpenFAN channels and headers with no mode switch are left at the
-exit minimum (§ Safety).
+Each one stops and disables the service before it removes anything (the
+tarball's uninstaller refuses to remove anything while the daemon is still
+running). Stopping the daemon gives every motherboard fan header it took back to
+what it was doing before, usually its BIOS fan mode, both in-process as it exits
+and again through `ExecStopPost`. OpenFAN channels and headers with no mode
+switch are left at the exit minimum (§ Safety).
 
-pacman leaves behind what it did not install or what you changed:
+What stays behind:
 
-- `/var/lib/ventulus/`, the daemon's state: `runtime.toml` (your header roles and
-  API-set settings), the saved active profile, the profile store and diagnostic
-  records;
-- an edited `/etc/ventulus/daemon.toml`, `/etc/ventulus/profiles/quiet.json` or
-  `/etc/modules-load.d/ventulus.conf`, kept with a `.pacsave` suffix, and any
-  profile you added under `/etc/ventulus/profiles/`;
+- `/var/lib/ventulus/`, the daemon's state, on every format: `runtime.toml` (your
+  header roles and API-set settings), the saved active profile, the profile store
+  and diagnostic records;
+- configuration under `/etc` (`/etc/ventulus/daemon.toml`,
+  `/etc/ventulus/profiles/quiet.json`, `/etc/modules-load.d/ventulus.conf`, and on
+  Debian, Ubuntu, Fedora and the tarball also the tray's autostart entry
+  `/etc/xdg/autostart/ventulus-tray.desktop`): pacman keeps an edited file with a
+  `.pacsave` suffix, dnf with `.rpmsave`, and the tarball's uninstaller keeps it
+  under its own name; `apt remove` keeps every one of them, edited or not, and
+  `apt purge ventulusd` deletes them. Any profile you added under
+  `/etc/ventulus/profiles/` stays too;
 - anything you installed by hand: a udev rule in `/etc/udev/rules.d/`, or a
   drop-in under `/etc/systemd/system/ventulusd.service.d/`.
 

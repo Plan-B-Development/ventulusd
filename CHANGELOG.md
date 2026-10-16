@@ -28,6 +28,12 @@ rename. Version numbers carry on from Control-OFC.
   they named `it87-dkms-git` and `nct6687d-dkms-git`, which exist only in the AUR. The GUI adds the
   install steps for your distribution beside the hint.
 
+- **The documentation covers every supported distribution.** The README, the User Guide and
+  `man ventulusd` give the install, upgrade and removal commands for Arch, Debian, Ubuntu, Fedora
+  and the tarball, say how each starts and restarts the service and what each keeps of your
+  configuration when you remove it, and give the kernel-parameter step for GRUB on Debian, Ubuntu
+  and Fedora.
+
 ## [5.1.0] — 2026-10-15
 
 Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.1.0 is the matching release.

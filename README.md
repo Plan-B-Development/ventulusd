@@ -27,21 +27,35 @@ guide has the chip-by-chip and board-by-board detail.
 
 ## Install
 
-Ventulus is packaged for Arch Linux (x86_64) in a signed pacman repository.
-[Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#installation)
-covers adding it (the key, its fingerprint and the `pacman.conf` entry), the
-signed bootstrap script, a one-off install from a release and its Sigstore check.
-Once the repository is set up:
+`ventulusd` is packaged for x86_64 Linux in signed repositories, from which it
+upgrades with the rest of your system:
+
+| Distribution | Install | Upgrades with |
+|---|---|---|
+| Arch Linux, CachyOS, EndeavourOS, Garuda | `sudo pacman -Syu ventulusd` | `sudo pacman -Syu` |
+| Debian 13, Ubuntu 26.04 LTS | `sudo apt install ventulusd` | `sudo apt update && sudo apt upgrade` |
+| Fedora 44 | `sudo dnf install ventulusd` | `sudo dnf upgrade` |
+
+Add the repository first: the
+[pacman-repo README](https://github.com/Plan-B-Development/pacman-repo#readme) and
+the GUI's [Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#installation)
+have the steps (the key, its fingerprint and the repository entry), the signed
+bootstrap script for Arch, a tarball for Debian, Ubuntu and Fedora without a
+repository, one-off installs from a release with their Sigstore check, and the
+distributions that are not supported. Install `ventulus` instead for the desktop
+app; it pulls in the daemon.
+
+On Debian and Ubuntu the service is enabled and started as it installs. On Arch
+and Fedora, and from the tarball, enable it yourself:
 
 ```bash
-sudo pacman -Syu ventulusd     # add ventulus for the desktop app
 sudo systemctl enable --now ventulusd
 ```
 
 A headless machine needs only `ventulusd`; the tray starts only where `ventulus`
-is installed. Install the package rather than copying the binary: the unit, the
+is installed. Install a package rather than copying the binary: the unit, the
 hand-back script that runs after every stop, the sleep hook and the Super-I/O
-guard all come with it. To build the package yourself or run your own build, see
+guard all come with it. To build the packages yourself or run your own build, see
 [`daemon/README.md`](https://github.com/Plan-B-Development/ventulusd/blob/main/daemon/README.md).
 
 Check that the daemon is answering:
@@ -58,7 +72,7 @@ GUI's **Hardware** page reports what yours needs. The usual extras:
 
 | You need | When | How |
 |---|---|---|
-| An out-of-tree driver (`it87-dkms-git`, `nct6687d-dkms-git`) | Most 2022-and-later Gigabyte and MSI boards, many ASRock boards, ASUS AM4 300/400-series | [Driver Setup][driver-setup] |
+| An out-of-tree driver (`frankcrawford/it87`, `Fred78290/nct6687d`), built with DKMS | Most 2022-and-later Gigabyte and MSI boards, many ASRock boards, ASUS AM4 300/400-series | [Driver Setup][driver-setup], per distribution |
 | Signed DKMS modules, or Secure Boot off | An out-of-tree driver with Secure Boot on | [Secure Boot and DKMS modules][secure-boot] |
 | Sensible BIOS fan settings | Every board: the BIOS still runs the fans at boot, so never give its curve a 0 % point | [BIOS settings][bios] |
 | `amdgpu.ppfeaturemask=0xfff7ffff` (any mask with bit `0x4000`) | Fan control on an RX 7000 or RX 9000 | [AMD GPU prerequisite][amd-gpu] |

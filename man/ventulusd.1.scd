@@ -162,8 +162,9 @@ _/usr/lib/systemd/system-sleep/ventulusd_
 
 _/etc/modules-load.d/ventulus.conf_
 	Loads the common Super-I/O sensor drivers at boot. To stop loading one,
-	comment out its line; do not rename or delete the file, which pacman
-	restores at the next upgrade. Apply an edit with *systemctl restart
+	comment out its line; do not rename or delete the file, which pacman,
+	dnf and the tarball's installer restore at the next upgrade (apt leaves
+	it deleted). Apply an edit with *systemctl restart
 	systemd-modules-load* or a reboot.
 
 _/usr/lib/modprobe.d/ventulus-superio.conf_, _/usr/lib/ventulus/ventulus-superio-guard_
@@ -247,7 +248,10 @@ To set the kernel parameter:
 
 . *GRUB* -- append to *GRUB_CMDLINE_LINUX_DEFAULT* in
   _/etc/default/grub_, then run
-  *sudo grub-mkconfig -o /boot/grub/grub.cfg*.
+  *sudo grub-mkconfig -o /boot/grub/grub.cfg* (Arch) or
+  *sudo update-grub* (Debian, Ubuntu). On Fedora, run
+  *sudo grubby --update-kernel=ALL --args=amdgpu.ppfeaturemask=0xfff7ffff*
+  instead of editing the file.
 . *systemd-boot* -- append to the *options* line in the active loader
   entry under _/boot/loader/entries/_.
 . *rEFInd* -- append to the *options* line in _/boot/refind_linux.conf_

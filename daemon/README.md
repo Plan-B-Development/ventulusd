@@ -101,9 +101,12 @@ sudo systemctl start ventulusd
 journalctl -u ventulusd -f
 ```
 
-pacman overwrites `/usr/bin/ventulusd` at the next upgrade, and
-`pacman -Qkk ventulusd` reports it as modified until then. To go back to the
-released binary, reinstall the package: `sudo pacman -S ventulusd`.
+The next package upgrade overwrites `/usr/bin/ventulusd`, and until then the
+package manager reports the file as modified (`pacman -Qkk ventulusd`,
+`dpkg --verify ventulusd` or `rpm -V ventulusd`). To go back to the released
+binary, reinstall the package: `sudo pacman -S ventulusd`,
+`sudo apt install --reinstall ventulusd` or `sudo dnf reinstall ventulusd`. On a tarball
+install, run its `install.sh` again.
 
 `--allow-non-root` skips the root check, for development only. File and socket
 permission checks still apply.
