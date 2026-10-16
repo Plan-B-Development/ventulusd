@@ -554,34 +554,32 @@ The daemon is the profile **store of record**: stored profiles live under
 API. The GUI uses this surface; scripts can too.
 
 ```bash
-SOCK="/run/ventulus/ventulus.sock"
-
 # List stored profiles (id / name / description summaries only)
-curl -s --unix-socket $SOCK http://localhost/profiles | jq .
+curl -s --unix-socket /run/ventulus/ventulus.sock http://localhost/profiles | jq .
 
 # Fetch one full profile document
-curl -s --unix-socket $SOCK http://localhost/profiles/quiet | jq .
+curl -s --unix-socket /run/ventulus/ventulus.sock http://localhost/profiles/quiet | jq .
 
 # Create a profile from a local JSON file
-curl -s --unix-socket $SOCK \
+curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X POST -H "Content-Type: application/json" \
   --data @my-profile.json \
   http://localhost/profiles | jq .
 
 # Validate a document without storing it (?validate_only=true)
-curl -s --unix-socket $SOCK \
+curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X POST -H "Content-Type: application/json" \
   --data @my-profile.json \
   'http://localhost/profiles?validate_only=true' | jq .
 
 # Replace a stored profile (re-activate afterwards to apply; there is no hot reload)
-curl -s --unix-socket $SOCK \
+curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X PUT -H "Content-Type: application/json" \
   --data @my-profile.json \
   http://localhost/profiles/my-profile | jq .
 
 # Delete a stored profile (fails 409 profile_in_use if it is active)
-curl -s --unix-socket $SOCK \
+curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X DELETE http://localhost/profiles/my-profile | jq .
 ```
 
@@ -681,23 +679,22 @@ pump/CPU floor (30 %, or 70 % for a pump on a DC-mode header), and the safety ru
 still win.
 
 ```bash
-SOCK="/run/ventulus/ventulus.sock"
-
 # 1. Take an override on a control (control_id comes from the active profile).
 #    Returns an override_token plus the TTL (15 s) and advised renew interval (~5 s).
-TOKEN=$(curl -s --unix-socket $SOCK \
+#    In fish, write `set TOKEN (curl ... | jq -r .override_token)` instead.
+TOKEN=$(curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X POST -H "Content-Type: application/json" \
   -d '{"pwm_percent": 60}' \
   http://localhost/control/cpu_fans/override | jq -r .override_token)
 
 # 2. Renew before the TTL lapses (repeat roughly every 5 s to hold it).
-curl -s --unix-socket $SOCK \
+curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X POST -H "Content-Type: application/json" \
   -d "{\"override_token\": $TOKEN}" \
   http://localhost/control/cpu_fans/override/renew | jq .
 
 # 3. Release when done (reverts to the curve immediately).
-curl -s --unix-socket $SOCK \
+curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X DELETE -H "Content-Type: application/json" \
   -d "{\"override_token\": $TOKEN}" \
   http://localhost/control/cpu_fans/override | jq .
@@ -746,16 +743,14 @@ profile, as a `CPU_FAN` label does, but it is not a pump: identify still stops i
 and `stop_permitted` stays `true`.
 
 ```bash
-SOCK="/run/ventulus/ventulus.sock"
-
 # Stop one fan (fan_id from GET /fans). It is restored when the timer runs out.
-curl -s --unix-socket $SOCK \
+curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X POST -H "Content-Type: application/json" \
   -d '{"action": "stop"}' \
   http://localhost/fans/amd_gpu:0000:03:00.0/identify | jq .
 
 # Restore it now (the engine resumes the fan's curve value).
-curl -s --unix-socket $SOCK \
+curl -s --unix-socket /run/ventulus/ventulus.sock \
   -X POST -H "Content-Type: application/json" \
   -d '{"action": "restore"}' \
   http://localhost/fans/amd_gpu:0000:03:00.0/identify | jq .
@@ -979,12 +974,11 @@ The API is HTTP over the Unix socket `/run/ventulus/ventulus.sock`, which every
 local user can read and write. `curl` and `jq` are enough:
 
 ```bash
-SOCK=/run/ventulus/ventulus.sock
-curl -s --unix-socket $SOCK http://localhost/status | jq .        # health, thermal state, overrides
-curl -s --unix-socket $SOCK http://localhost/capabilities | jq .  # devices, feature flags, limits
-curl -s --unix-socket $SOCK http://localhost/sensors | jq .
-curl -s --unix-socket $SOCK http://localhost/fans | jq .
-curl -s --unix-socket $SOCK http://localhost/diagnostics/hardware | jq .  # start here when something looks wrong
+curl -s --unix-socket /run/ventulus/ventulus.sock http://localhost/status | jq .        # health, thermal state, overrides
+curl -s --unix-socket /run/ventulus/ventulus.sock http://localhost/capabilities | jq .  # devices, feature flags, limits
+curl -s --unix-socket /run/ventulus/ventulus.sock http://localhost/sensors | jq .
+curl -s --unix-socket /run/ventulus/ventulus.sock http://localhost/fans | jq .
+curl -s --unix-socket /run/ventulus/ventulus.sock http://localhost/diagnostics/hardware | jq .  # start here when something looks wrong
 ```
 
 The [API contract](https://github.com/Plan-B-Development/ventulus/blob/main/docs/08_API_Integration_Contract.md)
