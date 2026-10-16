@@ -34,7 +34,7 @@ upgrades with the rest of your system:
 |---|---|---|
 | Arch Linux, CachyOS, EndeavourOS, Garuda | `sudo pacman -Syu ventulusd` | `sudo pacman -Syu` |
 | Debian 13, Ubuntu 26.04 LTS | `sudo apt install ventulusd` | `sudo apt update && sudo apt upgrade` |
-| Fedora 44 | `sudo dnf install ventulusd` | `sudo dnf upgrade` |
+| Fedora 44, Fedora 45 | `sudo dnf install ventulusd` | `sudo dnf upgrade` |
 
 Add the repository first: the
 [pacman-repo README](https://github.com/Plan-B-Development/pacman-repo#readme) and

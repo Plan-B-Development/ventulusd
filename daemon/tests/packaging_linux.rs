@@ -540,9 +540,11 @@ fn ci_runs_the_lifecycle_for_every_format_and_distribution() {
         ("debian:13", "deb"),
         ("ubuntu:26.04", "deb"),
         ("fedora:44", "rpm"),
+        ("fedora:45", "rpm"),
         ("debian:13", "tarball"),
         ("ubuntu:26.04", "tarball"),
         ("fedora:44", "tarball"),
+        ("fedora:45", "tarball"),
     ] {
         assert!(
             legs.contains(&(want.0.to_string(), want.1.to_string())),

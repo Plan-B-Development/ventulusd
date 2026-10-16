@@ -213,6 +213,9 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  # One .rpm for every Fedora release (no %{?dist}: the binary needs only
+  # glibc 2.34), built once here; the lifecycle legs install it on each release
+  # the GUI is built for.
   rpm:
     name: Fedora package
     needs: packages
@@ -254,9 +257,11 @@ jobs:
           - { image: 'debian:13', format: deb }
           - { image: 'ubuntu:26.04', format: deb }
           - { image: 'fedora:44', format: rpm }
+          - { image: 'fedora:45', format: rpm }
           - { image: 'debian:13', format: tarball }
           - { image: 'ubuntu:26.04', format: tarball }
           - { image: 'fedora:44', format: tarball }
+          - { image: 'fedora:45', format: tarball }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2

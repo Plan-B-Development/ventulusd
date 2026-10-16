@@ -45,7 +45,7 @@ so can your scripts be (§ Scripting the daemon). No client writes a fan.
 
 Install the package from the signed Ventulus repository for your distribution:
 pacman on Arch Linux and its derivatives, APT on Debian 13 and Ubuntu 26.04, DNF
-on Fedora 44. The GUI manual's
+on Fedora 44 and 45. The GUI manual's
 [Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#installation)
 has the steps, a tarball for Debian, Ubuntu and Fedora without a repository, and
 the distributions that are not supported. A headless machine needs only
