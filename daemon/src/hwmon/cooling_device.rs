@@ -342,7 +342,7 @@ pub fn canonicalize_ids(mut dev: CoolingDeviceConfig) -> CoolingDeviceConfig {
         out
     };
 
-    dev.pump_member = dev.pump_member.filter(&keep).map(canon);
+    dev.pump_member = dev.pump_member.filter(keep).map(canon);
     dev.radiator_members = canon_list(std::mem::take(&mut dev.radiator_members));
     dev.auxiliary_members = canon_list(std::mem::take(&mut dev.auxiliary_members));
     dev.preferred_sensor = dev.preferred_sensor.map(canon);
