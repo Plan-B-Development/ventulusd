@@ -5,7 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "Hardware fan control daemon for Linux (OpenFan, hwmon, AMD GPU)"
 repository = "https://github.com/Plan-B-Development/ventulusd"
-authors = ["Plan-B-Development <https://github.com/Plan-B-Development>"]
+authors = ["Plan-B-Development <Mitchell.R.Palmer@gmail.com>"]
 
 [dependencies]
 axum = "0.8"

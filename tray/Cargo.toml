@@ -14,7 +14,7 @@ edition = "2021"
 license = "MIT"
 description = "KDE/freedesktop system-tray client for the Ventulus daemon"
 repository = "https://github.com/Plan-B-Development/ventulusd"
-authors = ["Plan-B-Development <https://github.com/Plan-B-Development>"]
+authors = ["Plan-B-Development <Mitchell.R.Palmer@gmail.com>"]
 
 [dependencies]
 # StatusNotifierItem + com.canonical.dbusmenu, pure Rust, no GUI toolkit.

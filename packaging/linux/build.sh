@@ -44,7 +44,7 @@ ventulusd ($version-$rev) unstable; urgency=medium
 
   * Ventulus daemon $version; see /usr/share/doc/ventulusd/CHANGELOG.md.
 
- -- Plan-B-Development <https://github.com/Plan-B-Development>  $(date -R -u -d "@$SOURCE_DATE_EPOCH")
+ -- Plan-B-Development <Mitchell.R.Palmer@gmail.com>  $(date -R -u -d "@$SOURCE_DATE_EPOCH")
 EOF
     # -d: the toolchain comes from rustup, not Build-Depends; nothing is
     # compiled here anyway (debian/rules packs <work>/bin).
