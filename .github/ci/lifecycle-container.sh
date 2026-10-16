@@ -14,7 +14,10 @@ name=lifecycle
 
 case "$image" in
     debian:* | ubuntu:*)
-        setup='export DEBIAN_FRONTEND=noninteractive && apt-get update -q && apt-get install -y -q --no-install-recommends systemd systemd-sysv dbus kmod curl ca-certificates procps'
+        # The Docker Hub images ship a policy-rc.d that exits 101, so
+        # deb-systemd-invoke would never start, restart or stop the daemon
+        # from the maintainer scripts. A real system has none; remove it.
+        setup='export DEBIAN_FRONTEND=noninteractive && rm -f /usr/sbin/policy-rc.d && apt-get update -q && apt-get install -y -q --no-install-recommends systemd systemd-sysv dbus kmod curl ca-certificates procps'
         ;;
     fedora:*)
         setup='dnf -y -q install systemd kmod curl procps-ng tar gzip gawk'
