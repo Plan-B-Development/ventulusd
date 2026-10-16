@@ -1458,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "ventulus-tray"
-version = "5.1.0"
+version = "5.2.0"
 dependencies = [
  "env_logger",
  "ksni",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "ventulusd"
-version = "5.1.0"
+version = "5.2.0"
 dependencies = [
  "axum",
  "bytes",

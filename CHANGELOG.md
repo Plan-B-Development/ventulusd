@@ -5,6 +5,12 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+## [5.2.0] — 2026-10-16
+
+Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.2.0 is the matching release.
+Packages for Debian, Ubuntu and Fedora and a tarball, and driver hints named by upstream project. No API,
+capability, curve, floor or thermal-safety change.
+
 ### Added
 
 - **Packages for Debian 13, Ubuntu 26.04 and Fedora 44, and a tarball.** Each release now carries
