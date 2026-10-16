@@ -660,14 +660,25 @@ fn github_release_gates_on_a_green_test_suite() {
 
 /// The Release step must attach the package, not create an empty Release —
 /// otherwise the AUR-free install path documented in README.md is a dead link.
+/// It attaches everything in dist/ (DEC-499), so the Arch package must land
+/// there; packaging_linux.rs holds the other formats and SHA256SUMS.
 #[test]
 fn release_attaches_the_built_package() {
     let block = job_block(&release_workflow(), "github-release");
     assert!(
         block
             .lines()
-            .any(|l| l.trim().starts_with("files:") && l.contains("pkg.tar.zst")),
-        "the Release step must attach the built *.pkg.tar.zst (DEC-239)"
+            .any(|l| l.trim().strip_prefix("files:").map(str::trim) == Some("dist/*")),
+        "the Release step must attach every built package in dist/ (DEC-239, DEC-499)"
+    );
+    let download = block
+        .split("actions/download-artifact@")
+        .nth(1)
+        .expect("github-release downloads the clean-room package");
+    let step: String = download.lines().take(4).collect::<Vec<_>>().join("\n");
+    assert!(
+        step.contains("name: arch-package") && step.contains("path: dist"),
+        "the clean-room package must be downloaded into dist/ to be attached (DEC-239): {step}"
     );
 }
 

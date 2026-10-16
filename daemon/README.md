@@ -16,7 +16,8 @@ and the [User Guide](../docs/USER_GUIDE.md).
 ├── completions/      # shell completions
 ├── packaging/        # PKGBUILD, systemd unit, restore script, sleep hook,
 │                     #   Super-I/O guard, tray autostart entry, example
-│                     #   config and drop-ins
+│                     #   config and drop-ins; debian/, rpm/ and linux/
+│                     #   build the .deb, .rpm and tarball
 ├── docs/             # USER_GUIDE.md and ADRs/
 └── CHANGELOG.md
 ```
@@ -40,6 +41,8 @@ release time.
 
 ## Build the package yourself
 
+### Arch Linux
+
 ```bash
 git clone https://github.com/Plan-B-Development/ventulusd.git
 cd ventulusd/packaging
@@ -54,6 +57,27 @@ the archive the sum pins. `makepkg` therefore trusts the HTTPS fetch from this
 repository's own tag. For an input that is pinned and verifiable, use the
 package attached to the release and check its Sigstore attestation
 (`gh attestation verify <package> --repo Plan-B-Development/ventulusd`).
+
+### Debian, Ubuntu, Fedora and the tarball
+
+`packaging/linux/build.sh` builds these the way the release does. The binaries
+are built once, on Debian 13 (the oldest glibc of the supported distributions),
+and every format carries the same bytes; `packaging/linux/stage.sh` is their one
+file list and mirrors the `PKGBUILD`. From the repository root:
+
+```bash
+# Debian 13, with rustup, debhelper, dpkg-dev, scdoc, libudev-dev and pkg-config
+packaging/linux/build.sh binaries work
+packaging/linux/build.sh deb work 5.1.0 1 out         # out/ventulusd_5.1.0-1_amd64.deb
+packaging/linux/build.sh tarball work 5.1.0 out       # out/ventulusd-5.1.0-x86_64.tar.gz
+# Fedora, with rpm-build and systemd-rpm-macros, from the same work/
+packaging/linux/build.sh rpm work 5.1.0 1 out         # out/ventulusd-5.1.0-1.x86_64.rpm
+```
+
+`.github/ci/lifecycle.sh` installs, stops, kills, upgrades and removes a package
+on a machine running systemd and checks that the hand-back ran on each path. CI
+runs it per distribution in a privileged container. It also runs unchanged as
+root in a throwaway VM, never on a machine whose fans you care about.
 
 ## Running your own build
 

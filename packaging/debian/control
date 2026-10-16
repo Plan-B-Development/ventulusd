@@ -1,0 +1,20 @@
+Source: ventulusd
+Section: admin
+Priority: optional
+Maintainer: Plan-B-Development <https://github.com/Plan-B-Development>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Homepage: https://github.com/Plan-B-Development/ventulusd
+Rules-Requires-Root: no
+
+Package: ventulusd
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, systemd, kmod
+Suggests: lm-sensors, dkms
+Description: Hardware fan control daemon for Linux (OpenFan, hwmon, GPU)
+ ventulusd controls PC fans through an OpenFAN controller, motherboard
+ fan headers (hwmon) and AMD GPU firmware fan curves. The Ventulus GUI and
+ the ventulus-tray panel client talk to it over a local socket.
+ .
+ It gives every fan header back exactly as it found it whenever it stops,
+ and forces full speed on a thermal emergency whatever profile is active.

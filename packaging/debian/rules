@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+# Packs the binaries packaging/linux/build.sh built; nothing is compiled here.
+# build.sh sets VENTULUS_REPO (the source tree) and VENTULUS_WORK (its output).
+
+%:
+	dh $@
+
+override_dh_auto_configure override_dh_auto_build override_dh_auto_test override_dh_auto_clean:
+
+override_dh_auto_install:
+	cd "$(VENTULUS_REPO)" && packaging/linux/stage.sh deb \
+		"$(VENTULUS_WORK)/bin" "$(VENTULUS_WORK)/man" "$(CURDIR)/debian/ventulusd"
+
+# build.sh stripped the binaries, so the .deb, .rpm and tarball carry the same bytes.
+override_dh_strip override_dh_dwz:
+
+# The documentation stays at the paths the man page and messages name.
+override_dh_compress:
+	dh_compress -X.md -X.example
+
+# CHANGELOG.md stays CHANGELOG.md, at the path the documentation names; the
+# Debian changelog is installed beside it as changelog.Debian.
+override_dh_installchangelogs:
+	dh_installchangelogs -XCHANGELOG.md

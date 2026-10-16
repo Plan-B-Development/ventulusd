@@ -5,7 +5,23 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Added
+
+- **Packages for Debian 13, Ubuntu 26.04 and Fedora 44, and a tarball.** Each release now carries
+  `ventulusd_X.Y.Z-1_amd64.deb`, `ventulusd-X.Y.Z-1.x86_64.rpm` and `ventulusd-X.Y.Z-x86_64.tar.gz`
+  beside the Arch package, with a `SHA256SUMS` and a Sigstore provenance attestation for every file.
+  They install the same files at the same paths as the Arch package. The Debian and Ubuntu package
+  enables and starts the daemon on install, as Debian services do; the Fedora package and the tarball
+  leave it for you to enable (`sudo systemctl enable --now ventulusd`). The tarball's `install.sh`
+  upgrades an earlier tarball install and refuses to overwrite a packaged one; `sudo
+  /usr/lib/ventulus/uninstall` removes it. Every format restarts a running daemon on upgrade and stops
+  it on removal through systemd, so the fans are handed back as the daemon found them each time.
+  Configuration you edited is kept.
+
 ### Changed
+
+- **The module list says what each package manager does with it.** `/etc/modules-load.d/ventulus.conf`
+  said pacman puts a deleted copy back. So do dnf and the tarball's installer; apt leaves it deleted.
 
 - **Driver hints name the upstream project, not an Arch package.** The unbound-chip hint and the it87
   risk note say to build the driver from `frankcrawford/it87` or `Fred78290/nct6687d` with DKMS, where
