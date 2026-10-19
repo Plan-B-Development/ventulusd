@@ -621,3 +621,158 @@ fn the_release_ships_every_format_attested_and_checked_before_publishing() {
         );
     }
 }
+
+/// The package names in a PKGBUILD array (`depends=(...)`), quotes and any
+/// `: description` or version constraint removed.
+fn pkgbuild_array(pkgbuild: &str, name: &str) -> Vec<String> {
+    let start = pkgbuild
+        .find(&format!("\n{name}=("))
+        .unwrap_or_else(|| panic!("PKGBUILD has no {name}=( array"))
+        + name.len()
+        + 3;
+    let (mut out, mut word, mut quote) = (Vec::new(), String::new(), None);
+    for ch in pkgbuild[start..].chars() {
+        match (quote, ch) {
+            (None, ')') => break,
+            (None, '\'' | '"') => quote = Some(ch),
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_whitespace() => out.push(std::mem::take(&mut word)),
+            (_, c) => word.push(c),
+        }
+    }
+    out.push(word);
+    out.into_iter()
+        .filter(|w| !w.is_empty())
+        .map(|w| {
+            let w = w.split(':').next().unwrap();
+            w.split(['<', '>', '=']).next().unwrap().to_string()
+        })
+        .collect()
+}
+
+/// The package names in a Debian control field, alternatives included, with
+/// continuation lines joined and version constraints removed.
+fn deb_field(control: &str, field: &str) -> Vec<String> {
+    let mut value = String::new();
+    let mut lines = control.lines();
+    while let Some(line) = lines.next() {
+        if let Some(rest) = line.strip_prefix(&format!("{field}:")) {
+            value.push_str(rest);
+            for more in lines.by_ref() {
+                if !more.starts_with([' ', '\t']) {
+                    break;
+                }
+                value.push_str(more);
+            }
+        }
+    }
+    value
+        .split([',', '|'])
+        .filter_map(|alt| alt.split_whitespace().next())
+        .map(|w| w.split('(').next().unwrap().to_string())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// The package names an rpm spec tag lists (`Requires`, `Requires(post)`, …),
+/// version constraints removed.
+fn rpm_tag(spec: &str, tag: &str) -> Vec<String> {
+    spec.lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            let key = key.trim();
+            (key == tag || key.starts_with(&format!("{tag}("))).then_some(value)
+        })
+        .flat_map(|v| {
+            v.split([',', ' ', '\t'])
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .filter(|w| w.starts_with(|c: char| c.is_ascii_alphabetic()))
+        .collect()
+}
+
+/// A package that builds out-of-tree modules: DKMS, a `*-dkms` driver, kernel
+/// headers or akmods.
+fn builds_modules(name: &str) -> bool {
+    name.contains("dkms")
+        || name.contains("headers")
+        || name.starts_with("kernel-devel")
+        || name.starts_with("akmod")
+}
+
+/// DEC-500 Phase 3: an out-of-tree driver, and the DKMS and kernel headers it
+/// builds with, stay the user's choice in every format. None may become a
+/// dependency the package manager installs by default — Arch `depends`, a
+/// `.deb`'s `Depends`, `Pre-Depends` or `Recommends` (apt installs those), an
+/// rpm's `Requires` or `Recommends` (dnf installs weak dependencies) — and the
+/// tarball installer installs no package at all. They are offered where each
+/// format offers optional software: `optdepends` and `Suggests`.
+#[test]
+fn no_format_installs_dkms_or_kernel_headers_on_its_own() {
+    let pkgbuild = read_repo("packaging/PKGBUILD");
+    let control = read_repo("packaging/debian/control");
+    let spec = read_repo("packaging/rpm/ventulusd.spec");
+
+    // Each parser reads what it should, so an empty list cannot pass.
+    let arch_depends = pkgbuild_array(&pkgbuild, "depends");
+    assert!(
+        arch_depends.contains(&"glibc".to_string()),
+        "{arch_depends:?}"
+    );
+    let deb_depends = deb_field(&control, "Depends");
+    assert!(deb_depends.contains(&"kmod".to_string()), "{deb_depends:?}");
+    let rpm_requires = rpm_tag(&spec, "Requires");
+    assert!(
+        rpm_requires.contains(&"kmod".to_string()),
+        "{rpm_requires:?}"
+    );
+
+    let installed: Vec<(&str, Vec<String>)> = vec![
+        ("PKGBUILD depends", arch_depends),
+        ("debian Depends", deb_depends),
+        ("debian Pre-Depends", deb_field(&control, "Pre-Depends")),
+        ("debian Recommends", deb_field(&control, "Recommends")),
+        ("rpm Requires", rpm_requires),
+        ("rpm Recommends", rpm_tag(&spec, "Recommends")),
+    ];
+    for (what, names) in &installed {
+        let bad: Vec<_> = names.iter().filter(|n| builds_modules(n)).collect();
+        assert!(bad.is_empty(), "{what} installs {bad:?} by default");
+    }
+
+    // Offered, never installed: the optional lists name them.
+    let optdepends = pkgbuild_array(&pkgbuild, "optdepends");
+    for name in ["dkms", "linux-headers", "it87-dkms-git", "lm_sensors"] {
+        assert!(
+            optdepends.contains(&name.to_string()),
+            "optdepends lacks {name}: {optdepends:?}"
+        );
+    }
+    assert_eq!(deb_field(&control, "Suggests"), ["lm-sensors", "dkms"]);
+    assert_eq!(rpm_tag(&spec, "Suggests"), ["lm_sensors", "dkms"]);
+
+    // The tarball has no dependency list; its installer installs nothing.
+    let install = read_repo("packaging/linux/install.sh");
+    let commands: Vec<&str> = install
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    assert!(
+        commands.iter().any(|l| l.contains("dpkg -S")),
+        "the scan reads the installer's commands"
+    );
+    for verb in [
+        "apt install",
+        "apt-get install",
+        "dnf install",
+        "pacman -S",
+        "dkms ",
+    ] {
+        assert!(
+            !commands.iter().any(|l| l.contains(verb)),
+            "install.sh runs `{verb}`"
+        );
+    }
+}

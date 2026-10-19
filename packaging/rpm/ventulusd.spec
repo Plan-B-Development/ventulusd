@@ -14,6 +14,9 @@ URL:            https://github.com/Plan-B-Development/ventulusd
 ExclusiveArch:  x86_64
 BuildRequires:  systemd-rpm-macros
 Requires:       kmod
+# As the .deb's Suggests: never installed by default, so DKMS and kernel headers
+# stay the user's choice (packaging_linux.rs pins it).
+Suggests:       lm_sensors, dkms
 %{?systemd_requires}
 
 %description

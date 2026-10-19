@@ -37,6 +37,12 @@ rename. Version numbers carry on from Control-OFC.
 - **The kernel's own it87 is named as the likely after-update cause.** Where the loaded it87 is the
   kernel's own and cannot drive the chip, the Super-I/O advice says the out-of-tree DKMS build
   probably did not follow a kernel update, with `dkms status` and `sudo dkms autoinstall`.
+- **Packages offer the driver tools, never install them.** The Fedora package now suggests
+  `lm_sensors` and `dkms`, as the Debian package already did. The Arch `it87-dkms-git` optional
+  dependency says which chips need it and what it adds where the kernel already drives the chip
+  (IT87952E, and IT8689E from Linux 7.1). The tarball installer points to the GUI's Hardware page
+  to check which driver your board needs. No package installs DKMS or kernel headers by default,
+  and a test keeps it that way.
 
 - **Board voltages: 39 inputs on nine layouts are now shown unnamed.** Where a second, independent
   reading of GIGABYTE's sensor tables disagrees with the it87 configuration, the input is now left
