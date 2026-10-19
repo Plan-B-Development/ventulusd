@@ -185,6 +185,60 @@ pub fn knows_siv(cpu_vendor: &str, siv: u32) -> bool {
     })
 }
 
+/// The secondary Super-I/O chips — IT8792E/IT8795E (hwmon `it8792`) and
+/// IT87952E. A layout with a block for one carries it beside its primary; the
+/// primaries are every other chip the catalogue names.
+const SECONDARY_CHIPS: &[&str] = &["it8792", "it87952"];
+
+/// The chips this layout expects the board to expose (DEC-500), for the
+/// missing-chip warning on a board the DMI dual-chip table does not list.
+///
+/// Every chip the catalogue has a block for under this platform and SIV, with
+/// one correction: several layouts carry blocks for **two primaries** (the
+/// X570S layouts' `it8688` and `it8689`, a few Intel layouts' `it8686` and
+/// `it8688`) because the boards sharing the SIV are built with either. A board
+/// has one, so the primary expected is the one bound; with none of them bound
+/// the layout cannot say which is missing, and none is listed — never a guess.
+/// A single primary, and every secondary, is expected whatever is bound.
+///
+/// `bound` are the chip names bound here, canonical or not. Primaries first,
+/// then secondaries, each in name order. Empty for an unknown platform or SIV.
+///
+/// Checked against the DMI table on every board both name (2026-10-19): 101 of
+/// 103 agree; on the other two (B450 AORUS PRO and its WIFI, SIV `31050607`)
+/// the catalogue has no block for the board's fanless IT8792E, so it expects
+/// fewer chips, never more.
+pub fn expected_chips(cpu_vendor: &str, siv: u32, bound: &[&str]) -> Vec<String> {
+    let Some((stanzas, _)) = table_for(cpu_vendor) else {
+        return Vec::new();
+    };
+    let mut chips: Vec<&'static str> = stanzas
+        .iter()
+        .flat_map(|s| s.chips.iter())
+        .filter(|&&(_, w)| w == siv)
+        .map(|&(c, _)| c)
+        .collect();
+    chips.sort_unstable();
+    chips.dedup();
+    let is_bound = |chip: &str| {
+        bound
+            .iter()
+            .any(|b| super::chip_name::canonical_chip_name(b.trim()).eq_ignore_ascii_case(chip))
+    };
+    let (secondaries, primaries): (Vec<&str>, Vec<&str>) =
+        chips.into_iter().partition(|c| SECONDARY_CHIPS.contains(c));
+    let primaries: Vec<&str> = if primaries.len() > 1 {
+        primaries.into_iter().filter(|c| is_bound(c)).collect()
+    } else {
+        primaries
+    };
+    primaries
+        .into_iter()
+        .chain(secondaries)
+        .map(str::to_string)
+        .collect()
+}
+
 /// The board names the configs list for this SIV — empty where upstream says
 /// "Names not currently known", and for an unknown platform or SIV.
 pub fn listed_boards(cpu_vendor: &str, siv: u32) -> &'static [&'static str] {
@@ -557,6 +611,76 @@ mod tests {
             for &(siv, names) in boards {
                 assert!(sivs.insert(siv), "{name}: board list for {siv:08X} twice");
                 assert!(!names.is_empty() && names.iter().all(|n| !n.trim().is_empty()));
+            }
+        }
+    }
+
+    // ── expected_chips (DEC-500) ──────────────────────────────────────────
+
+    #[test]
+    fn a_layout_expects_its_primary_and_secondary_whatever_is_bound() {
+        let expect = |bound: &[&str]| expected_chips("AMD", HOST_SIV, bound);
+        assert_eq!(expect(&["it8696", "it87952"]), ["it8696", "it87952"]);
+        // The secondary is expected while it is missing: that is the warning.
+        assert_eq!(expect(&["it8696"]), ["it8696", "it87952"]);
+        assert_eq!(expect(&[]), ["it8696", "it87952"]);
+        // it87 v2.0 names the chip after the SIV; canonical names match.
+        assert_eq!(expect(&["it8696_a008090a"]), ["it8696", "it87952"]);
+        // A single-chip layout.
+        assert_eq!(expected_chips("AMD", 0x9004_0507, &[]), ["it8696"]);
+    }
+
+    /// The X570S layouts give one SIV blocks for `it8688` and `it8689`: the
+    /// board has one of them. The bound one is expected; with neither bound
+    /// the layout names no primary rather than call one missing.
+    #[test]
+    fn two_primary_blocks_expect_the_bound_one_and_never_guess() {
+        let x570s = 0x8008_090A;
+        assert_eq!(
+            expected_chips("AMD", x570s, &["it8689", "it87952"]),
+            ["it8689", "it87952"]
+        );
+        assert_eq!(
+            expected_chips("AMD", x570s, &["it8688_8008090a"]),
+            ["it8688", "it87952"]
+        );
+        assert_eq!(expected_chips("AMD", x570s, &[]), ["it87952"]);
+        // The platform is part of the key: the same SIV on Intel is one
+        // primary, expected unbound.
+        assert_eq!(expected_chips("Intel", x570s, &[]), ["it8689", "it87952"]);
+        // Intel 4008090A: two primaries and a secondary.
+        assert_eq!(
+            expected_chips("Intel", 0x4008_090A, &["it8688"]),
+            ["it8688", "it8792"]
+        );
+        assert_eq!(
+            expected_chips("AMD", 0x4008_090A, &[]),
+            ["it8688", "it8792"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_layout_or_platform_expects_nothing() {
+        assert!(expected_chips("AMD", 0xDEAD_BEEF, &["it8696"]).is_empty());
+        assert!(expected_chips("", HOST_SIV, &[]).is_empty());
+        assert!(expected_chips("Intel", HOST_SIV, &[]).is_empty());
+    }
+
+    /// Every primary group with more than one chip is the either-or case the
+    /// rule is for: no layout pairs two primaries with no secondary chip
+    /// between them for a reason the rule does not know, and every chip the
+    /// catalogue names is either a known primary or a [`SECONDARY_CHIPS`] entry.
+    #[test]
+    fn every_catalogue_chip_is_a_known_primary_or_secondary() {
+        let primaries = ["it8686", "it8688", "it8689", "it8696", "it8698"];
+        for (stanzas, _) in [(AMD, AMD_BOARDS), (INTEL, INTEL_BOARDS)] {
+            for s in stanzas {
+                for &(chip, _) in s.chips {
+                    assert!(
+                        primaries.contains(&chip) || SECONDARY_CHIPS.contains(&chip),
+                        "{chip}: classify it before the expected-chip rule meets it"
+                    );
+                }
             }
         }
     }

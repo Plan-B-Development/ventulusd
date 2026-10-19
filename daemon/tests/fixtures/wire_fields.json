@@ -509,6 +509,7 @@
         "catalogue_commit",
         "listed_boards",
         "board_listed",
+        "expected_chips",
         "channels"
       ],
       "must_be_read": [
@@ -518,9 +519,10 @@
         "catalogue_commit",
         "listed_boards",
         "board_listed",
+        "expected_chips",
         "channels"
       ],
-      "note": "DEC-500. The board's GIGABYTE firmware layout (SIV) and the board-catalogue verdict on its channels; omitted with no SIV or an unknown CPU vendor. Pinned from the first release that publishes it (WIRE-h is what an unpinned new struct costs)."
+      "note": "DEC-500. The board's GIGABYTE firmware layout (SIV) and the board-catalogue verdict on its channels; omitted with no SIV or an unknown CPU vendor. Pinned from the first release that publishes it (WIRE-h is what an unpinned new struct costs). Phase 2 added `expected_chips`: the chips the layout expects, which the GUI's missing-chip warning uses where the curated top-level `expected_chips` is empty."
     },
     {
       "daemon": "BoardLayoutChannel",
@@ -543,6 +545,26 @@
         "kind": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
       },
       "note": "DEC-500. `id` is the id the entity is published under elsewhere (a header, a monitor-only fan or a sensor) and is the GUI's join key; `kind` says which. Both names are too common for the name-based read check, so tests/test_board_layout_dec500.py asserts the join at the call site. `board_label` and `board_unmapped` are shared with VoltageEntry, so a read of either struct satisfies the name check for both."
+    },
+    {
+      "daemon": "KernelSecurityInfo",
+      "gui": "KernelSecurityInfo",
+      "endpoints": [
+        "GET /diagnostics/hardware .kernel_security"
+      ],
+      "fields": [
+        "secure_boot",
+        "lockdown",
+        "module_sig_enforce",
+        "signed_modules_only"
+      ],
+      "must_be_read": [
+        "secure_boot",
+        "lockdown",
+        "module_sig_enforce",
+        "signed_modules_only"
+      ],
+      "note": "DEC-500 Phase 2. Whether the kernel refuses unsigned modules (`signed_modules_only`, the verdict readiness wording keys on) and the three facts it is decided from; each omitted where it could not be read, the object omitted when none could. Pinned from the first release that publishes it."
     },
     {
       "daemon": "HwmonChipInfo",
@@ -1207,7 +1229,8 @@
         "amd_pci_devices",
         "amdgpu_module_loaded",
         "voltages",
-        "board_layout"
+        "board_layout",
+        "kernel_security"
       ],
       "must_be_read": [
         "hwmon",
@@ -1227,7 +1250,8 @@
         "amd_pci_devices",
         "amdgpu_module_loaded",
         "voltages",
-        "board_layout"
+        "board_layout",
+        "kernel_security"
       ],
       "inert": {
         "kernel_detected_chips": "parsed (DEC-101's kmsg chip detection) and read by no GUI surface today; the support bundle carries the raw payload instead."

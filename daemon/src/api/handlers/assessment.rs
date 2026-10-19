@@ -152,6 +152,7 @@ mod tests {
             chips: Vec::new(),
             acpi_conflict_drivers: Vec::new(),
             notes: Vec::new(),
+            signed_modules_only: None,
         }
     }
 

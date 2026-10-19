@@ -18,8 +18,25 @@ rename. Version numbers carry on from Control-OFC.
   `false`, and a profile holds it at the pump floor (70 % on a DC header). A `CPU_FAN` or `CPU_OPT`
   name earns the 30 % floor. Like every pump rule, this only adds protection; a role you assign can
   add to it, never take it away.
+- **The daemon says whether the kernel loads unsigned drivers.** `GET /diagnostics/hardware` reports
+  `kernel_security`: Secure Boot, the lockdown level, `module.sig_enforce`, and whether the kernel
+  refuses an unsigned module, read from sysfs, securityfs and efivarfs. Where it does and a chip
+  needs an out-of-tree driver that is not loaded, the Super-I/O advice and the readiness item say
+  so and how to enrol the key DKMS signed the driver with. The service sandbox is unchanged.
+- **The board layout lists the chips it expects.** `board_layout.expected_chips` names the chips a
+  Gigabyte layout says the board has (the bound primary where a layout has two), so a missing chip
+  can be reported on boards the curated list does not include.
 
 ### Changed
+
+- **IT8689E support follows the running kernel.** The kernel's own it87 drives the IT8689E from
+  Linux 7.1, so on 7.1 or later the chip reads as mainline and its advice calls the out-of-tree
+  driver optional, naming what it still adds: the board layout ID and the fixes for boards where
+  fan writes have no effect. On older kernels (Debian 13, Ubuntu 26.04), or when the kernel version
+  cannot be read, nothing changes.
+- **The kernel's own it87 is named as the likely after-update cause.** Where the loaded it87 is the
+  kernel's own and cannot drive the chip, the Super-I/O advice says the out-of-tree DKMS build
+  probably did not follow a kernel update, with `dkms status` and `sudo dkms autoinstall`.
 
 - **Board voltages: 39 inputs on nine layouts are now shown unnamed.** Where a second, independent
   reading of GIGABYTE's sensor tables disagrees with the it87 configuration, the input is now left

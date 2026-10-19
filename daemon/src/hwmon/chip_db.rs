@@ -25,14 +25,14 @@ use crate::api::responses::{AcpiConflictInfo, KernelModuleInfo, ModuleCollisionI
 /// Known hwmon driver modules and whether they're in the mainline kernel.
 ///
 /// Note on `it87`: the *module name* exists in the mainline tree, but most
-/// AM5/Z790-class chips people run (IT8625E/IT8686E/IT8688E/IT8696E, and —
-/// pragmatically — IT8689E) still want the out-of-tree frankcrawford/it87
-/// fork. IT8689E fan *control* only landed in mainline 7.1 (commit 66b8eaf)
-/// and IT87952E enumerates since 6.3 (commit d44cb4cd7456 — v6.2 lacks it,
-/// v6.3 has it; re-checked 2026-09-24), but on the 6.12/6.18 LTS kernels most
-/// users run, and for dual-chip control, the DKMS build is what they need.
-/// Marking the module `false` keeps the modules table honest for DKMS users;
-/// the chip-level column (`chip_driver_in_mainline`) reports per-chip.
+/// AM5/Z790-class chips people run (IT8625E/IT8686E/IT8688E/IT8696E) still
+/// want the out-of-tree frankcrawford/it87 fork. IT8689E is in mainline from
+/// 7.1 (commit 66b8eaf; [`mainline_since`]) and IT87952E enumerates since 6.3
+/// (commit d44cb4cd7456 — v6.2 lacks it, v6.3 has it; re-checked 2026-09-24),
+/// but for dual-chip control, and for the GIGABYTE layout ID, the DKMS build is
+/// what they need. Marking the module `false` keeps the modules table honest for
+/// DKMS users; the chip-level column (`chip_driver_in_mainline`) reports
+/// per-chip, for the running kernel.
 const KNOWN_MODULES: &[(&str, bool)] = &[
     ("nct6775", true),
     ("nct6775_core", true),
@@ -210,30 +210,51 @@ pub(crate) fn expected_driver_for_chip(chip_name: &str) -> &'static str {
     "unknown"
 }
 
-/// Whether a chip's driver is in the mainline kernel.
+/// A running kernel's `(major, minor)`, from
+/// [`crate::hwmon::kernel_warnings::parse_kernel_version`].
+pub type KernelVersion = (u32, u32);
+
+/// The `(major, minor)` of a kernel release string (`"7.2.10-1-cachyos"` →
+/// `(7, 2)`); `None` when absent or unparsable.
+pub fn kernel_version(release: Option<&str>) -> Option<KernelVersion> {
+    crate::hwmon::kernel_warnings::parse_kernel_version(release?)
+        .map(|(major, minor, _)| (major, minor))
+}
+
+/// The first mainline release whose `it87` drives this chip, for a chip that
+/// is supported only from a release the kernels people run may predate
+/// (DEC-500). `None` for every other chip: the static list in
+/// [`chip_driver_in_mainline`] answers for those on any kernel.
+///
+/// `it8689`: 7.1 (commit 66b8eaf, six PWM channels; released 2026-06-14;
+/// absent from `drivers/hwmon/it87.c` at v7.0, present at v7.1 and v7.3 —
+/// re-checked 2026-10-19). Fedora 43–45 and Arch ship 7.1 or later; Debian 13
+/// (6.12) and Ubuntu 26.04 (7.0) do not.
+pub fn mainline_since(chip_name: &str) -> Option<KernelVersion> {
+    chip_name
+        .to_lowercase()
+        .starts_with("it8689")
+        .then_some((7, 1))
+}
+
+/// Whether a chip's driver is in the mainline kernel **running here**.
 ///
 /// The ITE list mirrors mainline `it87` chip support
 /// (`drivers/hwmon/it87.c` enum + docs.kernel.org/hwmon/it87.html,
 /// verified at the v7.2 release tag, 2026-08-25 — enum unchanged from the
-/// 7.2-rc4 reading). `it8622` added in DEC-144. `it8689`
-/// is deliberately NOT listed (DEC-144, re-evaluated 2026-07 and again
-/// 2026-08-23): mainline 7.1 added IT8689E fan *control* (commit 66b8eaf — six
-/// PWM, FEAT_FANCTL_ONOFF, not just sensors; released 2026-06-14), but 7.1 is
-/// not the common kernel and some Gigabyte Rev 1 boards still have EC quirks —
-/// reporting "mainline: yes" would steer users off the DKMS build they still
-/// need.
+/// 7.2-rc4 reading). `it8622` added in DEC-144.
 ///
-/// **The 2026-08-23 re-check changed the schedule, not the flag**, and that is
-/// the useful outcome: the LTS lines this waits on were *extended*, so the
-/// trigger moved further away rather than closer. 6.12 and 6.18 are both now
-/// supported to **December 2028** (6.12 underpins Debian 13 and RHEL 10), so
-/// "7.1+ is the common floor" cannot plausibly become true before then.
-///
-/// So stop re-deriving this every audit. **Next scheduled re-check: 2027-08**,
-/// and the question to ask then is whether a mainstream distro has actually
-/// shipped 7.1+ as its default — not whether 7.1 exists, which has been true
-/// since 2026-06-14 and is not the condition that matters.
-pub fn chip_driver_in_mainline(chip_name: &str) -> bool {
+/// `kernel` is the running kernel's version; it matters only for a chip with a
+/// [`mainline_since`] release. **`it8689` is kernel-aware (DEC-500)**, by the
+/// user's decision, replacing DEC-144's "out-of-tree everywhere until a
+/// mainstream distro ships 7.1": on 7.1 or later the kernel's own `it87` drives
+/// it and the out-of-tree build is optional (it adds the GIGABYTE layout ID the
+/// board catalogue needs, and the PR #128 fixes for boards where writes have no
+/// effect); before 7.1, and where the version is unknown, it needs the
+/// out-of-tree build, the answer this function always gave. Matched on the
+/// version number, so a distribution kernel that backported the chip reads as
+/// lacking it.
+pub fn chip_driver_in_mainline(chip_name: &str, kernel: Option<KernelVersion>) -> bool {
     let driver = expected_driver_for_chip(chip_name);
     // ITE chips IT8625E+ require out-of-tree frankcrawford/it87
     if driver == "it87" {
@@ -244,6 +265,9 @@ pub fn chip_driver_in_mainline(chip_name: &str) -> bool {
             "it8772", "it8781", "it8782", "it8783", "it8786", "it8790", "it8792", "it8795",
             "it87952",
         ];
+        if let (Some(since), Some(running)) = (mainline_since(&lower), kernel) {
+            return running >= since;
+        }
         return mainline_chips.iter().any(|c| lower.starts_with(c));
     }
     KNOWN_MODULES
@@ -262,7 +286,11 @@ pub fn chip_driver_in_mainline(chip_name: &str) -> bool {
 /// knows, the bound module's own answer replaces the guess: an NCT6687D the
 /// in-kernel `nct6683` bound is `true`, an `nct6683` chip the out-of-tree
 /// `nct6687` bound is `false`. An unknown or unobserved driver changes nothing.
-pub fn chip_driver_in_mainline_bound(chip_name: &str, bound_driver: Option<&str>) -> bool {
+pub fn chip_driver_in_mainline_bound(
+    chip_name: &str,
+    bound_driver: Option<&str>,
+    kernel: Option<KernelVersion>,
+) -> bool {
     let module = |d: &str| d.trim().replace('-', "_");
     if let Some(bound) = bound_driver.map(module) {
         if bound != module(expected_driver_for_chip(chip_name)) {
@@ -271,7 +299,7 @@ pub fn chip_driver_in_mainline_bound(chip_name: &str, bound_driver: Option<&str>
             }
         }
     }
-    chip_driver_in_mainline(chip_name)
+    chip_driver_in_mainline(chip_name, kernel)
 }
 
 /// Return the expected driver name for a chip.
@@ -1838,9 +1866,9 @@ mod tests {
     #[test]
     fn f81768d_and_smsc47m192_map_to_their_own_drivers() {
         assert_eq!(expected_driver("f81768d"), "f71882fg");
-        assert!(chip_driver_in_mainline("f81768d"));
+        assert!(chip_driver_in_mainline("f81768d", None));
         assert_eq!(expected_driver("smsc47m192"), "smsc47m192");
-        assert!(chip_driver_in_mainline("smsc47m192"));
+        assert!(chip_driver_in_mainline("smsc47m192", None));
         for chip in ["smsc47m1", "smsc47m2"] {
             assert_eq!(expected_driver(chip), "smsc47m1", "{chip}");
         }
@@ -1886,12 +1914,12 @@ mod tests {
 
     #[test]
     fn mainline_detection() {
-        assert!(chip_driver_in_mainline("nct6798"));
-        assert!(!chip_driver_in_mainline("nct6687"));
+        assert!(chip_driver_in_mainline("nct6798", None));
+        assert!(!chip_driver_in_mainline("nct6687", None));
         // IT8688E is NOT in mainline
-        assert!(!chip_driver_in_mainline("it8688"));
+        assert!(!chip_driver_in_mainline("it8688", None));
         // IT8628E IS in mainline
-        assert!(chip_driver_in_mainline("it8628"));
+        assert!(chip_driver_in_mainline("it8628", None));
     }
 
     #[test]
@@ -1901,23 +1929,63 @@ mod tests {
         // tag, 2026-08-25) but was
         // missing from our list — the chips table falsely told IT8622E
         // owners they needed the DKMS build.
-        assert!(chip_driver_in_mainline("it8622"));
+        assert!(chip_driver_in_mainline("it8622", None));
+    }
+
+    /// DEC-500 (the user's "Kernel-aware" decision, replacing DEC-144's
+    /// out-of-tree-everywhere lock): IT8689E is in the kernel's own it87 from
+    /// 7.1. Both sides of the boundary, an unknown kernel (which keeps the old
+    /// answer), and a chip with no `mainline_since` that the version must not
+    /// move in either direction.
+    #[test]
+    fn it8689_is_mainline_from_kernel_7_1_and_unknown_kernels_keep_the_dkms_answer() {
+        assert!(
+            !chip_driver_in_mainline("it8689", Some((7, 0))),
+            "Ubuntu 26.04"
+        );
+        assert!(
+            !chip_driver_in_mainline("it8689", Some((6, 12))),
+            "Debian 13"
+        );
+        assert!(chip_driver_in_mainline("it8689", Some((7, 1))));
+        assert!(chip_driver_in_mainline("it8689", Some((7, 3))));
+        assert!(chip_driver_in_mainline("it8689", Some((8, 0))));
+        assert!(
+            !chip_driver_in_mainline("it8689", None),
+            "unknown: the old answer"
+        );
+        // A canonical name with it87 v2.0's SIV suffix is the same chip.
+        assert!(chip_driver_in_mainline("it8689_a008090a", Some((7, 2))));
+        for (chip, mainline) in [("it8696", false), ("it8688", false), ("it87952", true)] {
+            for kernel in [None, Some((6, 12)), Some((7, 1)), Some((9, 9))] {
+                assert_eq!(
+                    chip_driver_in_mainline(chip, kernel),
+                    mainline,
+                    "{chip} {kernel:?}"
+                );
+            }
+        }
+        // The bound-driver variant passes the kernel through.
+        assert!(chip_driver_in_mainline_bound(
+            "it8689",
+            Some("it87"),
+            Some((7, 1))
+        ));
+        assert!(!chip_driver_in_mainline_bound(
+            "it8689",
+            Some("it87"),
+            Some((7, 0))
+        ));
     }
 
     #[test]
-    fn it8689_stays_out_of_mainline_pending_common_7_1() {
-        // DEC-144 intent lock (re-evaluated 2026-07, and again 2026-08-23):
-        // mainline 7.1 added IT8689E fan *control* (commit 66b8eaf — six PWM,
-        // FEAT_FANCTL_ONOFF; released 2026-06-14), not just sensors. We still
-        // report it as NOT mainline because 7.1 is not the common kernel and
-        // some Gigabyte Rev 1 boards still have EC quirks — flipping this to
-        // true would steer users off the DKMS build they still need.
-        //
-        // 2026-08-23: the 6.12 and 6.18 LTS lines were EXTENDED to December
-        // 2028, so the condition this waits on moved further away, not closer.
-        // Next scheduled re-check 2027-08 — see `chip_driver_in_mainline`.
-        // Do not change without revisiting DEC-144.
-        assert!(!chip_driver_in_mainline("it8689"));
+    fn kernel_version_reads_major_and_minor() {
+        assert_eq!(kernel_version(Some("7.2.10-1-cachyos")), Some((7, 2)));
+        assert_eq!(kernel_version(Some("6.12.48+deb13-amd64")), Some((6, 12)));
+        assert_eq!(kernel_version(Some("garbage")), None);
+        assert_eq!(kernel_version(None), None);
+        assert_eq!(mainline_since("it8689"), Some((7, 1)));
+        assert_eq!(mainline_since("it8696"), None);
     }
 
     #[test]
@@ -1927,7 +1995,7 @@ mod tests {
         // GUI's chip guidance (DKMS; the mmio=on default regression was fixed
         // by frankcrawford/it87 PR #120, merged 2026-07-22 — issue #106 closed)
         // lines up with the modules table.
-        assert!(!chip_driver_in_mainline("it8665"));
+        assert!(!chip_driver_in_mainline("it8665", None));
     }
 
     #[test]
@@ -3169,29 +3237,53 @@ mod tests {
         assert_eq!(expected_driver("nct6799"), "nct6775");
         assert_eq!(expected_driver("nct6798"), "nct6775");
         // nct6683 is mainline; the nct6687d-driven chip is out-of-tree.
-        assert!(chip_driver_in_mainline("nct6683"));
-        assert!(chip_driver_in_mainline("nct6686"));
-        assert!(!chip_driver_in_mainline("nct6687"));
+        assert!(chip_driver_in_mainline("nct6683", None));
+        assert!(chip_driver_in_mainline("nct6686", None));
+        assert!(!chip_driver_in_mainline("nct6687", None));
     }
 
     #[test]
     fn mainline_follows_the_bound_driver_where_the_name_guessed_wrong() {
         // `BRD-g`: the hwmon name is shared by both nct668x drivers, so the
         // observed driver decides — in both directions.
-        assert!(chip_driver_in_mainline_bound("nct6687", Some("nct6683")));
-        assert!(chip_driver_in_mainline_bound("nct6686", Some("nct6683")));
+        assert!(chip_driver_in_mainline_bound(
+            "nct6687",
+            Some("nct6683"),
+            None
+        ));
+        assert!(chip_driver_in_mainline_bound(
+            "nct6686",
+            Some("nct6683"),
+            None
+        ));
         // `BRD-ac`: an NCT6686D the out-of-tree nct6687d bound is out-of-tree,
         // although its name now guesses the mainline nct6683.
-        assert!(!chip_driver_in_mainline_bound("nct6686", Some("nct6687")));
-        assert!(!chip_driver_in_mainline_bound("nct6683", Some("nct6687")));
+        assert!(!chip_driver_in_mainline_bound(
+            "nct6686",
+            Some("nct6687"),
+            None
+        ));
+        assert!(!chip_driver_in_mainline_bound(
+            "nct6683",
+            Some("nct6687"),
+            None
+        ));
         // Unobserved or matching: the chip-level answer stands, so it87's
         // per-chip split survives (one module, two answers).
-        assert!(!chip_driver_in_mainline_bound("nct6687", None));
-        assert!(!chip_driver_in_mainline_bound("it8688", Some("it87")));
-        assert!(chip_driver_in_mainline_bound("it8628", Some("it87")));
-        assert!(chip_driver_in_mainline_bound("nct6799", Some("nct6775")));
+        assert!(!chip_driver_in_mainline_bound("nct6687", None, None));
+        assert!(!chip_driver_in_mainline_bound("it8688", Some("it87"), None));
+        assert!(chip_driver_in_mainline_bound("it8628", Some("it87"), None));
+        assert!(chip_driver_in_mainline_bound(
+            "nct6799",
+            Some("nct6775"),
+            None
+        ));
         // A driver this table does not know cannot correct the guess.
-        assert!(!chip_driver_in_mainline_bound("nct6687", Some("mystery")));
+        assert!(!chip_driver_in_mainline_bound(
+            "nct6687",
+            Some("mystery"),
+            None
+        ));
     }
 
     #[test]
@@ -3211,7 +3303,7 @@ mod tests {
             "pc87427",
         ] {
             assert!(
-                chip_driver_in_mainline(chip),
+                chip_driver_in_mainline(chip, None),
                 "{chip} should report mainline=true"
             );
         }

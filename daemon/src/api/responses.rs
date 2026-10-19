@@ -2044,6 +2044,48 @@ pub struct HardwareDiagnosticsResponse {
     /// CPU vendor is unknown, and on older daemons.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub board_layout: Option<BoardLayout>,
+    /// Whether this kernel refuses unsigned modules, and the facts that decide
+    /// it (DEC-500). Omitted when none of them could be read, and on older
+    /// daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_security: Option<KernelSecurityInfo>,
+}
+
+/// The kernel's module-signing state (DEC-500,
+/// [`crate::hwmon::kernel_security`]): what decides whether an out-of-tree
+/// driver that is unsigned, or signed with a key this machine has not enrolled,
+/// can load. Each field is omitted where it could not be read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KernelSecurityInfo {
+    /// Whether the firmware booted with Secure Boot on (`false` on a machine
+    /// with no UEFI firmware). Secure Boot refuses nothing itself: what
+    /// refuses is `signed_modules_only`, which distributions usually turn on
+    /// with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secure_boot: Option<bool>,
+    /// The lockdown level: `"none"`, `"integrity"` or `"confidentiality"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lockdown: Option<&'static str>,
+    /// The `module.sig_enforce` parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_sig_enforce: Option<bool>,
+    /// The verdict: `true` when `module_sig_enforce` is on, or lockdown is at
+    /// `integrity` or above on a kernel with module signing; `false` only when
+    /// both were read and neither refuses; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_modules_only: Option<bool>,
+}
+
+impl KernelSecurityInfo {
+    /// The wire form, or `None` when nothing was read.
+    pub fn from_facts(ks: crate::hwmon::kernel_security::KernelSecurity) -> Option<Self> {
+        (!ks.is_unknown()).then(|| Self {
+            secure_boot: ks.secure_boot,
+            lockdown: ks.lockdown.map(|l| l.as_str()),
+            module_sig_enforce: ks.module_sig_enforce,
+            signed_modules_only: ks.signed_modules_only(),
+        })
+    }
 }
 
 /// A board's GIGABYTE firmware layout (its SIV) and the board-catalogue names
@@ -2071,6 +2113,15 @@ pub struct BoardLayout {
     /// Whether this board's DMI `board_name` is one of `listed_boards`
     /// (ASCII case-insensitive, trimmed).
     pub board_listed: bool,
+    /// The chips this layout expects the board to expose, in `chip_name` form
+    /// ([`crate::hwmon::board_catalogue::expected_chips`]): primaries first,
+    /// then secondaries. Where the layout has blocks for two primaries (boards
+    /// built with either), only the bound one is listed, and none when neither
+    /// is bound. Compare against `hwmon.chips_detected[].chip_name`, as for the
+    /// top-level `expected_chips`, which a client prefers where it is not
+    /// empty (that is the curated per-board table). Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_chips: Vec<String>,
     /// What the catalogue says about each discovered channel it covers, sorted
     /// by `id`. A channel the driver labelled, or one the catalogue withholds or
     /// never mentions, is not listed.
@@ -3672,12 +3723,19 @@ mod tests {
                 catalogue_commit: "bd7a566".into(),
                 listed_boards: vec!["X870E AORUS MASTER".into()],
                 board_listed: true,
+                expected_chips: vec!["it8696".into(), "it87952".into()],
                 channels: vec![BoardLayoutChannel {
                     id: "hwmon:it8696:it87.2624:temp5".into(),
                     kind: "temp",
                     board_label: Some("VRM MOS".into()),
                     board_unmapped: true,
                 }],
+            }),
+            kernel_security: Some(KernelSecurityInfo {
+                secure_boot: Some(false),
+                lockdown: Some("none"),
+                module_sig_enforce: Some(false),
+                signed_modules_only: Some(false),
             }),
         };
         expect(
@@ -3692,6 +3750,10 @@ mod tests {
         expect(
             &serde_json::to_value(&layout.channels[0]).unwrap(),
             "BoardLayoutChannel",
+        );
+        expect(
+            &serde_json::to_value(hardware.kernel_security.as_ref().unwrap()).unwrap(),
+            "KernelSecurityInfo",
         );
 
         // DEC-404 Stage 4 (`PTR-u`): the DEC-407 stall probe, enrolled when the
@@ -4164,13 +4226,15 @@ mod tests {
                 amdgpu_module_loaded: false,
                 voltages,
                 board_layout: None,
+                kernel_security: None,
             })
             .unwrap()
         }
 
         // DEC-500: no SIV, no layout — absent, so an older client's response is
-        // the one it always saw.
+        // the one it always saw. Nothing read about module signing: absent too.
         assert!(response(Vec::new()).get("board_layout").is_none());
+        assert!(response(Vec::new()).get("kernel_security").is_none());
         assert!(
             response(Vec::new()).get("voltages").is_none(),
             "an empty rail list must be omitted, not published as [] — an older \

@@ -604,8 +604,17 @@ fn build_superio_probe_response(
                 std::path::Path::new(crate::hwmon::chip_db::DMI_SYSFS_ROOT),
             );
             report.notes.extend(probe_notes);
+            let kernel = crate::hwmon::chip_db::kernel_version(
+                crate::hwmon::kernel_warnings::read_kernel_release().as_deref(),
+            );
             for p in &probed {
-                let chip = probed_to_superio_chip(p, guard_declines);
+                let chip = probed_to_superio_chip(
+                    p,
+                    guard_declines,
+                    kernel,
+                    report.signed_modules_only,
+                    &|m| superio::module_taint_out_of_tree(m) == Some(true),
+                );
                 // Fold a probe hit into an existing same-name passive card
                 // (union the PortProbe evidence) rather than emitting a duplicate
                 // — the same physical chip can surface both passively (DMI/kmsg,
@@ -775,15 +784,22 @@ fn pick_probe_bases(
 ///
 /// `guard_declines`: the package's Super-I/O guard declines `nct6775`/`w83627ehf`
 /// on this board (`DC-da`), so the hint for either must not say "load it".
+/// `kernel` and `signed_only` are the running kernel's version and whether it
+/// refuses unsigned modules (DEC-500), as the passive report decided them.
 fn probed_to_superio_chip(
     p: &superio_probe::ProbedChip,
     guard_declines: bool,
+    kernel: Option<crate::hwmon::chip_db::KernelVersion>,
+    signed_only: Option<bool>,
+    // DEC-500: "is this module loaded as an out-of-tree build?" — the probe
+    // refuses only while a driver is *bound*, so one can be loaded and unbound.
+    out_of_tree_loaded: &dyn Fn(&str) -> bool,
 ) -> superio::SuperIoChip {
     let (chip_name, expected_module, in_mainline) = match (&p.chip_name, p.vendor) {
         (Some(name), _) => (
             name.clone(),
             crate::hwmon::chip_db::expected_driver(name).to_string(),
-            crate::hwmon::chip_db::chip_driver_in_mainline(name),
+            crate::hwmon::chip_db::chip_driver_in_mainline(name, kernel),
         ),
         (None, superio::SuperIoVendor::Nuvoton) => (
             format!("Nuvoton/Winbond Super-I/O (DEVID 0x{:04x})", p.devid),
@@ -847,12 +863,20 @@ fn probed_to_superio_chip(
                 superio::out_of_tree_source("it87")
             )
         };
+        // DEC-500: the same kernel notes as the passive report's.
+        let risk_notes = superio::kernel_risk_notes(
+            &chip_name,
+            &expected_module,
+            in_mainline,
+            signed_only,
+            out_of_tree_loaded(&expected_module),
+        );
         Some(superio::SuperIoRecommendation {
             module: expected_module.clone(),
             in_mainline,
             load_hint,
             reason: reason.clone(),
-            risk_notes: Vec::new(),
+            risk_notes,
         })
     };
     let caveats = if is_bridge {
@@ -1130,6 +1154,7 @@ mod tests {
             }],
             acpi_conflict_drivers: vec!["it87".into()],
             notes: vec!["present != control".into()],
+            signed_modules_only: None,
         };
         let dto = map_superio_report(&report, false, "disabled".to_string());
         assert!(dto.arch_supported);
@@ -1158,7 +1183,7 @@ mod tests {
             devid: 0x8688,
             chip_name: Some("it8688".to_string()),
         };
-        let chip = probed_to_superio_chip(&p, false);
+        let chip = probed_to_superio_chip(&p, false, None, None, &|_| false);
         assert_eq!(chip.chip_name, "it8688");
         assert_eq!(chip.evidence, vec![superio::Evidence::PortProbe]);
         assert!(!chip.hwmon_present);
@@ -1171,6 +1196,57 @@ mod tests {
         assert!(rec.reason.contains("active port probe"));
     }
 
+    /// DEC-500: a probed chip follows the running kernel (an IT8689E is
+    /// mainline on 7.1, where the out-of-tree build is called optional) and
+    /// carries the signing note where an out-of-tree build is needed and not
+    /// loaded, on a kernel that refuses unsigned modules — the passive
+    /// report's notes, from the same helper.
+    #[test]
+    fn a_probed_chip_follows_the_running_kernel_and_its_signing_rule() {
+        let probed = |chip: &str, devid: u16| superio_probe::ProbedChip {
+            base: 0x2e,
+            vendor: superio::SuperIoVendor::Ite,
+            devid,
+            chip_name: Some(chip.to_string()),
+        };
+        let rec_loaded = |p: &superio_probe::ProbedChip, kernel, signed, oot: bool| {
+            probed_to_superio_chip(p, false, kernel, signed, &|m| oot && m == "it87")
+                .recommendation
+                .expect("unbound probed chip → recommendation")
+        };
+        let rec =
+            |p: &superio_probe::ProbedChip, kernel, signed| rec_loaded(p, kernel, signed, false);
+        let it8689 = probed("it8689", 0x8689);
+        assert!(rec(&it8689, Some((7, 1)), None).in_mainline);
+        assert!(!rec(&it8689, Some((7, 0)), None).in_mainline);
+
+        let note = superio::signed_modules_note("it87");
+        let it8696 = probed("it8696", 0x8696);
+        assert!(rec(&it8696, Some((7, 2)), Some(true))
+            .risk_notes
+            .contains(&note));
+        assert!(rec(&it8696, Some((7, 2)), Some(false))
+            .risk_notes
+            .is_empty());
+        assert!(rec(&it8696, Some((7, 2)), None).risk_notes.is_empty());
+        // Loaded out-of-tree but unbound (the probe refuses only a bound
+        // driver): that build is running, so no signing note.
+        assert!(!rec_loaded(&it8696, Some((7, 2)), Some(true), true)
+            .risk_notes
+            .contains(&note));
+
+        // An IT8689E on 7.1: no signing note, and the optional-build note the
+        // passive report gives.
+        let on_7_1 = rec(&it8689, Some((7, 1)), Some(true)).risk_notes;
+        assert!(!on_7_1.contains(&note));
+        assert_eq!(
+            on_7_1,
+            superio::kernel_risk_notes("it8689", "it87", true, Some(true), false)
+        );
+        assert!(on_7_1.iter().any(|n| n.contains("optional")), "{on_7_1:?}");
+        assert!(rec(&it8689, Some((7, 0)), None).risk_notes.is_empty());
+    }
+
     #[test]
     fn probed_nuvoton_family_maps_to_nct6775_at_vendor_level() {
         let p = superio_probe::ProbedChip {
@@ -1179,7 +1255,7 @@ mod tests {
             devid: 0xd592,
             chip_name: None,
         };
-        let chip = probed_to_superio_chip(&p, false);
+        let chip = probed_to_superio_chip(&p, false, None, None, &|_| false);
         assert!(chip.chip_name.contains("DEVID 0xd592"));
         let rec = chip.recommendation.expect("recommendation");
         assert_eq!(rec.module, "nct6775");
@@ -1199,7 +1275,7 @@ mod tests {
             chip_name: None,
         };
         let hint = |guard| {
-            probed_to_superio_chip(&p, guard)
+            probed_to_superio_chip(&p, guard, None, None, &|_| false)
                 .recommendation
                 .expect("recommendation")
                 .load_hint
@@ -1243,7 +1319,7 @@ mod tests {
             run("Micro-Star International Co., Ltd.", "MAG B650 TOMAHAWK");
         assert!(!msi_guard, "another vendor: the guard loads");
         assert_eq!(msi_chips.len(), 1, "precondition: the MSI board was probed");
-        let msi_hint = probed_to_superio_chip(&msi_chips[0], msi_guard)
+        let msi_hint = probed_to_superio_chip(&msi_chips[0], msi_guard, None, None, &|_| false)
             .recommendation
             .expect("recommendation")
             .load_hint;
@@ -1258,7 +1334,7 @@ mod tests {
             devid: 0x1234,
             chip_name: None,
         };
-        let chip = probed_to_superio_chip(&p, false);
+        let chip = probed_to_superio_chip(&p, false, None, None, &|_| false);
         assert_eq!(chip.expected_module, "unknown");
         assert!(chip.recommendation.is_none());
         assert!(chip.caveats.iter().any(|c| c.contains("Unrecognized")));
@@ -1404,6 +1480,9 @@ mod tests {
                 chip_name: None,
             },
             false,
+            None,
+            None,
+            &|_| false,
         );
         let (vendor, name) = crate::hwmon::chip_db::any_ite_only_board_for_test();
         let (_, notes, _) = run_port_probe_with_board(

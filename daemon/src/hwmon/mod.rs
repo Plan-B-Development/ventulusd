@@ -22,6 +22,7 @@ pub mod handback;
 pub mod header_caps;
 pub mod intel_gpu_detect;
 pub mod inventory;
+pub mod kernel_security;
 pub mod kernel_warnings;
 pub mod lease;
 pub mod memory_id;

@@ -86,7 +86,7 @@ itself, because the chips sit on ISA ports:
 | Module | Chipset | Common boards |
 |--------|---------|---------------|
 | `nct6775` | Nuvoton NCT6775–NCT6799 (incl. NCT5585D and the ASUS NCT6701D, which it reports as `nct6799`) | ASUS (AM4 500-series onward, Intel), ASRock, older MSI (AM4 300/400, the original X570 boards, Intel ≤ 300-series) |
-| `it87` | ITE IT87xx/IT86xx: the in-kernel driver covers only older parts plus IT8689E (7.1+) and IT87952E (6.3+); IT8686E/IT8688E/IT8696E/IT8665E need the out-of-tree `frankcrawford/it87` | Gigabyte; ASUS AM4 300/400-series (IT8665E) |
+| `it87` | ITE IT87xx/IT86xx: the in-kernel driver covers only older parts plus IT8689E (7.1+) and IT87952E (6.3+); IT8686E/IT8688E/IT8696E/IT8665E need the out-of-tree `frankcrawford/it87`. The daemon reads the running kernel's version for the IT8689E | Gigabyte; ASUS AM4 300/400-series (IT8665E) |
 | `w83627ehf` | Winbond W83627EHF/DHG | Older boards |
 | `drivetemp` | SATA/SAS drive temperature | All SATA drives |
 
@@ -177,6 +177,18 @@ Hardware page shows the steps for the one it runs on. Things to know:
   2026-10-02 or later ([it87 PR #140](https://github.com/frankcrawford/it87/pull/140)).
   Current builds need kernel 6.4 or newer.
 - Never load `nct6687` with `force=1` on a board whose chip is an NCT679x.
+- **After a kernel update** the new kernel can boot with its own `it87`, when the
+  DKMS build for it failed or its headers were not installed. On most Gigabyte
+  boards that driver cannot drive the main chip. The daemon tells the two apart
+  (the module's out-of-tree taint) and says so in the Super-I/O advice, with
+  `dkms status` and `sudo dkms autoinstall`. It never reads the DKMS tree itself:
+  the sandbox keeps it out, and that stays so.
+- **A kernel that loads only signed modules** refuses an unsigned out-of-tree build
+  (*Key was rejected by service*, or *Operation not permitted* under lockdown).
+  `GET /diagnostics/hardware` reports `kernel_security`: Secure Boot, the lockdown
+  level, `module.sig_enforce` and the verdict, read from sysfs, securityfs and
+  efivarfs. When the verdict is yes and a chip needs a driver that is not loaded,
+  the Super-I/O advice says how to enrol the key DKMS signed the driver with.
 
 ### What the daemon detects, and what it deliberately doesn't
 
@@ -217,6 +229,8 @@ the driver left unnamed: `CPU_FAN`, `SYS_FAN5_PUMP`, `VRM MOS`.
   reports the match as `board_layout`: the SIV, whether the catalogue knows it, the
   upstream commit, the board names upstream lists for it and whether yours is one
   of them. A board on a known layout gets the names whether or not it is listed.
+  It also lists the chips the layout expects, so the GUI can warn about a missing
+  chip on a board its own list does not include.
 - **Read once, at start.** The daemon reads the layout as it starts, before it
   discovers the headers, and answers every catalogue fact from that read. After
   installing the out-of-tree driver, restart the daemon

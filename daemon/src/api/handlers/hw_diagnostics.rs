@@ -112,9 +112,12 @@ pub async fn hardware_diagnostics_handler(
 /// before it locks the controller so no sysfs read happens under that lock.
 /// `bound_driver` is published only where the scan saw one, and
 /// `in_mainline_kernel` follows it where it contradicts the name's guess.
+/// `kernel` is the running kernel's version: `in_mainline_kernel` is for this
+/// kernel (an IT8689E is mainline from 7.1, DEC-500).
 fn chips_detected(
     headers: &[&crate::hwmon::pwm_discovery::PwmHeaderDescriptor],
     observed: &[crate::hwmon::bound_driver::ObservedDriver],
+    kernel: Option<crate::hwmon::chip_db::KernelVersion>,
 ) -> Vec<HwmonChipInfo> {
     // Keyed by the canonical chip name (DEC-442); the sysfs spelling rides
     // beside it and is the same for every header of one chip.
@@ -134,8 +137,11 @@ fn chips_detected(
             let bound_driver =
                 crate::hwmon::bound_driver::driver_for_device(observed, &chip_name, &device_id)
                     .map(str::to_string);
-            let in_mainline =
-                diagnostics::chip_driver_in_mainline_bound(&chip_name, bound_driver.as_deref());
+            let in_mainline = diagnostics::chip_driver_in_mainline_bound(
+                &chip_name,
+                bound_driver.as_deref(),
+                kernel,
+            );
             let sysfs_chip_name = sysfs_names
                 .remove(&(chip_name.clone(), device_id.clone()))
                 .unwrap_or_else(|| chip_name.clone());
@@ -153,13 +159,19 @@ fn chips_detected(
 }
 
 fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json::Value>) {
+    // Kernel release read once and reused for the chips' mainline answer, the
+    // GPU advisories and the report.
+    let kernel_release = crate::hwmon::kernel_warnings::read_kernel_release();
+    let kernel = crate::hwmon::chip_db::kernel_version(kernel_release.as_deref());
     let observed = crate::hwmon::bound_driver::scan_bound_drivers(std::path::Path::new(
         crate::hwmon::HWMON_SYSFS_ROOT,
     ));
     let chips_detected: Vec<HwmonChipInfo> = match state.hwmon_controller {
-        Some(ref controller) => {
-            chips_detected(&controller.headers().iter().collect::<Vec<_>>(), &observed)
-        }
+        Some(ref controller) => chips_detected(
+            &controller.headers().iter().collect::<Vec<_>>(),
+            &observed,
+            kernel,
+        ),
         None => Vec::new(),
     };
 
@@ -186,9 +198,6 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             hwmon_present: state.amd_gpus.iter().any(|g| g.pci_bdf == d.pci_bdf),
         })
         .collect();
-
-    // Kernel release read once and reused for the GPU advisories and the report.
-    let kernel_release = crate::hwmon::kernel_warnings::read_kernel_release();
 
     // GPU diagnostics from detected GPUs
     let gpu_diag = amd_gpu_diagnostics(&state.amd_gpus, &amd_pci_raw, kernel_release.as_deref());
@@ -402,10 +411,24 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             .values()
             .map(|r| (r.id.as_str(), r.chip_name.as_str(), r.label.as_str()))
             .collect();
-        board_layout(board_context, &board.name, &headers, &fans, &temps)
+        board_layout(
+            board_context,
+            &board.name,
+            &bound_names,
+            &headers,
+            &fans,
+            &temps,
+        )
     } else {
         None
     };
+
+    // DEC-500: whether this kernel refuses unsigned modules. Three small
+    // read-only files; read fresh, as lockdown and `sig_enforce` can be raised
+    // at runtime.
+    let kernel_security = kernel_security_entry(std::path::Path::new(
+        crate::hwmon::kernel_security::SYS_ROOT,
+    ));
 
     json_ok(
         StatusCode::OK,
@@ -440,8 +463,17 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             amdgpu_module_loaded,
             voltages,
             board_layout,
+            kernel_security,
         },
     )
+}
+
+/// The `kernel_security` object (DEC-500) read under `sys_root`, or `None`
+/// when nothing could be read.
+fn kernel_security_entry(sys_root: &std::path::Path) -> Option<KernelSecurityInfo> {
+    KernelSecurityInfo::from_facts(crate::hwmon::kernel_security::KernelSecurity::read_from(
+        sys_root,
+    ))
 }
 
 /// The `board_layout` object (DEC-500): this board's SIV, whether upstream
@@ -450,6 +482,8 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
 ///
 /// `None` without an SIV or a known CPU vendor — the catalogue is keyed on
 /// both, and a layout object with no key would claim a match nobody made.
+/// `bound_chips` are the chips bound here (`chips_detected`), against which
+/// the layout's expected chips resolve a two-primary layout.
 /// `temps` is `(id, canonical chip, label)` per published sensor. A channel is
 /// named only where its driver published no label: a header's `board` was
 /// decided at discovery under that rule, and a monitor-only fan or temperature
@@ -457,6 +491,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
 fn board_layout(
     board: &crate::hwmon::board_catalogue::BoardContext,
     dmi_board_name: &str,
+    bound_chips: &[&str],
     headers: &[&crate::hwmon::pwm_discovery::PwmHeaderDescriptor],
     fans: &[crate::hwmon::inventory::FanInputDescriptor],
     temps: &[(&str, &str, &str)],
@@ -492,6 +527,7 @@ fn board_layout(
         }
     }
     channels.sort_by(|a, b| a.id.cmp(&b.id));
+    let expected_chips = board_catalogue::expected_chips(&platform, siv, bound_chips);
 
     Some(BoardLayout {
         siv: format!("{siv:08X}"),
@@ -500,6 +536,7 @@ fn board_layout(
         catalogue_commit: board_catalogue::UPSTREAM_COMMIT.to_string(),
         listed_boards: listed.iter().map(|n| n.to_string()).collect(),
         board_listed,
+        expected_chips,
         channels,
     })
 }
@@ -569,13 +606,13 @@ mod tests {
             header("it8696", "hwmon4", 1),
         ];
         let refs: Vec<&PwmHeaderDescriptor> = headers.iter().collect();
-        let chips = chips_detected(&refs, &observed);
+        let chips = chips_detected(&refs, &observed, Some((7, 2)));
 
         let nct = chips.iter().find(|c| c.chip_name == "nct6687").unwrap();
         assert_eq!(nct.expected_driver, "nct6687", "the name still guesses");
         assert_eq!(nct.bound_driver.as_deref(), Some("nct6683"));
         assert!(
-            !diagnostics::chip_driver_in_mainline_bound("nct6687", None),
+            !diagnostics::chip_driver_in_mainline_bound("nct6687", None, Some((7, 2))),
             "precondition: by name alone this chip is out-of-tree"
         );
         assert!(nct.in_mainline_kernel, "the in-kernel nct6683 bound it");
@@ -589,6 +626,25 @@ mod tests {
             wire.get("bound_driver").is_none(),
             "absent, not null: {wire}"
         );
+    }
+
+    /// DEC-500: `in_mainline_kernel` is for the kernel passed in — an IT8689E
+    /// the in-kernel it87 bound is mainline on 7.1, and out-of-tree on 7.0,
+    /// through the builder the handler calls.
+    #[test]
+    fn chips_detected_answers_mainline_for_the_running_kernel() {
+        use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
+        let header = PwmHeaderDescriptor {
+            chip_name: "it8689".into(),
+            device_id: "it87.2624".into(),
+            pwm_index: 1,
+            ..Default::default()
+        };
+        let refs = [&header];
+        let on = |kernel| chips_detected(&refs, &[], kernel)[0].in_mainline_kernel;
+        assert!(on(Some((7, 1))));
+        assert!(!on(Some((7, 0))));
+        assert!(!on(None));
     }
 
     /// `VOLT-b`: the handler's builder carries the catalogue through to the
@@ -765,6 +821,7 @@ mod tests {
             let layout = board_layout(
                 &ctx("AMD", Some(HOST_SIV)),
                 "X870E AORUS MASTER",
+                &["it8696"],
                 &[&cpu, &spare, &labelled],
                 &fans,
                 &temps,
@@ -772,6 +829,9 @@ mod tests {
             .expect("a layout");
 
             assert_eq!(layout.siv, "A008090A");
+            // The secondary is expected although only the primary is bound:
+            // that difference is the missing-chip warning's input.
+            assert_eq!(layout.expected_chips, ["it8696", "it87952"]);
             assert_eq!(layout.platform, "AMD");
             assert!(layout.in_catalogue);
             assert!(layout.board_listed);
@@ -814,7 +874,7 @@ mod tests {
                 ("B650 AORUS ELITE AX", false),
                 ("", false),
             ] {
-                let layout = board_layout(&ctx("AMD", Some(HOST_SIV)), dmi, &[&cpu], &[], &[])
+                let layout = board_layout(&ctx("AMD", Some(HOST_SIV)), dmi, &[], &[&cpu], &[], &[])
                     .expect("a layout");
                 assert_eq!(layout.board_listed, listed, "{dmi:?}");
                 assert_eq!(layout.channels.len(), 1, "{dmi:?}");
@@ -829,7 +889,7 @@ mod tests {
                 ctx("Hygon", Some(HOST_SIV)),
             ] {
                 assert!(
-                    board_layout(&c, "X870E AORUS MASTER", &[], &[], &[]).is_none(),
+                    board_layout(&c, "X870E AORUS MASTER", &[], &[], &[], &[]).is_none(),
                     "{c:?}"
                 );
             }
@@ -841,9 +901,10 @@ mod tests {
         fn an_unmapped_layout_is_reported_with_no_channels() {
             let temps = [("hwmon:it8696:nodev:temp5", "it8696", "temp5")];
             for c in [ctx("AMD", Some(0xDEAD_BEEF)), ctx("Intel", Some(HOST_SIV))] {
-                let layout =
-                    board_layout(&c, "X870E AORUS MASTER", &[], &[], &temps).expect("a layout");
+                let layout = board_layout(&c, "X870E AORUS MASTER", &["it8696"], &[], &[], &temps)
+                    .expect("a layout");
                 assert!(!layout.in_catalogue, "{c:?}");
+                assert!(layout.expected_chips.is_empty(), "{c:?}");
                 assert!(
                     layout.listed_boards.is_empty() && !layout.board_listed,
                     "{c:?}"
@@ -865,7 +926,7 @@ mod tests {
                 ("hwmon:it8696:nodev:temp1", "it8696", "temp1"),
                 ("hwmon:it87952:nodev:temp1", "it87952", "temp1"),
             ];
-            let layout = board_layout(&c, "", &[], &[], &temps).expect("a layout");
+            let layout = board_layout(&c, "", &[], &[], &[], &temps).expect("a layout");
             assert!(layout.in_catalogue);
             assert_eq!(
                 names(&layout),
@@ -881,12 +942,60 @@ mod tests {
                 ("hwmon:it87952:nodev:temp1", "it87952", "temp1"),
                 ("hwmon:it87952:nodev:temp3", "it87952", "temp3"),
             ];
-            let layout = board_layout(&ctx("AMD", Some(0xA108_090A)), "", &[], &[], &temps)
+            let layout = board_layout(&ctx("AMD", Some(0xA108_090A)), "", &[], &[], &[], &temps)
                 .expect("a layout");
             assert_eq!(
                 names(&layout),
                 vec![("hwmon:it87952:nodev:temp3", "temp", Some("System 2"), false)]
             );
         }
+
+        /// An X570S layout carries blocks for two primaries: the one bound is
+        /// expected, through the builder the handler calls; with neither bound
+        /// only the secondary is.
+        #[test]
+        fn a_two_primary_layout_expects_the_bound_primary() {
+            let c = ctx("AMD", Some(0x8008_090A));
+            let expected = |bound: &[&str]| {
+                board_layout(&c, "X570S AORUS MASTER", bound, &[], &[], &[])
+                    .expect("a layout")
+                    .expected_chips
+            };
+            assert_eq!(expected(&["it8689"]), ["it8689", "it87952"]);
+            assert_eq!(expected(&["it8688", "it87952"]), ["it8688", "it87952"]);
+            assert_eq!(expected(&[]), ["it87952"]);
+        }
+    }
+
+    /// DEC-500: the handler's `kernel_security` is the read under the root it
+    /// is given, and is absent when nothing there could be read.
+    #[test]
+    fn kernel_security_entry_publishes_what_was_read() {
+        let root = tempfile::tempdir().unwrap();
+        let write = |rel: &str, text: &str| {
+            let p = root.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        // No /sys/firmware/efi reads as "no Secure Boot" — create one with an
+        // empty efivars so all three facts start unknown.
+        std::fs::create_dir_all(root.path().join("firmware/efi/efivars")).unwrap();
+        assert_eq!(kernel_security_entry(root.path()), None);
+
+        write(
+            "kernel/security/lockdown",
+            "none [integrity] confidentiality\n",
+        );
+        write("module/module/parameters/sig_enforce", "N\n");
+        let entry = kernel_security_entry(root.path()).expect("facts were read");
+        assert_eq!(entry.lockdown, Some("integrity"));
+        assert_eq!(entry.module_sig_enforce, Some(false));
+        assert_eq!(entry.secure_boot, None);
+        assert_eq!(entry.signed_modules_only, Some(true));
+        let wire = serde_json::to_value(&entry).unwrap();
+        assert!(
+            wire.get("secure_boot").is_none(),
+            "absent, not null: {wire}"
+        );
     }
 }

@@ -563,6 +563,20 @@ pub fn superio_readiness_items(
         } else {
             ""
         };
+        // DEC-500: a chip that needs an out-of-tree driver which is not loaded,
+        // on a kernel that refuses unsigned modules — the likeliest reason an
+        // installed build is not loaded. The per-chip risk note says how to
+        // enrol the key.
+        let signing_note = if report.signed_modules_only == Some(true)
+            && report.chips.iter().any(|c| {
+                !c.module_loaded && c.recommendation.as_ref().is_some_and(|r| !r.in_mainline)
+            }) {
+            " This kernel loads only signed modules, so an out-of-tree driver that is unsigned, \
+             or signed with a key this machine has not enrolled, is refused when it loads; the \
+             per-chip recommendation says how to enrol the key DKMS signed it with."
+        } else {
+            ""
+        };
         items.push(
             ReadinessItem::new(
                 "superio_driver_unloaded",
@@ -571,7 +585,7 @@ pub fn superio_readiness_items(
                 title,
                 format!(
                     "{} Super-I/O chip(s) were detected but no matching kernel driver is bound: \
-                     {}. {tail}{guard_note}",
+                     {}. {tail}{guard_note}{signing_note}",
                     unbound.len(),
                     unbound.join(", ")
                 ),
@@ -921,6 +935,7 @@ mod tests {
             }],
             acpi_conflict_drivers: vec!["it87".into()],
             notes: vec![],
+            signed_modules_only: None,
         };
         let items = superio_readiness_items(&report);
         let codes: Vec<&str> = items.iter().map(|i| i.code.as_str()).collect();
@@ -968,6 +983,7 @@ mod tests {
                 }],
                 acpi_conflict_drivers: vec![],
                 notes: vec![],
+                signed_modules_only: None,
             };
         let detail = |r: SuperIoReport| {
             superio_readiness_items(&r)
@@ -1051,6 +1067,7 @@ mod tests {
             }],
             acpi_conflict_drivers: vec![],
             notes: vec![],
+            signed_modules_only: None,
         };
         let item = |loaded: bool| {
             superio_readiness_items(&report(loaded))
@@ -1097,6 +1114,55 @@ mod tests {
         assert_eq!(loaded.severity, not_loaded.severity);
     }
 
+    /// DEC-500: the aggregate names a kernel that refuses unsigned modules
+    /// only where a chip needs an out-of-tree driver that is not loaded — the
+    /// state a refused build leaves — and only on that verdict.
+    #[test]
+    fn the_unbound_item_names_a_kernel_that_refuses_unsigned_modules() {
+        use crate::hwmon::superio::{
+            Evidence, SuperIoChip, SuperIoRecommendation, SuperIoReport, SuperIoVendor,
+        };
+        let report = |signed: Option<bool>, in_mainline: bool, loaded: bool| SuperIoReport {
+            arch_supported: true,
+            chips: vec![SuperIoChip {
+                chip_name: "it8696".into(),
+                vendor: SuperIoVendor::Ite,
+                evidence: vec![Evidence::DmiBoardTable],
+                confidence: crate::hwmon::classify::Confidence::Medium,
+                bound_driver: None,
+                expected_module: "it87".into(),
+                module_loaded: loaded,
+                hwmon_present: false,
+                recommendation: Some(SuperIoRecommendation {
+                    module: "it87".into(),
+                    in_mainline,
+                    load_hint: "irrelevant here".into(),
+                    reason: "irrelevant here".into(),
+                    risk_notes: vec![],
+                }),
+                caveats: vec![],
+            }],
+            acpi_conflict_drivers: vec![],
+            notes: vec![],
+            signed_modules_only: signed,
+        };
+        let detail = |r: SuperIoReport| {
+            superio_readiness_items(&r)
+                .into_iter()
+                .find(|i| i.code == "superio_driver_unloaded")
+                .expect("an unbound chip with a recommendation must emit the item")
+                .detail
+        };
+        let signing = "loads only signed modules";
+        assert!(detail(report(Some(true), false, false)).contains(signing));
+        assert!(!detail(report(Some(false), false, false)).contains(signing));
+        assert!(!detail(report(None, false, false)).contains(signing));
+        // The driver the kernel ships drives it: nothing to sign.
+        assert!(!detail(report(Some(true), true, false)).contains(signing));
+        // Loaded: a refused build is not loaded, so this is not that state.
+        assert!(!detail(report(Some(true), false, true)).contains(signing));
+    }
+
     #[test]
     fn superio_items_empty_when_nothing_unbound_and_no_conflict() {
         use crate::hwmon::superio::SuperIoReport;
@@ -1105,6 +1171,7 @@ mod tests {
             chips: vec![],
             acpi_conflict_drivers: vec![],
             notes: vec![],
+            signed_modules_only: None,
         };
         assert!(superio_readiness_items(&report).is_empty());
     }
@@ -1141,6 +1208,7 @@ mod tests {
             }],
             acpi_conflict_drivers: vec!["it87".into()],
             notes: vec![],
+            signed_modules_only: None,
         };
         let mut items = build_readiness(&ReadinessInputs {
             cpu_sensor_count: 0,

@@ -145,6 +145,10 @@ pub struct SuperIoReport {
     pub acpi_conflict_drivers: Vec<String>,
     /// Report-level notes (always includes the "present ≠ controllable" caveat).
     pub notes: Vec<String>,
+    /// Whether this kernel refuses unsigned modules (DEC-500,
+    /// [`crate::hwmon::kernel_security::KernelSecurity::signed_modules_only`]);
+    /// `None` when that could not be read, and off x86.
+    pub signed_modules_only: Option<bool>,
 }
 
 /// One hwmon chip currently bound, as seen by the daemon's live cache. Passed
@@ -183,8 +187,16 @@ pub trait SuperIoEvidence {
     /// documented deterministic and side-effect free and every other input
     /// already arrives this way. The production implementation reads
     /// `/sys/module/<name>/taint`; see [`module_is_out_of_tree`] for why the
-    /// module's *path* cannot be used.
-    fn module_out_of_tree(&self, module: &str) -> bool;
+    /// module's *path* cannot be used. `None` when the flag could not be read
+    /// (DEC-500: then the loaded build is neither, never "the kernel's own").
+    fn module_out_of_tree(&self, module: &str) -> Option<bool>;
+    /// The running kernel's `(major, minor)`, `None` when unreadable (DEC-500):
+    /// whether a chip with a [`chip_db::mainline_since`] release is mainline
+    /// depends on it.
+    fn kernel_version(&self) -> Option<chip_db::KernelVersion>;
+    /// Whether this kernel refuses unsigned modules (DEC-500), `None` when
+    /// unknown.
+    fn signed_modules_only(&self) -> Option<bool>;
 }
 
 // ── Module allowlist ────────────────────────────────────────────────
@@ -345,11 +357,16 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
             chips: Vec::new(),
             acpi_conflict_drivers: Vec::new(),
             notes: vec!["Super-I/O detection is only supported on x86 / x86_64.".to_string()],
+            signed_modules_only: None,
         };
     }
 
     let loaded = ev.loaded_modules();
     let acpi_conflict_drivers = ev.acpi_conflict_drivers();
+    let kernel = KernelContext {
+        version: ev.kernel_version(),
+        signed_modules_only: ev.signed_modules_only(),
+    };
 
     // Union evidence into a name-keyed map (BTreeMap ⇒ deterministic ordering).
     let mut acc: BTreeMap<String, EvidenceAcc> = BTreeMap::new();
@@ -391,6 +408,7 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
             &acpi_conflict_drivers,
             &|m| ev.module_out_of_tree(m),
             guard_declines,
+            kernel,
         ));
     }
 
@@ -409,6 +427,7 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
         chips,
         acpi_conflict_drivers,
         notes,
+        signed_modules_only: kernel.signed_modules_only,
     }
 }
 
@@ -425,10 +444,11 @@ fn build_chip(
     // `HOST-d`: "is the loaded build out-of-tree?", taken from the evidence
     // trait rather than read here, so `build_chip` stays a pure function of its
     // inputs and the recommendation path is testable without a real `/sys`.
-    out_of_tree: &dyn Fn(&str) -> bool,
+    out_of_tree: &dyn Fn(&str) -> Option<bool>,
     // `DC-da`: whether the package's Super-I/O guard declines its modules on
     // this board ([`chip_db::superio_guard_declines`]).
     guard_declines: bool,
+    kernel: KernelContext,
 ) -> SuperIoChip {
     let expected_module = chip_db::expected_driver(chip_name).to_string();
     let vendor = vendor_for_module(&expected_module);
@@ -483,14 +503,17 @@ fn build_chip(
             ev,
             if !module_loaded {
                 DriverState::NotLoaded
-            } else if out_of_tree(&expected_module) {
-                DriverState::LoadedOutOfTree
             } else {
-                DriverState::LoadedInTree
+                match out_of_tree(&expected_module) {
+                    Some(true) => DriverState::LoadedOutOfTree,
+                    Some(false) => DriverState::LoadedInTree,
+                    None => DriverState::LoadedUnread,
+                }
             },
             loaded,
             acpi_conflict_drivers,
             guard_declines,
+            kernel,
             &mut caveats,
         )
     };
@@ -556,9 +579,22 @@ pub fn module_is_out_of_tree(module: &str) -> bool {
 /// Internal: the same check against an injectable root (test seam), matching
 /// the `amdgpu_module_loaded` / `amdgpu_module_loaded_at` pair in `gpu_detect`.
 pub fn module_is_out_of_tree_at(module_root: &Path, module: &str) -> bool {
+    module_taint_out_of_tree_at(module_root, module).unwrap_or(false)
+}
+
+/// [`module_taint_out_of_tree_at`] against the production root: `Some(true)`
+/// only for a loaded out-of-tree build (an unloaded module has no taint file).
+pub fn module_taint_out_of_tree(module: &str) -> Option<bool> {
+    module_taint_out_of_tree_at(Path::new(SYS_MODULE_ROOT), module)
+}
+
+/// The `O` flag as read, `None` when the taint file could not be read (DEC-500)
+/// — the reading `kernel_modules[].out_of_tree` publishes. A claim about which
+/// build is loaded ("the kernel's own") needs a flag that was read.
+pub fn module_taint_out_of_tree_at(module_root: &Path, module: &str) -> Option<bool> {
     std::fs::read_to_string(module_root.join(module).join("taint"))
+        .ok()
         .map(|t| t.contains('O'))
-        .unwrap_or(false)
 }
 
 /// How the expected driver stands for a present-but-unbound chip.
@@ -578,12 +614,24 @@ enum DriverState {
     LoadedInTree,
     /// Loaded, and it is an out-of-tree build (`HOST-d`, DEC-327).
     LoadedOutOfTree,
+    /// Loaded, with its taint unread (DEC-500). Advised as the in-tree build
+    /// is — the install advice stays, the conservative direction — except that
+    /// nothing says it is the kernel's own.
+    LoadedUnread,
 }
 
 impl DriverState {
     fn loaded(self) -> bool {
         !matches!(self, Self::NotLoaded)
     }
+}
+
+/// What the running kernel decides about a recommendation (DEC-500), read once
+/// per report from the evidence.
+#[derive(Debug, Clone, Copy, Default)]
+struct KernelContext {
+    version: Option<chip_db::KernelVersion>,
+    signed_modules_only: Option<bool>,
 }
 
 /// The upstream project an out-of-tree module is built from (DEC-499).
@@ -666,6 +714,66 @@ fn ite_unbound_tail(out_of_tree: bool) -> &'static str {
     }
 }
 
+/// The likely cause when the kernel's own `it87` is loaded but cannot drive the
+/// chip (DEC-500): DKMS builds a module per kernel, so a kernel whose rebuild
+/// failed, or whose headers were never installed, boots with its own driver.
+/// Prefixed to [`ite_unbound_tail`]'s in-tree branch. It gives no `modprobe -r`:
+/// unloading `it87` under a running daemon drops every header it drives.
+pub(crate) const IN_TREE_REBUILD_CAUSE: &str = " The `it87` loaded is the kernel's own, and it \
+     cannot drive this chip. If you had installed the out-of-tree it87, the usual cause is a \
+     kernel update its DKMS build did not follow: the rebuild for the new kernel failed, or \
+     that kernel's headers were not installed, so it kept its own driver. `dkms status` lists \
+     the kernels the build is installed for, and `sudo dkms autoinstall` builds it for the \
+     running kernel once that kernel's headers are installed; then reboot.";
+
+/// The cause named where a kernel refuses unsigned modules (DEC-500), from
+/// `module_sig_check`'s two refusals: `sig_enforce` (`EKEYREJECTED`) and
+/// lockdown (`EPERM`).
+/// The recommendation notes the running kernel decides (DEC-500), shared by the
+/// passive report and the port probe so the two cannot advise differently:
+///
+/// - a kernel that refuses unsigned modules refuses an out-of-tree build unless
+///   it is signed with an enrolled key — named wherever such a build is needed
+///   and is not the one loaded (`out_of_tree_loaded`);
+/// - a chip in mainline only because this kernel is new enough gets the
+///   out-of-tree build called optional, with what it still adds.
+pub(crate) fn kernel_risk_notes(
+    chip_name: &str,
+    module: &str,
+    in_mainline: bool,
+    signed_modules_only: Option<bool>,
+    out_of_tree_loaded: bool,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !in_mainline && signed_modules_only == Some(true) && !out_of_tree_loaded {
+        notes.push(signed_modules_note(module));
+    }
+    if in_mainline && module == "it87" {
+        if let Some((major, minor)) = chip_db::mainline_since(chip_name) {
+            notes.push(format!(
+                "The kernel's own it87 drives this chip from Linux {major}.{minor}, so this \
+                 kernel needs no out-of-tree driver for it. frankcrawford/it87 is optional \
+                 here: it adds the board's GIGABYTE layout ID, which board header names \
+                 need, and the fixes for boards where fan writes have no effect (its PR \
+                 #128)."
+            ));
+        }
+    }
+    notes
+}
+
+pub(crate) fn signed_modules_note(module: &str) -> String {
+    format!(
+        "This kernel loads only signed modules (module signature enforcement or lockdown is \
+         on, as distributions usually set it under Secure Boot), so an out-of-tree `{module}` \
+         that is unsigned, or signed with a key this machine has not enrolled, is refused: \
+         `modprobe {module}` reports 'Key was rejected by service' or 'Operation not \
+         permitted'. DKMS signs the module as it builds it and prints the certificate it \
+         used; enrol that file once with `sudo mokutil --import <file>`, reboot, and choose \
+         'Enroll MOK' in the MOK Manager screen."
+    )
+}
+
 /// Build a load recommendation for a present-but-unbound chip whose module is
 /// allowlisted. Returns `None` (with a caveat) if the module is not on the
 /// allowlist — the safety gate that stops the daemon ever recommending an
@@ -679,6 +787,7 @@ fn build_recommendation(
     loaded: &[String],
     acpi_conflict_drivers: &[String],
     guard_declines: bool,
+    kernel: KernelContext,
     caveats: &mut Vec<String>,
 ) -> Option<SuperIoRecommendation> {
     let Some(entry) = allowlist_entry(module) else {
@@ -689,7 +798,7 @@ fn build_recommendation(
         return None;
     };
 
-    let in_mainline = chip_db::chip_driver_in_mainline(chip_name);
+    let in_mainline = chip_db::chip_driver_in_mainline(chip_name, kernel.version);
 
     let load_hint = if driver.loaded() {
         // The driver is already loaded but the chip produced no hwmon device —
@@ -697,9 +806,20 @@ fn build_recommendation(
         // causes of a failed bind instead. The it87-dkms / mmio / force_id
         // notes are ITE-specific, so only add them for the it87 driver.
         let ite_tail = if module == "it87" {
-            ite_unbound_tail(driver == DriverState::LoadedOutOfTree)
+            // DEC-500: the kernel's own it87, loaded, with a chip it cannot
+            // drive — after an update, the out-of-tree build that should be
+            // there was not rebuilt for this kernel.
+            let rebuild = if driver == DriverState::LoadedInTree && !in_mainline {
+                IN_TREE_REBUILD_CAUSE
+            } else {
+                ""
+            };
+            format!(
+                "{rebuild}{}",
+                ite_unbound_tail(driver == DriverState::LoadedOutOfTree)
+            )
         } else {
-            ""
+            String::new()
         };
         format!(
             "The `{module}` driver is already loaded but no hwmon device appeared — the chip did \
@@ -763,6 +883,13 @@ fn build_recommendation(
              driver without understanding the race it reintroduces."
         ));
     }
+    risk_notes.extend(kernel_risk_notes(
+        chip_name,
+        module,
+        in_mainline,
+        kernel.signed_modules_only,
+        driver == DriverState::LoadedOutOfTree,
+    ));
     if let Some(other) = chip_db::conflicting_loaded_module(module, loaded) {
         if driver.loaded() {
             // Both drivers are loaded right now — the collision is ACTIVE, not
@@ -829,8 +956,16 @@ impl SysfsSuperIoEvidence {
 }
 
 impl SuperIoEvidence for SysfsSuperIoEvidence {
-    fn module_out_of_tree(&self, module: &str) -> bool {
-        module_is_out_of_tree(module)
+    fn module_out_of_tree(&self, module: &str) -> Option<bool> {
+        module_taint_out_of_tree(module)
+    }
+
+    fn kernel_version(&self) -> Option<chip_db::KernelVersion> {
+        chip_db::kernel_version(crate::hwmon::kernel_warnings::read_kernel_release().as_deref())
+    }
+
+    fn signed_modules_only(&self) -> Option<bool> {
+        crate::hwmon::kernel_security::KernelSecurity::read().signed_modules_only()
     }
 
     fn board(&self) -> (String, String) {
@@ -879,11 +1014,26 @@ mod tests {
         acpi: Vec<String>,
         /// Modules the fake reports as out-of-tree builds (`HOST-d`).
         out_of_tree: Vec<String>,
+        /// Modules whose taint the fake cannot read (DEC-500).
+        taint_unread: Vec<String>,
+        /// The running kernel (DEC-500); `None` = unreadable.
+        kernel: Option<chip_db::KernelVersion>,
+        /// Whether the kernel refuses unsigned modules (DEC-500).
+        signed_only: Option<bool>,
     }
 
     impl SuperIoEvidence for FakeEvidence {
-        fn module_out_of_tree(&self, module: &str) -> bool {
-            self.out_of_tree.iter().any(|m| m == module)
+        fn module_out_of_tree(&self, module: &str) -> Option<bool> {
+            if self.taint_unread.iter().any(|m| m == module) {
+                return None;
+            }
+            Some(self.out_of_tree.iter().any(|m| m == module))
+        }
+        fn kernel_version(&self) -> Option<chip_db::KernelVersion> {
+            self.kernel
+        }
+        fn signed_modules_only(&self) -> Option<bool> {
+            self.signed_only
         }
         fn board(&self) -> (String, String) {
             self.board.clone()
@@ -1849,6 +1999,7 @@ mod tests {
                 &[],
                 &[],
                 false,
+                KernelContext::default(),
                 &mut caveats,
             )
             .expect("allowlisted module → recommendation");
@@ -1906,5 +2057,189 @@ mod tests {
             }
         }
         assert!(offenders.is_empty(), "{offenders:#?}");
+    }
+
+    // ── DEC-500: the running kernel decides ─────────────────────────────
+
+    const GIGABYTE: &str = "Gigabyte Technology Co., Ltd.";
+
+    /// X870E AORUS MASTER: the board table expects it8696 + it87952. Here the
+    /// IT87952E is bound and `it87` is loaded, so the it8696 is the unbound
+    /// chip, with `it87` in-tree unless `it87_out_of_tree`.
+    fn x870e_with_it87_loaded(it87_out_of_tree: bool) -> FakeEvidence {
+        FakeEvidence {
+            board: (GIGABYTE.into(), "X870E AORUS MASTER".into()),
+            bound: vec![bound_by("it87952", "it87.2656", "it87")],
+            loaded: vec!["it87".into()],
+            out_of_tree: if it87_out_of_tree {
+                vec!["it87".into()]
+            } else {
+                Vec::new()
+            },
+            kernel: Some((7, 2)),
+            ..Default::default()
+        }
+    }
+
+    fn rec_for<'a>(r: &'a SuperIoReport, chip: &str) -> &'a SuperIoRecommendation {
+        find(r, chip)
+            .recommendation
+            .as_ref()
+            .expect("unbound chip → recommendation")
+    }
+
+    /// The kernel's own it87 is loaded and cannot drive the chip: the hint
+    /// names the missed DKMS rebuild and the two commands — only on that
+    /// branch, and never a `modprobe -r` under a running daemon.
+    #[test]
+    fn the_kernels_own_it87_names_the_missed_dkms_rebuild() {
+        let in_tree = detect_superio(&x870e_with_it87_loaded(false));
+        let hint = &rec_for(&in_tree, "it8696").load_hint;
+        assert!(hint.contains(IN_TREE_REBUILD_CAUSE), "{hint}");
+        assert!(hint.contains("`dkms status`") && hint.contains("`sudo dkms autoinstall`"));
+        assert!(!hint.contains("modprobe -r"), "{hint}");
+
+        let out_of_tree = detect_superio(&x870e_with_it87_loaded(true));
+        let hint = &rec_for(&out_of_tree, "it8696").load_hint;
+        assert!(!hint.contains(IN_TREE_REBUILD_CAUSE), "{hint}");
+
+        // A taint that could not be read says nothing about which build is
+        // loaded: no "kernel's own", and the in-tree install advice stays.
+        let unread = detect_superio(&FakeEvidence {
+            taint_unread: vec!["it87".into()],
+            ..x870e_with_it87_loaded(false)
+        });
+        let hint = &rec_for(&unread, "it8696").load_hint;
+        assert!(!hint.contains(IN_TREE_REBUILD_CAUSE), "{hint}");
+        assert_eq!(
+            hint.replace(IN_TREE_REBUILD_CAUSE, ""),
+            rec_for(&in_tree, "it8696")
+                .load_hint
+                .replace(IN_TREE_REBUILD_CAUSE, ""),
+            "otherwise advised as the in-tree build"
+        );
+
+        // Not loaded at all: the install hint, not the rebuild cause.
+        let none = detect_superio(&FakeEvidence {
+            board: (GIGABYTE.into(), "X870E AORUS MASTER".into()),
+            ..Default::default()
+        });
+        assert!(!rec_for(&none, "it8696")
+            .load_hint
+            .contains(IN_TREE_REBUILD_CAUSE));
+    }
+
+    /// The in-kernel it87 drives an IT8689E from 7.1, so there an unbound one
+    /// is not "a missed rebuild" — the cause would be false.
+    #[test]
+    fn the_rebuild_cause_is_not_given_for_a_chip_the_kernel_drives() {
+        let ev = |kernel| FakeEvidence {
+            board: (GIGABYTE.into(), "Z790 AORUS ELITE AX".into()),
+            loaded: vec!["it87".into()],
+            kernel,
+            ..Default::default()
+        };
+        let old = detect_superio(&ev(Some((7, 0))));
+        assert!(rec_for(&old, "it8689")
+            .load_hint
+            .contains(IN_TREE_REBUILD_CAUSE));
+        let new = detect_superio(&ev(Some((7, 1))));
+        assert!(!rec_for(&new, "it8689")
+            .load_hint
+            .contains(IN_TREE_REBUILD_CAUSE));
+    }
+
+    /// DEC-500 "Kernel-aware": an unbound IT8689E with nothing loaded is told
+    /// to load the kernel's own it87 on 7.1, with the out-of-tree build named
+    /// as optional, and keeps the DKMS hint on 7.0 or an unknown kernel.
+    #[test]
+    fn an_it8689_is_mainline_on_7_1_and_the_out_of_tree_build_is_optional_there() {
+        let ev = |kernel| FakeEvidence {
+            board: (GIGABYTE.into(), "Z790 AORUS ELITE AX".into()),
+            kernel,
+            ..Default::default()
+        };
+        let optional = |r: &SuperIoRecommendation| {
+            r.risk_notes
+                .iter()
+                .any(|n| n.contains("frankcrawford/it87 is optional here"))
+        };
+
+        let new = detect_superio(&ev(Some((7, 1))));
+        let rec = rec_for(&new, "it8689");
+        assert!(rec.in_mainline);
+        assert!(
+            rec.load_hint.contains("sudo modprobe it87"),
+            "{}",
+            rec.load_hint
+        );
+        assert!(optional(rec), "{:?}", rec.risk_notes);
+        assert!(rec
+            .risk_notes
+            .iter()
+            .any(|n| n.contains("from Linux 7.1") && n.contains("GIGABYTE layout ID")));
+
+        for kernel in [Some((7, 0)), None] {
+            let old = detect_superio(&ev(kernel));
+            let rec = rec_for(&old, "it8689");
+            assert!(!rec.in_mainline, "{kernel:?}");
+            assert!(rec.load_hint.contains("DKMS"), "{kernel:?}");
+            assert!(!optional(rec), "{kernel:?}");
+        }
+
+        // A chip mainline on every kernel never gets the "optional" note.
+        let it8628 = detect_superio(&FakeEvidence {
+            kmsg: vec!["it8628".into()],
+            kernel: Some((7, 2)),
+            ..Default::default()
+        });
+        assert!(!optional(rec_for(&it8628, "it8628")));
+    }
+
+    /// A kernel that refuses unsigned modules is named where an out-of-tree
+    /// build is needed and is not the one running — and nowhere else, so the
+    /// note never fires on a verdict it was not given.
+    #[test]
+    fn the_signing_note_fires_only_where_an_out_of_tree_build_is_needed_and_absent() {
+        let note = signed_modules_note("it87");
+        let has = |r: &SuperIoReport, chip: &str| rec_for(r, chip).risk_notes.contains(&note);
+        let with =
+            |signed_only, ev: FakeEvidence| detect_superio(&FakeEvidence { signed_only, ..ev });
+        let unloaded = || FakeEvidence {
+            board: (GIGABYTE.into(), "X870E AORUS MASTER".into()),
+            ..Default::default()
+        };
+
+        let r = with(Some(true), unloaded());
+        assert!(has(&r, "it8696"));
+        // The IT87952E is in every kernel this supports: no build to sign.
+        assert!(rec_for(&r, "it87952").in_mainline && !has(&r, "it87952"));
+        assert_eq!(r.signed_modules_only, Some(true), "the report carries it");
+        assert!(has(
+            &with(Some(true), x870e_with_it87_loaded(false)),
+            "it8696"
+        ));
+        // The out-of-tree build is running, so it was accepted.
+        assert!(!has(
+            &with(Some(true), x870e_with_it87_loaded(true)),
+            "it8696"
+        ));
+        // Not refused, or not known: nothing said.
+        assert!(!has(&with(Some(false), unloaded()), "it8696"));
+        assert!(!has(&with(None, unloaded()), "it8696"));
+        // A chip the kernel drives needs no out-of-tree build to be signed.
+        let it8689 = with(
+            Some(true),
+            FakeEvidence {
+                board: (GIGABYTE.into(), "Z790 AORUS ELITE AX".into()),
+                kernel: Some((7, 1)),
+                ..Default::default()
+            },
+        );
+        assert!(!rec_for(&it8689, "it8689")
+            .risk_notes
+            .iter()
+            .any(|n| n.contains("loads only signed modules")));
+        assert!(note.contains("Key was rejected by service") && note.contains("mokutil"));
     }
 }
