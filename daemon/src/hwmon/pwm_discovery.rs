@@ -70,6 +70,13 @@ pub struct PwmHeaderDescriptor {
     /// How `role` was established. `RoleSource::None` whenever the role is
     /// `Unknown`.
     pub role_source: crate::hwmon::roles::RoleSource,
+    /// What the board catalogue says about this header (DEC-500), where it says
+    /// anything — **only** on a header whose label discovery synthesised: a
+    /// driver's own label is never second-guessed from a table. A `Named`
+    /// entry is the board's name for the header and is part of the evidence
+    /// `role` was inferred from; read it through
+    /// [`PwmHeaderDescriptor::board_label`].
+    pub board: Option<crate::hwmon::board_catalogue::BoardChannel>,
     /// Read-only driver capability audit (AIO-MB Phase 4, DEC-316). Static
     /// facts sampled once here; every field is `Option` and stays `None` when
     /// the driver does not expose the attribute. See
@@ -90,12 +97,28 @@ impl PwmHeaderDescriptor {
     pub fn sysfs_chip_name(&self) -> &str {
         self.sysfs_chip_name.as_deref().unwrap_or(&self.chip_name)
     }
+
+    /// The board catalogue's name for this header, where it has one (DEC-500).
+    pub fn board_label(&self) -> Option<&'static str> {
+        match self.board? {
+            crate::hwmon::board_catalogue::BoardChannel::Named(name) => Some(name),
+            crate::hwmon::board_catalogue::BoardChannel::Unmapped => None,
+        }
+    }
 }
 
 /// Discover all controllable PWM outputs under a given hwmon root.
 ///
-/// A header is considered controllable if it has a `pwmN` file.
-pub fn discover_pwm_headers(hwmon_root: &Path) -> Result<Vec<PwmHeaderDescriptor>, HwmonError> {
+/// A header is considered controllable if it has a `pwmN` file. `board` keys
+/// the board catalogue (DEC-500): production passes
+/// [`BoardContext::read`](crate::hwmon::board_catalogue::BoardContext::read),
+/// and a header whose driver publishes no label takes the catalogue's name as
+/// role evidence. `BoardContext::default()` matches nothing, which is exactly
+/// the pre-catalogue behaviour.
+pub fn discover_pwm_headers(
+    hwmon_root: &Path,
+    board: &crate::hwmon::board_catalogue::BoardContext,
+) -> Result<Vec<PwmHeaderDescriptor>, HwmonError> {
     let mut descriptors = Vec::new();
 
     let entries = std::fs::read_dir(hwmon_root).map_err(|e| HwmonError::ReadError {
@@ -116,7 +139,7 @@ pub fn discover_pwm_headers(hwmon_root: &Path) -> Result<Vec<PwmHeaderDescriptor
     hwmon_dirs.sort();
 
     for hwmon_dir in hwmon_dirs {
-        match discover_device_pwm(&hwmon_dir) {
+        match discover_device_pwm(&hwmon_dir, board) {
             Ok(headers) => descriptors.extend(headers),
             Err(e) => {
                 log::warn!("Skipping PWM discovery for {}: {e}", hwmon_dir.display());
@@ -128,7 +151,10 @@ pub fn discover_pwm_headers(hwmon_root: &Path) -> Result<Vec<PwmHeaderDescriptor
 }
 
 /// Discover PWM outputs for a single hwmon device directory.
-fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, HwmonError> {
+fn discover_device_pwm(
+    hwmon_dir: &Path,
+    board: &crate::hwmon::board_catalogue::BoardContext,
+) -> Result<Vec<PwmHeaderDescriptor>, HwmonError> {
     let names = crate::hwmon::chip_name::read_chip_name(hwmon_dir)?;
     let chip_name = names.canonical;
     let sysfs_chip_name = (names.sysfs != chip_name).then_some(names.sysfs);
@@ -192,10 +218,26 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
 
         let id = build_stable_id(&chip_name, &device_id, pwm_index, &label);
 
+        // The board catalogue speaks only where the driver did not (DEC-500):
+        // `read_label` synthesised `pwmN` because no label file exists.
+        let board_channel = if label == format!("pwm{pwm_index}") {
+            board.channel(
+                &chip_name,
+                crate::hwmon::board_catalogue::ChannelKind::Pwm,
+                pwm_index,
+            )
+        } else {
+            None
+        };
+        let board_label = match board_channel {
+            Some(crate::hwmon::board_catalogue::BoardChannel::Named(name)) => Some(name),
+            _ => None,
+        };
+
         // Per-channel role (AIO-MB Phase 1). Inference only — the user's
         // assignment lives in `runtime.toml` and is overlaid by the API layer.
         let (role, role_source) =
-            crate::hwmon::roles::classify_header_role(&chip_name, pwm_index, &label);
+            crate::hwmon::roles::classify_header_role(&chip_name, pwm_index, &label, board_label);
 
         // Check if pwmN is writable (probe file permissions)
         let is_writable = std::fs::metadata(&pwm_path)
@@ -244,6 +286,7 @@ fn discover_device_pwm(hwmon_dir: &Path) -> Result<Vec<PwmHeaderDescriptor>, Hwm
             is_aio,
             role,
             role_source,
+            board: board_channel,
             caps,
             alarm_path,
         });
@@ -306,6 +349,7 @@ use super::util::{device_id_from_path, read_sysfs_string};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hwmon::board_catalogue::BoardContext;
     use std::fs;
 
     /// Create a hwmon fixture with PWM outputs.
@@ -344,7 +388,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_pwm_fixture(tmp.path(), "hwmon0", "it8696", &[(1, None, true, true)]);
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].chip_name, "it8696");
         assert_eq!(headers[0].pwm_index, 1);
@@ -367,7 +411,7 @@ mod tests {
             ],
         );
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 3);
         assert_eq!(headers[0].label, "CPU_FAN");
         assert_eq!(headers[1].label, "CHA_FAN1");
@@ -384,7 +428,7 @@ mod tests {
             &[(1, Some("CPU_FAN"), true, true)],
         );
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert!(headers[0].id.starts_with("hwmon:it8696:"));
         assert!(headers[0].id.contains("pwm1"));
         assert!(headers[0].id.contains("CPU_FAN"));
@@ -403,7 +447,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         create_pwm_fixture(tmp.path(), "hwmon0", "nct6798", &[(1, None, false, true)]);
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 1);
         assert!(!headers[0].supports_enable);
         assert!(headers[0].enable_path.is_none());
@@ -424,7 +468,7 @@ mod tests {
         // RDNA4 shape: pwm1 + fan1_input, no pwm1_enable.
         create_pwm_fixture(tmp.path(), "hwmon0", "amdgpu", &[(1, None, false, true)]);
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert!(
             headers.is_empty(),
             "amdgpu hwmon (no pwm1_enable shape) must not be advertised: {headers:#?}"
@@ -438,7 +482,7 @@ mod tests {
         // Still excluded — GPU fans are owned by the GPU subsystem.
         create_pwm_fixture(tmp.path(), "hwmon0", "amdgpu", &[(1, None, true, true)]);
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert!(
             headers.is_empty(),
             "amdgpu hwmon (RDNA2-style writable shape) must not be advertised: {headers:#?}"
@@ -458,7 +502,7 @@ mod tests {
         );
         create_pwm_fixture(tmp.path(), "hwmon1", "amdgpu", &[(1, None, false, true)]);
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 1, "headers: {headers:#?}");
         assert_eq!(headers[0].chip_name, "it8696");
     }
@@ -473,7 +517,7 @@ mod tests {
         // Writable shape: pwm1 + pwm1_enable + fan1_input — still excluded.
         create_pwm_fixture(tmp.path(), "hwmon0", "nouveau", &[(1, None, true, true)]);
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert!(
             headers.is_empty(),
             "nouveau hwmon (writable pwm1) must not be advertised as a header: {headers:#?}"
@@ -494,7 +538,7 @@ mod tests {
         );
         create_pwm_fixture(tmp.path(), "hwmon1", "nouveau", &[(1, None, true, true)]);
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 1, "headers: {headers:#?}");
         assert_eq!(headers[0].chip_name, "it8696");
     }
@@ -509,7 +553,7 @@ mod tests {
             &[(3, Some("PUMP"), true, false)],
         );
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 1);
         assert!(!headers[0].rpm_available);
         assert!(headers[0].rpm_path.is_none());
@@ -529,7 +573,7 @@ mod tests {
             ],
         );
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers[0].min_pwm_percent, 0);
         assert_eq!(headers[1].min_pwm_percent, 0);
     }
@@ -544,14 +588,14 @@ mod tests {
             &[(3, Some("PUMP"), true, false)],
         );
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers[0].min_pwm_percent, 0);
     }
 
     #[test]
     fn discover_empty_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert!(headers.is_empty());
     }
 
@@ -564,7 +608,7 @@ mod tests {
         fs::write(hwmon_dir.join("name"), "k10temp").unwrap();
         fs::write(hwmon_dir.join("temp1_input"), "55000\n").unwrap();
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert!(headers.is_empty());
     }
 
@@ -584,7 +628,7 @@ mod tests {
             &[(1, Some("SYS_FAN1"), true, true)],
         );
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 2);
     }
 
@@ -599,7 +643,7 @@ mod tests {
         fs::write(hwmon_dir.join("fan1_label"), "FAN_LABEL\n").unwrap();
         fs::write(hwmon_dir.join("pwm1_label"), "PWM_LABEL\n").unwrap();
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers[0].label, "PWM_LABEL");
     }
 
@@ -617,7 +661,7 @@ mod tests {
             &[(1, None, true, true), (2, None, true, true)],
         );
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 2);
         for h in &headers {
             assert!(h.is_aio, "Kraken header should be flagged AIO: {h:#?}");
@@ -636,7 +680,7 @@ mod tests {
             &[(1, None, false, true), (2, None, false, true)],
         );
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 2);
         for h in &headers {
             assert!(!h.is_aio, "a fan hub must not be flagged AIO: {h:#?}");
@@ -653,7 +697,7 @@ mod tests {
             "it8696",
             &[(1, Some("CPU_FAN"), true, true)],
         );
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert!(!headers[0].is_aio);
     }
 
@@ -674,12 +718,168 @@ mod tests {
         perms.set_mode(0o444);
         fs::set_permissions(&pwm, perms).unwrap();
 
-        let headers = discover_pwm_headers(tmp.path()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 1);
         assert!(
             !headers[0].is_writable,
             "read-only pwm must report not writable"
         );
         assert!(headers[0].is_aio);
+    }
+
+    // ── Board catalogue (DEC-500) ─────────────────────────────────────────
+
+    const HOST_SIV: u32 = 0xA008_090A;
+
+    fn board(cpu_vendor: &str, siv: Option<u32>) -> BoardContext {
+        BoardContext {
+            cpu_vendor: cpu_vendor.into(),
+            siv,
+        }
+    }
+
+    /// The reference board as it87 v2.0 publishes it: board-suffixed chip
+    /// names and no fan or pwm label files.
+    fn reference_board(base: &Path, with_secondary: bool) {
+        let primary: Vec<(u8, Option<&str>, bool, bool)> =
+            (1..=6).map(|i| (i, None, true, true)).collect();
+        create_pwm_fixture(base, "hwmon3", "it8696_a008090a", &primary);
+        if with_secondary {
+            create_pwm_fixture(
+                base,
+                "hwmon4",
+                "it87952_a008090a",
+                &[
+                    (1, None, true, true),
+                    (2, None, true, true),
+                    (3, None, true, true),
+                ],
+            );
+        }
+    }
+
+    fn header<'a>(
+        headers: &'a [PwmHeaderDescriptor],
+        chip: &str,
+        idx: u8,
+    ) -> &'a PwmHeaderDescriptor {
+        headers
+            .iter()
+            .find(|h| h.chip_name == chip && h.pwm_index == idx)
+            .unwrap_or_else(|| panic!("{chip} pwm{idx} not discovered"))
+    }
+
+    /// [SAFETY] The catalogue's pump name makes an unlabelled header a pump at
+    /// discovery — the one place every protection site reads the role from.
+    #[test]
+    fn unlabelled_headers_take_the_board_catalogue_name_as_role_evidence() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        let tmp = tempfile::tempdir().unwrap();
+        reference_board(tmp.path(), true);
+
+        let plain = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
+        let headers = discover_pwm_headers(tmp.path(), &board("AMD", Some(HOST_SIV))).unwrap();
+
+        // Without the catalogue: every header is a bare pwmN of unknown role.
+        assert!(plain.iter().all(|h| h.board.is_none()
+            && h.role == HeaderRole::Unknown
+            && h.board_label().is_none()));
+
+        let pump = header(&headers, "it87952", 1);
+        assert_eq!(pump.board_label(), Some("SYS_FAN5_PUMP"));
+        assert_eq!(
+            (pump.role, pump.role_source),
+            (HeaderRole::Pump, RoleSource::BoardCatalogue)
+        );
+        let cpu = header(&headers, "it8696", 1);
+        assert_eq!(cpu.board_label(), Some("CPU_FAN"));
+        assert_eq!(
+            (cpu.role, cpu.role_source),
+            (HeaderRole::CpuFan, RoleSource::BoardCatalogue)
+        );
+        // CPU_OPT is named but infers nothing, as a driver label would not.
+        let opt = header(&headers, "it8696", 5);
+        assert_eq!(opt.board_label(), Some("CPU_OPT"));
+        assert_eq!(
+            (opt.role, opt.role_source),
+            (HeaderRole::Unknown, RoleSource::None)
+        );
+        // pwm6 is on the chip but is no header on this board: unmapped, unnamed.
+        let spare = header(&headers, "it8696", 6);
+        assert_eq!(
+            spare.board,
+            Some(crate::hwmon::board_catalogue::BoardChannel::Unmapped)
+        );
+        assert_eq!(spare.board_label(), None);
+        assert_eq!(spare.role, HeaderRole::Unknown);
+
+        // The catalogue names a header; it never renames one. Ids and labels are
+        // exactly what discovery published before, so no stored id moves.
+        let ids = |hs: &[PwmHeaderDescriptor]| -> Vec<(String, String)> {
+            hs.iter().map(|h| (h.id.clone(), h.label.clone())).collect()
+        };
+        assert_eq!(ids(&headers), ids(&plain));
+    }
+
+    /// A driver label is the evidence wherever there is one: the catalogue is
+    /// not consulted for that header, even where it has an entry.
+    #[test]
+    fn a_driver_labelled_header_is_never_given_a_board_name() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        let tmp = tempfile::tempdir().unwrap();
+        create_pwm_fixture(
+            tmp.path(),
+            "hwmon4",
+            "it87952",
+            &[(1, Some("CHA_FAN1"), true, true), (2, None, true, true)],
+        );
+        assert_eq!(
+            board("AMD", Some(HOST_SIV)).name(
+                "it87952",
+                crate::hwmon::board_catalogue::ChannelKind::Pwm,
+                1
+            ),
+            Some("SYS_FAN5_PUMP"),
+            "precondition: the catalogue names this header a pump"
+        );
+
+        let headers = discover_pwm_headers(tmp.path(), &board("AMD", Some(HOST_SIV))).unwrap();
+
+        let labelled = header(&headers, "it87952", 1);
+        assert_eq!(labelled.board, None);
+        assert_eq!(
+            (labelled.role, labelled.role_source),
+            (HeaderRole::ChassisFan, RoleSource::Label)
+        );
+        assert!(header(&headers, "it87952", 2).board_label().is_some());
+    }
+
+    /// The key is platform + chip + SIV; a partial key matches nothing.
+    #[test]
+    fn a_wrong_platform_or_unknown_layout_names_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        reference_board(tmp.path(), true);
+        for ctx in [
+            board("Intel", Some(HOST_SIV)),
+            board("", Some(HOST_SIV)),
+            board("AMD", None),
+            board("AMD", Some(0xDEAD_BEEF)),
+        ] {
+            let headers = discover_pwm_headers(tmp.path(), &ctx).unwrap();
+            assert!(
+                headers.iter().all(|h| h.board.is_none()),
+                "{ctx:?} named a header"
+            );
+        }
+    }
+
+    /// A second chip that is not bound does not cancel the first chip's names.
+    #[test]
+    fn a_missing_secondary_chip_leaves_the_primary_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        reference_board(tmp.path(), false);
+        let headers = discover_pwm_headers(tmp.path(), &board("AMD", Some(HOST_SIV))).unwrap();
+        assert_eq!(headers.len(), 6);
+        assert_eq!(header(&headers, "it8696", 1).board_label(), Some("CPU_FAN"));
     }
 }

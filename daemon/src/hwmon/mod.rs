@@ -6,6 +6,8 @@
 //! - Lease-protected PWM writes with safety floors
 
 pub mod aio;
+pub mod board_catalogue;
+mod board_catalogue_data;
 pub mod bound_driver;
 pub mod chip_db;
 pub mod chip_name;
@@ -38,8 +40,6 @@ pub mod superio;
 pub mod superio_probe;
 pub mod types;
 pub mod util;
-pub mod voltage_catalogue;
-mod voltage_catalogue_data;
 pub mod voltages;
 
 use types::{SensorDescriptor, SensorReading};

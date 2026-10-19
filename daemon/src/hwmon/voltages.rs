@@ -21,7 +21,7 @@
 //! with `/etc/sensors.d` `compute` lines; this daemon reads none, and neither
 //! does the kernel. For the boards a public catalogue covers, the daemon
 //! carries the same facts itself — see [`apply_board_catalogue`] and
-//! [`super::voltage_catalogue`] (`VOLT-b`, DEC-464).
+//! [`super::board_catalogue`] (`VOLT-b`, DEC-464).
 //!
 //! That is why [`VoltageDescriptor::identified`] exists. A channel the driver
 //! labels (`3VSB`, `Vbat`, `+3.3V`) is one the driver claims to have identified,
@@ -54,8 +54,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::HwmonError;
 
+use super::board_catalogue::BoardRail;
 use super::util::{device_id_from_path, read_sysfs_string};
-use super::voltage_catalogue::BoardRail;
 
 /// A discovered board voltage rail: one hwmon `inN_input` channel.
 #[derive(Debug, Clone, PartialEq)]
@@ -106,8 +106,7 @@ pub fn apply_board_catalogue(rails: &mut [VoltageDescriptor], cpu_vendor: &str, 
         return;
     };
     for rail in rails.iter_mut().filter(|r| !r.identified) {
-        rail.board =
-            super::voltage_catalogue::lookup(cpu_vendor, &rail.chip_name, siv, rail.channel);
+        rail.board = super::board_catalogue::rail(cpu_vendor, &rail.chip_name, siv, rail.channel);
     }
 }
 
@@ -606,7 +605,7 @@ mod tests {
 
         for (chip, ch) in [("it8696", 2), ("it87952", 0), ("it87952", 2)] {
             let rail = by(&rails, chip, ch);
-            let expected = super::super::voltage_catalogue::lookup("AMD", chip, 0xA008_090A, ch);
+            let expected = super::super::board_catalogue::rail("AMD", chip, 0xA008_090A, ch);
             assert!(
                 expected.is_some(),
                 "precondition: the catalogue covers {chip} in{ch}"
@@ -629,7 +628,7 @@ mod tests {
         reference_board(root.path());
         let mut rails = discover_voltages(root.path()).unwrap();
         assert_eq!(
-            super::super::voltage_catalogue::lookup("AMD", "it87952", 0xA008_090A, 7),
+            super::super::board_catalogue::rail("AMD", "it87952", 0xA008_090A, 7),
             Some(BoardRail::Unmapped),
             "precondition: the catalogue has an entry for this driver-labelled input"
         );

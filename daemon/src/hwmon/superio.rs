@@ -945,7 +945,7 @@ mod tests {
             std::fs::write(d.join("pwm1"), "128\n").unwrap();
         }
         let bound_chips: Vec<BoundChip> =
-            crate::hwmon::pwm_discovery::discover_pwm_headers(root.path())
+            crate::hwmon::pwm_discovery::discover_pwm_headers(root.path(), &Default::default())
                 .unwrap()
                 .into_iter()
                 .map(|h| bound(&h.chip_name, &h.device_id))

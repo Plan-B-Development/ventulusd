@@ -2316,10 +2316,15 @@ pub(crate) struct HwmonBackend {
     /// controller on the async side (DEC-382).
     writable: Option<HashSet<String>>,
     /// DEC-443: each header's `pwmN_mode` and inferred role, for the engine's
-    /// DC-aware pump floor. Measured under the same bounded lock as `writable`;
+    /// DC-aware pump floor, and (DEC-500) whether its board-catalogue name earns
+    /// the hard floor. Measured under the same bounded lock as `writable`;
     /// `None` until a lock is had — [`Self::header_facts`] retries without
-    /// waiting, so a contended start costs at most a few ticks at the 30 % floor
-    /// every pump already had, never a missing floor.
+    /// waiting. While it is `None` a pump whose label or assigned role says so
+    /// keeps the 30 % floor; a member floored by the catalogue alone (a profile
+    /// that saved the bare `pwmN`, from before the catalogue named the header)
+    /// has no catalogue floor until the first tick that finds the lock free —
+    /// normally the next one, since the lock is held across one write at a time.
+    /// A member saved under the catalogue name is floored by that label throughout.
     facts: Option<Arc<HashMap<String, super::HeaderFacts>>>,
 }
 
@@ -2335,6 +2340,9 @@ fn measure_header_facts(ctrl: &HwmonPwmController) -> Arc<HashMap<String, super:
                     super::HeaderFacts {
                         pwm_mode: h.pwm_mode,
                         inferred_role: (h.role, h.role_source),
+                        board_label_floors: h
+                            .board_label()
+                            .is_some_and(crate::profile::label_hints_cpu_or_pump),
                     },
                 )
             })
@@ -2431,8 +2439,9 @@ impl HwmonBackend {
     ///
     /// [SAFETY] `try_lock`, never a wait: the controller is held across an
     /// uncancellable blocking sysfs write, and this runs on the engine's tick.
-    /// Contended → empty facts for this tick, which yields the 30 % pump floor
-    /// every pump member already had; the next tick tries again.
+    /// Contended → empty facts for this tick: a pump floored by its label or
+    /// role keeps 30 %, a catalogue-only floor waits (see `facts`); the next
+    /// tick tries again.
     pub(crate) fn header_facts(&mut self) -> Arc<HashMap<String, super::HeaderFacts>> {
         if self.facts.is_none() {
             if let Some(guard) = self.ctrl.try_lock() {
@@ -4041,6 +4050,54 @@ mod tests {
             role_source: crate::hwmon::roles::RoleSource::None,
             ..Default::default()
         }
+    }
+
+    /// [SAFETY] DEC-500: the engine's catalogue floor term is gathered here,
+    /// from the controller's descriptors — the half every engine test builds by
+    /// hand. A `CPU`/`PUMP` catalogue name sets it, an ordinary one or none does
+    /// not, and the inferred role travels with it.
+    #[test]
+    fn header_facts_carry_the_board_catalogue_floor_term() {
+        use crate::hwmon::board_catalogue::BoardChannel;
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        let named = |id: &str, name: &'static str, role| PwmHeaderDescriptor {
+            label: "pwm1".into(),
+            board: Some(BoardChannel::Named(name)),
+            role,
+            role_source: if role == HeaderRole::Unknown {
+                RoleSource::None
+            } else {
+                RoleSource::BoardCatalogue
+            },
+            ..make_header(id)
+        };
+        let headers = vec![
+            named("opt", "CPU_OPT", HeaderRole::Unknown),
+            named("pump", "SYS_FAN5_PUMP", HeaderRole::Pump),
+            named("sys", "SYS_FAN4", HeaderRole::ChassisFan),
+            PwmHeaderDescriptor {
+                board: Some(BoardChannel::Unmapped),
+                ..make_header("spare")
+            },
+            make_header("plain"),
+        ];
+        let ctrl = HwmonPwmController::new(
+            headers,
+            LeaseManager::new(),
+            Box::new(TestWriter {
+                writes: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(StateCache::new()),
+        );
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl))).expect("writable headers");
+        let facts = be.header_facts();
+        let floors = |id: &str| facts[id].board_label_floors;
+        assert!(floors("opt") && floors("pump"));
+        assert!(!floors("sys") && !floors("spare") && !floors("plain"));
+        assert_eq!(
+            facts["pump"].inferred_role,
+            (HeaderRole::Pump, RoleSource::BoardCatalogue)
+        );
     }
 
     /// A writer that WEDGES on its first write by blocking in `open(2)` on a

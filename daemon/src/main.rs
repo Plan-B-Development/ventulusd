@@ -2568,16 +2568,23 @@ async fn async_main(cli: CliOptions) {
     // its mutex — the shutdown restore and the panic hook must reach it without
     // that lock, which a wedged sysfs write can hold for good.
     let mut hwmon_handback: Option<Arc<HandBackLedger>> = None;
-    let hwmon_controller = match discover_pwm_headers(hwmon_root) {
+    // DEC-500: the board catalogue's key, read once — the CPU vendor and the
+    // board's SIV. A header the driver leaves unlabelled takes the catalogue's
+    // name as role evidence, so it must be in place before the descriptors are
+    // frozen into the controller, and `AppState::board_context` keeps this same
+    // value so nothing publishes a key the controller was not built with.
+    let board_context = ventulusd::hwmon::board_catalogue::BoardContext::read();
+    let hwmon_controller = match discover_pwm_headers(hwmon_root, &board_context) {
         Ok(headers) if !headers.is_empty() => {
             log::info!("Discovered {} hwmon PWM header(s)", headers.len());
             for h in &headers {
                 log::info!(
-                    "  {} — {} (writable={}, mode={:?})",
+                    "  {} — {} (writable={}, mode={:?}, board name={:?})",
                     h.id,
                     h.label,
                     h.is_writable,
-                    h.pwm_mode
+                    h.pwm_mode,
+                    h.board_label()
                 );
             }
             // Keep a copy for the polling loop (needs paths for RPM/PWM reads)
@@ -2837,6 +2844,7 @@ async fn async_main(cli: CliOptions) {
             runtime_cfg.cooling_devices(),
         ))),
         allow_port_probe: config.detection.allow_port_probe,
+        board_context,
         running_config: config.clone(),
         // DEC-206/207: seeded by the assessment task below once the poll cache is
         // warm. The rollup Arc is shared with the AssessmentCache (its store keeps

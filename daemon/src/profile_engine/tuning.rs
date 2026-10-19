@@ -143,10 +143,15 @@ pub(crate) fn member_effective_floor(
     let mut floor = control.minimum_pct;
     if member_needs_hard_floor(member)
         || crate::profile::assigned_role_earns_hard_floor(member, assigned_roles)
+        || board_label_earns_hard_floor(member, header_facts)
     {
         // DEC-252: the eval-time superset — the author's label OR the daemon's
         // own discovered one. `validate`'s rejection deliberately stays on the
         // narrower `member_is_pump_or_cpu`; see `member_needs_hard_floor`.
+        //
+        // DEC-500 adds the board catalogue's name for a header whose driver
+        // publishes none — DEC-252's daemon-label term, for the header that has
+        // no daemon label to read.
         //
         // DEC-311 adds a third union term: the user's explicit header-role
         // assignment, `pump` or (`ROLE-a`) `cpu_fan`. Same discipline — it can add a floor, never remove one —
@@ -176,8 +181,10 @@ pub(crate) fn member_effective_floor(
 ///
 /// With empty `header_facts` (the parity oracle, or a contended controller at
 /// engine start) the inferred term is `Unknown` and `pwm_mode` unknown, so this
-/// returns at most [`HARD_PUMP_CPU_FLOOR_PCT`], which every such member already
-/// had through `member_needs_hard_floor` — no floor moves on missing evidence.
+/// returns at most [`HARD_PUMP_CPU_FLOOR_PCT`], which a member whose label or
+/// assigned role names a pump already had through `member_needs_hard_floor`. A
+/// pump known only from its board-catalogue name (DEC-500) gets neither until
+/// the facts are measured (`HwmonBackend::facts`).
 ///
 /// hwmon only. An OpenFan pump (`ROLE-f`) is floored by `assigned_role_earns_hard_floor`
 /// in [`member_effective_floor`]; it has no `pwmN_mode`, so the DC floor this
@@ -200,4 +207,25 @@ pub(crate) fn member_pump_floor(
         crate::profile::member_label_names_pump(member),
     );
     is_pump.then(|| crate::profile::pump_floor_pct(facts.pwm_mode))
+}
+
+/// Whether `member`'s header has a board-catalogue name that earns the hard
+/// pump/CPU floor (DEC-500).
+///
+/// [SAFETY] DEC-252's "the daemon's own label" term for a header whose driver
+/// publishes no label: discovery synthesises `pwmN` there, so the label in the
+/// member id carries nothing, and the catalogue's name (`CPU_FAN`,
+/// `SYS_FAN5_PUMP`) is what the daemon knows the header as. Union, never
+/// replacement — it can add a floor, never remove one. Header facts, not the
+/// member, carry it, so with empty facts it adds nothing: the parity oracle is
+/// unperturbed, and at a contended engine start a member floored by the
+/// catalogue alone waits for the facts (`HwmonBackend::facts` bounds that).
+pub(crate) fn board_label_earns_hard_floor(
+    member: &ControlMember,
+    header_facts: &std::collections::HashMap<String, HeaderFacts>,
+) -> bool {
+    member.source == "hwmon"
+        && header_facts
+            .get(&member.member_id)
+            .is_some_and(|f| f.board_label_floors)
 }

@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "description": "Cross-stack HWMON HEADER role-classification agreement vectors (AUD3-c, DEC-322). The daemon's hwmon::roles::classify_header_role + is_pump_protected and the GUI's services.pump_protection.header_is_pump_protected MUST agree on every case. This pins the classifier that decides whether the fan wizard offers to STOP a header, which is why it is a safety oracle and not a tidiness one: if the daemon learns a new pump-classifying label (the hardware-knowledge curation process exists to add exactly that) and the GUI's hand-mirrored copy does not, the GUI concludes 'not protected' and offers to stop a real pump. Inference only: every case has assigned = None, because a user assignment is runtime.toml state neither side infers. The GUI reconstruction is the FALLBACK path (a daemon >= 2.31.0 publishes stop_permitted and the GUI prefers it), so these cases are driven with stop_permitted = null. is_aio is an INPUT for the GUI reconstruction, which cannot see chip_name; the daemon derives it from chip_name via aio::is_liquid_cooler_chip, and BOTH tests assert that derivation (the GUI's against sensor_knowledge.is_liquid_cooler_chip, BRD-r), so neither chip list can drift from this file. That only pins a chip the file names, so every chip on the cooler list has a vector here. This file must be byte-identical in both repos (daemon/tests/fixtures and the GUI tests/fixtures) and is gated by parity.yml.",
+  "description": "Cross-stack HWMON HEADER role-classification agreement vectors (AUD3-c, DEC-322). The daemon's hwmon::roles::classify_header_role + is_pump_protected and the GUI's services.pump_protection.header_is_pump_protected MUST agree on every case. This pins the classifier that decides whether the fan wizard offers to STOP a header, which is why it is a safety oracle and not a tidiness one: if the daemon learns a new pump-classifying label (the hardware-knowledge curation process exists to add exactly that) and the GUI's hand-mirrored copy does not, the GUI concludes 'not protected' and offers to stop a real pump. Inference only: every case has assigned = None, because a user assignment is runtime.toml state neither side infers. The GUI reconstruction is the FALLBACK path (a daemon >= 2.31.0 publishes stop_permitted and the GUI prefers it), so these cases are driven with stop_permitted = null. is_aio is an INPUT for the GUI reconstruction, which cannot see chip_name; the daemon derives it from chip_name via aio::is_liquid_cooler_chip, and BOTH tests assert that derivation (the GUI's against sensor_knowledge.is_liquid_cooler_chip, BRD-r), so neither chip list can drift from this file. That only pins a chip the file names, so every chip on the cooler list has a vector here. This file must be byte-identical in both repos (daemon/tests/fixtures and the GUI tests/fixtures) and is gated by parity.yml. board_label (optional, DEC-500) is the board catalogue's name for the header, an INPUT on both sides: the daemon publishes it on a header whose driver gives no label, and both classifiers read it only then — a real driver label, recognised or not, outranks it. A case without the key has no catalogue name.",
   "cases": [
     {
       "name": "synthesised_placeholder_channel_1",
@@ -342,6 +342,61 @@
       "is_aio": true,
       "role": "pump",
       "pump_protected": true
+    },
+    {
+      "name": "catalogue_pump_name_on_an_unlabelled_header",
+      "why": "DEC-500: the reference board's it87952 publishes no label files; the board catalogue names pwm1 SYS_FAN5_PUMP for SIV A008090A, and that name is the role evidence. A pump to every pump-protection site.",
+      "chip_name": "it87952",
+      "pwm_index": 1,
+      "label": "pwm1",
+      "board_label": "SYS_FAN5_PUMP",
+      "is_aio": false,
+      "role": "pump",
+      "pump_protected": true
+    },
+    {
+      "name": "catalogue_cpu_fan_name_is_a_cpu_fan",
+      "why": "DEC-500: a catalogue CPU_FAN classifies as a CPU fan by the same prefix rule a driver label uses — floored, but stoppable, so not pump-protected.",
+      "chip_name": "it8696",
+      "pwm_index": 1,
+      "label": "pwm1",
+      "board_label": "CPU_FAN",
+      "is_aio": false,
+      "role": "cpu_fan",
+      "pump_protected": false
+    },
+    {
+      "name": "catalogue_cpu_opt_stays_unknown",
+      "why": "DEC-500: CPU_OPT is ambiguous whoever names it — where a pump or a second radiator fan lands — so the catalogue's name infers nothing, exactly as the driver label would not.",
+      "chip_name": "it8696",
+      "pwm_index": 5,
+      "label": "pwm5",
+      "board_label": "CPU_OPT",
+      "is_aio": false,
+      "role": "unknown",
+      "pump_protected": false
+    },
+    {
+      "name": "driver_label_outranks_the_catalogue",
+      "why": "DEC-500 / DEC-464 'the driver wins': a real driver label is the evidence and the catalogue is not consulted. Discovery never sets a catalogue name beside a real label; this pins the precedence both classifiers must share if the two ever meet.",
+      "chip_name": "it8696",
+      "pwm_index": 1,
+      "label": "CPU_FAN",
+      "board_label": "SYS_FAN5_PUMP",
+      "is_aio": false,
+      "role": "cpu_fan",
+      "pump_protected": false
+    },
+    {
+      "name": "unrecognised_driver_label_outranks_the_catalogue",
+      "why": "DEC-500: a real label the rules do not recognise (CPU_OPT) is still the driver's evidence, so the catalogue does not fill the gap — the header stays unknown.",
+      "chip_name": "it8696",
+      "pwm_index": 5,
+      "label": "CPU_OPT",
+      "board_label": "SYS_FAN5_PUMP",
+      "is_aio": false,
+      "role": "unknown",
+      "pump_protected": false
     }
   ]
 }

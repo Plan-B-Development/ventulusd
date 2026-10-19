@@ -18,20 +18,28 @@
 //!
 //! # Roles never lower a floor
 //!
-//! Every role this module can *infer* is already inside the 30% pump/CPU floor
-//! set that [`crate::profile::member_needs_hard_floor`] computes from labels and
-//! chip names:
+//! Every role this module infers from the **driver's** label or the chip is
+//! already inside the 30% pump/CPU floor set that
+//! [`crate::profile::member_needs_hard_floor`] computes from labels and chip
+//! names:
 //!
 //! - `Pump` by label requires a `"pump"` substring — already a
 //!   `CPU_PUMP_LABEL_HINTS` hit.
 //! - `Pump` by chip mapping requires `is_liquid_cooler_chip` — already the
 //!   `member_is_pump_or_cpu` cooler branch.
 //!
-//! So inference changes **no** floor anywhere, which is why the DEC-162
-//! `role_classification.json` oracle passes unchanged. Only a *user assignment*
-//! (`RoleSource::UserAssigned`) can raise a floor, and it is a union term — it
-//! can add a floor, never remove one. Pinned by
+//! So that inference changes **no** floor anywhere, which is why the DEC-162
+//! `role_classification.json` oracle passes unchanged. Pinned by
 //! `inferred_pump_roles_are_a_subset_of_the_existing_floor_set`.
+//!
+//! The **board catalogue** ([`RoleSource::BoardCatalogue`], DEC-500) is the one
+//! inference that adds floors, by the user's decision: a header whose driver
+//! publishes no label takes the catalogue's name for it, and a `PUMP` or `CPU`
+//! name earns the same protection and floor the same driver label would. It
+//! reaches the engine as header facts (`profile_engine::HeaderFacts`), not
+//! through the member, so the parity oracles are unperturbed by construction.
+//! A user assignment (`RoleSource::UserAssigned`) can raise a floor too. Every
+//! one of these is a union term — it can add a floor, never remove one.
 //!
 //! # Ambiguity is not resolved by guessing
 //!
@@ -137,6 +145,10 @@ pub enum RoleSource {
     /// Inferred from the hwmon chip being a known liquid cooler, plus the
     /// channel index.
     ChipMapping,
+    /// Inferred from the board catalogue's name for a header whose driver
+    /// publishes no label (DEC-500): frankcrawford/it87's Gigabyte config for
+    /// this board's SIV, not verified on this machine.
+    BoardCatalogue,
     /// Set explicitly by the user via `POST /config/header-role`. Outranks
     /// every inference.
     UserAssigned,
@@ -148,6 +160,7 @@ impl RoleSource {
             RoleSource::None => "none",
             RoleSource::Label => "label",
             RoleSource::ChipMapping => "chip_mapping",
+            RoleSource::BoardCatalogue => "board_catalogue",
             RoleSource::UserAssigned => "user_assigned",
         }
     }
@@ -170,24 +183,57 @@ const CPU_FAN_LABEL_PREFIXES: &[&str] = &["cpu_fan", "cpufan"];
 /// Labels that mark an ordinary case fan.
 const CHASSIS_LABEL_HINTS: &[&str] = &["cha_fan", "chafan", "sys_fan", "sysfan", "chassis"];
 
-/// Classify a PWM header from what discovery can see: chip name, channel index
-/// and label. Pure — no sysfs, no hardware, no user state.
+/// The role a header name states, if it states one — the label rules shared by
+/// the driver's label and the board catalogue's name.
+fn role_from_label(label: &str) -> Option<HeaderRole> {
+    let lower = label.to_lowercase();
+    // Pump first: `SYS_FAN5_PUMP` contains a chassis hint too, and the pump
+    // reading is the one that must win.
+    if PUMP_LABEL_HINTS.iter().any(|h| lower.contains(h)) {
+        return Some(HeaderRole::Pump);
+    }
+    let normalised = lower.replace(['-', ' ', '.'], "_");
+    if CPU_FAN_LABEL_PREFIXES
+        .iter()
+        .any(|p| normalised.starts_with(p))
+    {
+        return Some(HeaderRole::CpuFan);
+    }
+    if CHASSIS_LABEL_HINTS.iter().any(|h| normalised.contains(h)) {
+        return Some(HeaderRole::ChassisFan);
+    }
+    // A name we do not recognise — including `CPU_OPT`.
+    None
+}
+
+/// Classify a PWM header from what discovery can see: chip name, channel index,
+/// the driver's label and the board catalogue's name for the header. Pure — no
+/// sysfs, no hardware, no user state.
 ///
 /// User assignment is **not** applied here: it is not known at discovery time
 /// and lives in `runtime.toml`. Callers overlay it with [`resolve_role`], which
 /// is the function every consumer should actually use.
 ///
-/// Precedence is **label before chip mapping**, and that ordering is
-/// load-bearing rather than arbitrary. A label is direct per-channel evidence; a
-/// chip mapping is a positional assumption ("channel 1 of a cooler is the
-/// pump"). Where they disagree the label is both more specific and safer: a
-/// cooler whose `pwm2` is labelled `PUMP` (a dual-pump loop) classifies `Pump`
-/// under label-first and `RadiatorFan` under mapping-first — and only one of
-/// those refuses to stop it.
+/// Precedence is **driver label, then board catalogue, then chip mapping**, and
+/// that ordering is load-bearing rather than arbitrary. A label is direct
+/// per-channel evidence; a chip mapping is a positional assumption ("channel 1
+/// of a cooler is the pump"). Where they disagree the label is both more
+/// specific and safer: a cooler whose `pwm2` is labelled `PUMP` (a dual-pump
+/// loop) classifies `Pump` under label-first and `RadiatorFan` under
+/// mapping-first — and only one of those refuses to stop it.
+///
+/// `board_label` is the catalogue's name for the header (DEC-500,
+/// [`crate::hwmon::board_catalogue`]). It stands in for a label the driver did
+/// not publish and is read **only** then: a real driver label — even one these
+/// rules do not recognise, like `CPU_OPT` — is the evidence, exactly as a
+/// driver-labelled voltage rail is never renamed from the catalogue (DEC-464).
+/// Discovery sets `board_label` only on a header whose label it synthesised, so
+/// the two never meet in practice; the precedence says what happens if they do.
 pub fn classify_header_role(
     chip_name: &str,
     pwm_index: u8,
     label: &str,
+    board_label: Option<&str>,
 ) -> (HeaderRole, RoleSource) {
     // A synthesised `pwmN` restates the channel index and carries no evidence
     // (DEC-229's rule, applied to roles). Skipping it here is what lets the chip
@@ -195,24 +241,16 @@ pub fn classify_header_role(
     let has_real_label = !label.is_empty() && label != format!("pwm{pwm_index}");
 
     if has_real_label {
-        let lower = label.to_lowercase();
-        // Pump first: `SYS_FAN5_PUMP` contains a chassis hint too, and the pump
-        // reading is the one that must win.
-        if PUMP_LABEL_HINTS.iter().any(|h| lower.contains(h)) {
-            return (HeaderRole::Pump, RoleSource::Label);
-        }
-        let normalised = lower.replace(['-', ' ', '.'], "_");
-        if CPU_FAN_LABEL_PREFIXES
-            .iter()
-            .any(|p| normalised.starts_with(p))
-        {
-            return (HeaderRole::CpuFan, RoleSource::Label);
-        }
-        if CHASSIS_LABEL_HINTS.iter().any(|h| normalised.contains(h)) {
-            return (HeaderRole::ChassisFan, RoleSource::Label);
+        if let Some(role) = role_from_label(label) {
+            return (role, RoleSource::Label);
         }
         // A real label we do not recognise — including `CPU_OPT`. Fall through
         // to the chip mapping; on a motherboard that yields `Unknown`.
+    } else if let Some(name) = board_label.filter(|n| !n.trim().is_empty()) {
+        if let Some(role) = role_from_label(name) {
+            return (role, RoleSource::BoardCatalogue);
+        }
+        // `CPU_OPT` and every other unrecognised name: no evidence either way.
     }
 
     // Chip mapping: on a known liquid cooler, channel 1 is the pump and the
@@ -382,7 +420,8 @@ mod tests {
             let idx = case["pwm_index"].as_u64().unwrap() as u8;
             let label = case["label"].as_str().unwrap();
 
-            let inferred = classify_header_role(chip, idx, label);
+            let board_label = case["board_label"].as_str();
+            let inferred = classify_header_role(chip, idx, label, board_label);
             assert_eq!(
                 inferred.0.as_str(),
                 case["role"].as_str().unwrap(),
@@ -411,7 +450,7 @@ mod tests {
     #[test]
     fn synthesised_labels_carry_no_evidence() {
         for idx in 1..=5u8 {
-            let (role, source) = classify_header_role("it8696", idx, &format!("pwm{idx}"));
+            let (role, source) = classify_header_role("it8696", idx, &format!("pwm{idx}"), None);
             assert_eq!(
                 role,
                 HeaderRole::Unknown,
@@ -424,7 +463,7 @@ mod tests {
     #[test]
     fn empty_label_carries_no_evidence() {
         assert_eq!(
-            classify_header_role("nct6798", 3, ""),
+            classify_header_role("nct6798", 3, "", None),
             (HeaderRole::Unknown, RoleSource::None)
         );
     }
@@ -441,7 +480,7 @@ mod tests {
             "pump",
         ] {
             assert_eq!(
-                classify_header_role("nct6798", 3, label),
+                classify_header_role("nct6798", 3, label, None),
                 (HeaderRole::Pump, RoleSource::Label),
                 "{label} must classify as a pump"
             );
@@ -452,7 +491,7 @@ mod tests {
     fn cpu_fan_is_a_cpu_fan_not_a_pump() {
         for label in ["CPU_FAN", "CPU_FAN1", "CPUFAN", "cpu-fan"] {
             assert_eq!(
-                classify_header_role("nct6798", 1, label),
+                classify_header_role("nct6798", 1, label, None),
                 (HeaderRole::CpuFan, RoleSource::Label),
                 "{label} must classify as a CPU fan"
             );
@@ -465,11 +504,11 @@ mod tests {
     #[test]
     fn cpu_opt_stays_unknown() {
         assert_eq!(
-            classify_header_role("nct6798", 2, "CPU_OPT"),
+            classify_header_role("nct6798", 2, "CPU_OPT", None),
             (HeaderRole::Unknown, RoleSource::None)
         );
         assert_eq!(
-            classify_header_role("it8696", 5, "CPU_OPT"),
+            classify_header_role("it8696", 5, "CPU_OPT", None),
             (HeaderRole::Unknown, RoleSource::None)
         );
     }
@@ -477,7 +516,7 @@ mod tests {
     #[test]
     fn chassis_labels_are_not_pumps() {
         for label in ["CHA_FAN1", "SYS_FAN2", "Chassis Fan", "sys_fan"] {
-            let (role, _) = classify_header_role("nct6798", 4, label);
+            let (role, _) = classify_header_role("nct6798", 4, label, None);
             assert_eq!(
                 role,
                 HeaderRole::ChassisFan,
@@ -491,12 +530,12 @@ mod tests {
     fn cooler_chip_maps_channel_one_to_the_pump() {
         for chip in ["z53", "x53", "kraken2023", "d5next"] {
             assert_eq!(
-                classify_header_role(chip, 1, "pwm1"),
+                classify_header_role(chip, 1, "pwm1", None),
                 (HeaderRole::Pump, RoleSource::ChipMapping),
                 "{chip} pwm1 must map to the pump"
             );
             assert_eq!(
-                classify_header_role(chip, 2, "pwm2"),
+                classify_header_role(chip, 2, "pwm2", None),
                 (HeaderRole::RadiatorFan, RoleSource::ChipMapping),
                 "{chip} pwm2 must map to a radiator fan"
             );
@@ -509,21 +548,82 @@ mod tests {
     #[test]
     fn a_pump_label_outranks_the_chip_channel_mapping() {
         assert_eq!(
-            classify_header_role("z53", 2, "PUMP"),
+            classify_header_role("z53", 2, "PUMP", None),
             (HeaderRole::Pump, RoleSource::Label)
         );
     }
 
+    /// DEC-500: on a chip that publishes no label files, the board catalogue's
+    /// name is the evidence — classified by the same rules as a driver label.
+    #[test]
+    fn a_catalogue_name_stands_in_for_a_missing_driver_label() {
+        // Without the catalogue the synthesised label says nothing.
+        assert_eq!(
+            classify_header_role("it87952", 1, "pwm1", None),
+            (HeaderRole::Unknown, RoleSource::None)
+        );
+        assert_eq!(
+            classify_header_role("it87952", 1, "pwm1", Some("SYS_FAN5_PUMP")),
+            (HeaderRole::Pump, RoleSource::BoardCatalogue)
+        );
+        assert_eq!(
+            classify_header_role("it8696", 1, "pwm1", Some("CPU_FAN")),
+            (HeaderRole::CpuFan, RoleSource::BoardCatalogue)
+        );
+        assert_eq!(
+            classify_header_role("it8696", 2, "pwm2", Some("SYS_FAN1")),
+            (HeaderRole::ChassisFan, RoleSource::BoardCatalogue)
+        );
+        // The ambiguity rule holds for a catalogue name too.
+        assert_eq!(
+            classify_header_role("it8696", 5, "pwm5", Some("CPU_OPT")),
+            (HeaderRole::Unknown, RoleSource::None)
+        );
+        assert_eq!(
+            classify_header_role("it8696", 5, "pwm5", Some("  ")),
+            (HeaderRole::Unknown, RoleSource::None)
+        );
+    }
+
+    /// A real driver label is the evidence whenever there is one, recognised or
+    /// not; the catalogue is not consulted (DEC-464's "the driver wins").
+    #[test]
+    fn a_real_driver_label_outranks_the_catalogue() {
+        assert_eq!(
+            classify_header_role("it8696", 1, "CPU_FAN", Some("SYS_FAN5_PUMP")),
+            (HeaderRole::CpuFan, RoleSource::Label)
+        );
+        assert_eq!(
+            classify_header_role("it8696", 5, "CPU_OPT", Some("SYS_FAN5_PUMP")),
+            (HeaderRole::Unknown, RoleSource::None)
+        );
+    }
+
+    /// [SAFETY] A catalogue pump is a pump to the union, and no assignment can
+    /// take that away — the same add-only rule a driver-labelled pump has.
+    #[test]
+    fn a_catalogue_pump_is_pump_protected_whatever_is_assigned() {
+        let inferred = classify_header_role("it87952", 2, "pwm2", Some("SYS_FAN6_PUMP"));
+        assert!(is_pump_protected(None, inferred, false));
+        assert!(is_pump_protected(
+            Some(HeaderRole::ChassisFan),
+            inferred,
+            false
+        ));
+        let not_a_pump = classify_header_role("it87952", 3, "pwm3", Some("SYS_FAN4"));
+        assert!(!is_pump_protected(None, not_a_pump, false));
+    }
+
     #[test]
     fn user_assignment_outranks_every_inference() {
-        let inferred = classify_header_role("nct6798", 2, "CPU_OPT");
+        let inferred = classify_header_role("nct6798", 2, "CPU_OPT", None);
         assert_eq!(inferred, (HeaderRole::Unknown, RoleSource::None));
         assert_eq!(
             resolve_role(Some(HeaderRole::Pump), inferred),
             (HeaderRole::Pump, RoleSource::UserAssigned)
         );
         // …including a downgrade: the user may correct a mis-inferred role.
-        let inferred_pump = classify_header_role("nct6798", 3, "PUMP");
+        let inferred_pump = classify_header_role("nct6798", 3, "PUMP", None);
         assert_eq!(
             resolve_role(Some(HeaderRole::ChassisFan), inferred_pump),
             (HeaderRole::ChassisFan, RoleSource::UserAssigned)
@@ -535,7 +635,7 @@ mod tests {
     /// that header pump-protected (DEC-312's union).
     #[test]
     fn no_fan_never_removes_pump_protection() {
-        let labelled_pump = classify_header_role("nct6798", 3, "AIO_PUMP");
+        let labelled_pump = classify_header_role("nct6798", 3, "AIO_PUMP", None);
         assert_eq!(
             resolve_role(Some(HeaderRole::NoFan), labelled_pump),
             (HeaderRole::NoFan, RoleSource::UserAssigned)
@@ -545,7 +645,7 @@ mod tests {
             labelled_pump,
             false
         ));
-        let unlabelled = classify_header_role("nct6798", 4, "pwm4");
+        let unlabelled = classify_header_role("nct6798", 4, "pwm4", None);
         assert!(is_pump_protected(Some(HeaderRole::NoFan), unlabelled, true));
         assert!(!is_pump_protected(
             Some(HeaderRole::NoFan),
@@ -556,14 +656,16 @@ mod tests {
 
     #[test]
     fn resolve_passes_the_inference_through_when_unassigned() {
-        let inferred = classify_header_role("nct6798", 3, "AIO_PUMP");
+        let inferred = classify_header_role("nct6798", 3, "AIO_PUMP", None);
         assert_eq!(resolve_role(None, inferred), inferred);
     }
 
     /// [SAFETY] The invariant that lets this whole feature ship without moving
-    /// a single floor: everything the classifier can *infer* as a pump is
-    /// already inside the existing 30% pump/CPU floor set, so inference alone
-    /// changes nothing. Only a user assignment can add a floor.
+    /// a single floor: everything the classifier can *infer* as a pump from a
+    /// driver label or a chip is already inside the existing 30% pump/CPU floor
+    /// set, so that inference alone changes nothing. Only a user assignment or a
+    /// board-catalogue name (DEC-500, floored through the engine's header facts)
+    /// can add one.
     ///
     /// If this fails, the role model has started making floor decisions on its
     /// own and `role_classification.json` is no longer a sufficient oracle.
@@ -587,7 +689,7 @@ mod tests {
             ("z53", 2, "PUMP"),
         ];
         for (chip, idx, label) in cases {
-            let (role, _) = classify_header_role(chip, idx, label);
+            let (role, _) = classify_header_role(chip, idx, label, None);
             if matches!(role, HeaderRole::Pump | HeaderRole::CpuFan) {
                 assert!(
                     already_floored(chip, label),
@@ -649,6 +751,7 @@ mod tests {
             RoleSource::None,
             RoleSource::Label,
             RoleSource::ChipMapping,
+            RoleSource::BoardCatalogue,
             RoleSource::UserAssigned,
         ] {
             let json = serde_json::to_string(&source).unwrap();

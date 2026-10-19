@@ -294,7 +294,7 @@ mod tests {
         let hwmon = root.to_path_buf();
         let mut ids: Vec<String> = Vec::new();
         ids.extend(
-            crate::hwmon::pwm_discovery::discover_pwm_headers(&hwmon)
+            crate::hwmon::pwm_discovery::discover_pwm_headers(&hwmon, &Default::default())
                 .unwrap()
                 .into_iter()
                 .map(|h| h.id),
@@ -344,12 +344,16 @@ mod tests {
         assert_eq!(discovered_ids(suffixed.path()), want);
 
         // The sysfs spelling rides beside it, for /etc/sensors.d matching only.
-        let headers = crate::hwmon::pwm_discovery::discover_pwm_headers(suffixed.path()).unwrap();
+        let headers =
+            crate::hwmon::pwm_discovery::discover_pwm_headers(suffixed.path(), &Default::default())
+                .unwrap();
         assert!(headers.iter().all(|h| h.chip_name == "it8696"));
         assert!(headers
             .iter()
             .all(|h| h.sysfs_chip_name() == "it8696_a008090a"));
-        let headers = crate::hwmon::pwm_discovery::discover_pwm_headers(bare.path()).unwrap();
+        let headers =
+            crate::hwmon::pwm_discovery::discover_pwm_headers(bare.path(), &Default::default())
+                .unwrap();
         assert!(headers.iter().all(|h| h.sysfs_chip_name() == "it8696"));
     }
 

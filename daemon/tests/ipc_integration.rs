@@ -133,6 +133,7 @@ fn test_app_state_inner(engine_ticked: bool, runtime_cfg: std::path::PathBuf) ->
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -920,6 +921,7 @@ async fn fans_endpoint_tags_intel_gpu_source_by_id_prefix() {
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -1206,6 +1208,7 @@ fn test_app_state_with_nvidia_gpu(
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -1516,6 +1519,15 @@ fn test_app_state_with_hwmon() -> Arc<AppState> {
 /// publishing `pwm_enable != 1`, a sweep can take `run_sweep`'s reclaim branch
 /// and abort for a reason that has nothing to do with what the test asserts.
 fn test_app_state_with_headers(headers: Vec<PwmHeaderDescriptor>) -> Arc<AppState> {
+    test_app_state_with_board(headers, Default::default())
+}
+
+/// [`test_app_state_with_headers`] under a board-catalogue key (DEC-500): the
+/// value `main.rs` reads once and both discovery and the routes then share.
+fn test_app_state_with_board(
+    headers: Vec<PwmHeaderDescriptor>,
+    board_context: ventulusd::hwmon::board_catalogue::BoardContext,
+) -> Arc<AppState> {
     let cache = Arc::new(StateCache::new());
     // One cool CPU reading that stays fresh for the whole test. Since DEC-385 a
     // verify or characterisation refuses — and a sweep aborts part way — once the
@@ -1590,6 +1602,7 @@ fn test_app_state_with_headers(headers: Vec<PwmHeaderDescriptor>) -> Arc<AppStat
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context,
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -2005,6 +2018,7 @@ fn test_app_state_with_unsupported_gpu(pci_bdf: &str) -> Arc<AppState> {
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -2114,6 +2128,7 @@ fn test_app_state_with_amd_gpu_info(
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -2215,6 +2230,7 @@ fn test_app_state_with_amd_gpu(
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -3497,6 +3513,7 @@ async fn deactivate_profile_resets_hwmon_coalescing() {
         cooling_devices: Arc::new(parking_lot::RwLock::new(Arc::new(Vec::new()))),
         override_table: Arc::new(Mutex::new(ventulusd::control_override::OverrideTable::new())),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -3640,6 +3657,7 @@ fn test_app_state_with_writable_pmfw_gpu(pci_bdf: &str) -> (Arc<AppState>, tempf
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -3777,7 +3795,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
         std::fs::write(dir.join("fan1_input"), "0\n").unwrap();
     }
 
-    let descriptors = discover_pwm_headers(root).expect("discovery succeeds");
+    let descriptors = discover_pwm_headers(root, &Default::default()).expect("discovery succeeds");
     assert_eq!(
         descriptors.len(),
         1,
@@ -3839,6 +3857,7 @@ async fn hwmon_discovery_excludes_amdgpu_end_to_end_via_ipc() {
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -3929,6 +3948,7 @@ fn test_app_state_with_profile_dirs(dirs: Vec<std::path::PathBuf>) -> Arc<AppSta
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),
@@ -5498,6 +5518,158 @@ async fn profile_search_dirs_refuses_to_remove_the_profile_store() {
 
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
+}
+
+// ── DEC-500: board-catalogue names, through discovery and the routes ─────
+
+/// The reference board as it87 v2.0 publishes it — suffixed chip names, no
+/// fan or pwm label files — so every header's own label is a synthesised `pwmN`.
+fn unlabelled_reference_board(root: &std::path::Path) {
+    for (dir, name, pwms) in [
+        ("hwmon3", "it8696_a008090a", 6u8),
+        ("hwmon4", "it87952_a008090a", 3u8),
+    ] {
+        let d = root.join(dir);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("name"), format!("{name}\n")).unwrap();
+        for i in 1..=pwms {
+            std::fs::write(d.join(format!("pwm{i}")), "128\n").unwrap();
+            std::fs::write(d.join(format!("pwm{i}_enable")), "2\n").unwrap();
+            std::fs::write(d.join(format!("fan{i}_input")), "1200\n").unwrap();
+        }
+    }
+    // The two pump headers in both modes (`pwmN_mode`: 0 = DC, 1 = PWM), so the
+    // published floor is checked against the mode it depends on.
+    let secondary = root.join("hwmon4");
+    std::fs::write(secondary.join("pwm1_mode"), "0\n").unwrap();
+    std::fs::write(secondary.join("pwm2_mode"), "1\n").unwrap();
+}
+
+/// [SAFETY] DEC-500, the user's "Daemon too": a header the board catalogue
+/// names a pump is a pump to every protection site — `/hwmon/headers` reports
+/// it unstoppable with the pump floor, and identify perturbs it instead of
+/// stopping it. The same tree discovered without the catalogue key is the
+/// negative arm: nothing named, nothing protected, so the name alone did it.
+#[tokio::test]
+async fn a_board_catalogue_pump_is_protected_end_to_end() {
+    use ventulusd::hwmon::board_catalogue::BoardContext;
+    use ventulusd::hwmon::pwm_discovery::discover_pwm_headers;
+    let tmp = tempfile::tempdir().unwrap();
+    unlabelled_reference_board(tmp.path());
+    let pump_id = "hwmon:it87952:nodev:pwm1:pwm1";
+    let pwm_pump_id = "hwmon:it87952:nodev:pwm2:pwm2";
+    let cpu_id = "hwmon:it8696:nodev:pwm1:pwm1";
+    let spare_id = "hwmon:it8696:nodev:pwm6:pwm6";
+
+    for keyed in [true, false] {
+        let board = if keyed {
+            BoardContext {
+                cpu_vendor: "AMD".into(),
+                siv: Some(0xA008_090A),
+            }
+        } else {
+            BoardContext::default()
+        };
+        let headers = discover_pwm_headers(tmp.path(), &board).unwrap();
+        let state = test_app_state_with_board(headers, board);
+        // Identify acts on a fan the cache knows, as the engine's tick makes it.
+        state
+            .cache
+            .update_hwmon_fans(vec![ventulusd::health::state::HwmonFanState {
+                id: pump_id.into(),
+                rpm: Some(1200),
+                last_commanded_pwm: Some(60),
+                pwm_readback_pct: None,
+                pwm_commanded_pct: None,
+                updated_at: Instant::now(),
+                alarm: None,
+                pwm_enable_mode: None,
+            }]);
+        let (path, shutdown, _dir) = start_test_server(state).await;
+
+        let (status, json) = uds_get(&path, "/hwmon/headers").await;
+        assert_eq!(status, 200, "{json}");
+        let by_id = |id: &str| {
+            json["headers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|h| h["id"] == id)
+                .unwrap_or_else(|| panic!("{id} not published: {json}"))
+                .clone()
+        };
+        let pump = by_id(pump_id);
+        let cpu = by_id(cpu_id);
+        // The catalogue never renames: the id and label are the driver's.
+        assert_eq!(pump["label"], "pwm1", "{pump}");
+        assert!(by_id(spare_id).get("board_label").is_none());
+
+        let (status, ident) = uds_post(
+            &path,
+            &format!("/fans/{pump_id}/identify"),
+            &serde_json::json!({ "action": "stop" }),
+        )
+        .await;
+        assert_eq!(status, 200, "{ident}");
+
+        if keyed {
+            assert_eq!(pump["board_label"], "SYS_FAN5_PUMP", "{pump}");
+            assert_eq!(pump["role"], "pump", "{pump}");
+            assert_eq!(pump["role_source"], "board_catalogue", "{pump}");
+            assert_eq!(pump["stop_permitted"], false, "{pump}");
+            // The pump floor for each header's own mode: DC 70 %, PWM 30 %.
+            let pwm_pump = by_id(pwm_pump_id);
+            let floor_of = |h: &serde_json::Value| {
+                let mode = h["pwm_mode"].as_u64().map(|m| m as u8);
+                (
+                    h["effective_min_pwm_pct"].as_u64().unwrap(),
+                    ventulusd::profile::pump_floor_pct(mode).round() as u64,
+                )
+            };
+            assert_eq!(pump["pwm_mode"], 0, "precondition: a DC header: {pump}");
+            assert_eq!(pwm_pump["role_source"], "board_catalogue", "{pwm_pump}");
+            let (floor, dc_floor) = floor_of(&pump);
+            let (pwm_floor, pwm_expected) = floor_of(&pwm_pump);
+            assert_eq!(floor, dc_floor, "{pump}");
+            assert_eq!(pwm_floor, pwm_expected, "{pwm_pump}");
+            assert!(dc_floor > pwm_expected, "precondition: the modes differ");
+            assert_eq!(ident["mode"], "pump_perturb", "{ident}");
+            assert!(ident["identify_pwm_percent"].as_u64().unwrap() >= floor);
+            // A catalogue CPU_FAN is a CPU fan: classified, and stoppable.
+            assert_eq!(cpu["board_label"], "CPU_FAN", "{cpu}");
+            assert_eq!(cpu["role"], "cpu_fan", "{cpu}");
+            assert_eq!(cpu["stop_permitted"], true, "{cpu}");
+        } else {
+            assert!(pump.get("board_label").is_none(), "{pump}");
+            assert_eq!(pump["role"], "unknown", "{pump}");
+            assert_eq!(pump["stop_permitted"], true, "{pump}");
+            assert_eq!(ident["mode"], "stop", "{ident}");
+        }
+
+        // `board_layout` answers under the same key the headers were built
+        // with, so its header entry repeats `/hwmon/headers` — never a fresh read.
+        let (status, diag) = uds_get(&path, "/diagnostics/hardware").await;
+        assert_eq!(status, 200, "{diag}");
+        if keyed {
+            let entry = diag["board_layout"]["channels"]
+                .as_array()
+                .unwrap_or_else(|| panic!("a layout under the key: {diag}"))
+                .iter()
+                .find(|c| c["id"] == pump_id)
+                .unwrap_or_else(|| panic!("the pump header is listed: {diag}"))
+                .clone();
+            assert_eq!(entry["kind"], "pwm", "{entry}");
+            assert_eq!(entry["board_label"], pump["board_label"], "{entry}");
+        } else {
+            assert!(
+                diag.get("board_layout").is_none(),
+                "no key, no layout: {diag}"
+            );
+        }
+
+        let _ = shutdown.send(());
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 // ── DEC-311 / AIO-MB Phase 1: header roles + pump-safe identify ──────────

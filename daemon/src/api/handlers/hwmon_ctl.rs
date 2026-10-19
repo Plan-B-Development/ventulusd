@@ -157,7 +157,11 @@ pub async fn hwmon_rescan_handler(
     }
 
     let hwmon_root = std::path::Path::new(HWMON_SYSFS_ROOT);
-    match discover_pwm_headers(hwmon_root) {
+    // DEC-500: the key startup discovery used, never a fresh read. The running
+    // controller keeps its startup descriptors, and identify and the engine
+    // protect exactly those; a rescan that found an SIV the controller was not
+    // built with would publish a pump protection nothing enforces.
+    match discover_pwm_headers(hwmon_root, &state.board_context) {
         Ok(headers) => {
             // DEC-146 P3-12 / DEC-384: the one mapping `/hwmon/headers` and
             // `/inventory/hwmon` use too. No controller lock is held here, but the
@@ -3858,6 +3862,7 @@ pub(crate) mod tests {
                 crate::control_override::OverrideTable::new(),
             )),
             allow_port_probe: false,
+            board_context: Default::default(),
             running_config: Default::default(),
             readiness_rollup: readiness_rollup.clone(),
             config_write: Default::default(),

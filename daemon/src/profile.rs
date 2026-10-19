@@ -683,8 +683,9 @@ pub(crate) const PWM_MODE_DC: u8 = 0;
 /// can never have two pump floors (the user's Q11 decision). `None` (the chip
 /// does not say) and PWM mode keep [`HARD_PUMP_CPU_FLOOR_PCT`]: an unknown mode
 /// must not RAISE a floor on evidence we do not have, and it cannot LOWER one
-/// below the value every pump already had.
-pub(crate) fn pump_floor_pct(pwm_mode: Option<u8>) -> f64 {
+/// below the value every pump already had. Public so the integration tests can
+/// pin a published floor against it rather than against a literal.
+pub fn pump_floor_pct(pwm_mode: Option<u8>) -> f64 {
     if pwm_mode == Some(PWM_MODE_DC) {
         DC_PUMP_FLOOR_PCT
     } else {
@@ -724,8 +725,7 @@ pub(crate) fn member_is_pump_or_cpu(member: &ControlMember) -> bool {
     if member.source != "hwmon" {
         return false;
     }
-    let label = member.member_label.to_lowercase();
-    if CPU_PUMP_LABEL_HINTS.iter().any(|hint| label.contains(hint)) {
+    if label_hints_cpu_or_pump(&member.member_label) {
         return true;
     }
     // Chip name is the 2nd colon-delimited field of the stable hwmon id; a
@@ -791,10 +791,16 @@ pub(crate) fn member_needs_hard_floor(member: &ControlMember) -> bool {
     if member.source != "hwmon" {
         return false;
     }
-    daemon_label_from_member_id(&member.member_id).is_some_and(|label| {
-        let lower = label.to_lowercase();
-        CPU_PUMP_LABEL_HINTS.iter().any(|hint| lower.contains(hint))
-    })
+    daemon_label_from_member_id(&member.member_id).is_some_and(label_hints_cpu_or_pump)
+}
+
+/// Whether a header name carries a [`CPU_PUMP_LABEL_HINTS`] hint
+/// (case-insensitive substring) — the one test every floor term that reads a
+/// name applies: the author's `member_label`, the daemon's own label, and the
+/// board catalogue's name (DEC-500, via `profile_engine::HeaderFacts`).
+pub(crate) fn label_hints_cpu_or_pump(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    CPU_PUMP_LABEL_HINTS.iter().any(|hint| lower.contains(hint))
 }
 
 /// The pump half of [`CPU_PUMP_LABEL_HINTS`]: every hint except `"cpu"`. Kept as

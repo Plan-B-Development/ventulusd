@@ -600,10 +600,20 @@ pub struct PwmHeaderEntry {
     /// render an unrecognised token rather than dropping the header (the 273-i
     /// rule). Pre-2.28.0 daemons omit this; consumers default to `"unknown"`.
     pub role: crate::hwmon::roles::HeaderRole,
-    /// How `role` was established: `"none"`, `"label"`, `"chip_mapping"` or
-    /// `"user_assigned"`. Lets a client show *why* a header is a pump, and
-    /// distinguish a confident classification from a guess it should ask about.
+    /// How `role` was established: `"none"`, `"label"`, `"chip_mapping"`,
+    /// `"board_catalogue"` (DEC-500) or `"user_assigned"`. Lets a client show
+    /// *why* a header is a pump, and distinguish a confident classification from
+    /// a guess it should ask about. Clients must render a token they do not
+    /// recognise.
     pub role_source: crate::hwmon::roles::RoleSource,
+    /// The board catalogue's name for this header (DEC-500): frankcrawford/it87's
+    /// Gigabyte config for this board's SIV, published only where the driver
+    /// publishes no label (so `label` is the synthesised `pwmN`), and not
+    /// verified on this machine. It is role evidence — `role_source:
+    /// "board_catalogue"` says when it decided `role` — and never part of `id`.
+    /// Absent on every other header and on older daemons.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_label: Option<String>,
 
     // ── AIO-MB Phase 4 (DEC-316) ──────────────────────────────────────────
     // Every field below is OPTIONAL on the wire and absent when this daemon or
@@ -715,6 +725,7 @@ impl PwmHeaderEntry {
             is_aio: h.is_aio,
             role,
             role_source,
+            board_label: h.board_label().map(str::to_string),
             effective_min_pwm_pct: Some(floor.round() as u8),
             stop_permitted: Some(crate::hwmon::device_policy::stop_permitted(pump_protected)),
             cooling_device_id: device.map(|d| d.id.clone()),
@@ -2027,6 +2038,85 @@ pub struct HardwareDiagnosticsResponse {
     /// [`VoltageEntry::identified`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub voltages: Vec<VoltageEntry>,
+    /// The board's GIGABYTE firmware layout and what the board catalogue says
+    /// about its channels (DEC-500). Omitted when the board publishes no SIV
+    /// (any non-Gigabyte board, or `it87` without the out-of-tree driver) or the
+    /// CPU vendor is unknown, and on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_layout: Option<BoardLayout>,
+}
+
+/// A board's GIGABYTE firmware layout (its SIV) and the board-catalogue names
+/// for its channels (DEC-500).
+///
+/// The catalogue is frankcrawford/it87's Gigabyte configs (GPL-2.0, credited in
+/// `NOTICE.md`), keyed on CPU platform + canonical chip + SIV — never on the
+/// board name, which upstream lists for some SIVs and which can map to two. A
+/// name here is **not verified on this machine**; `board_listed` says whether
+/// upstream lists this board for the layout at all.
+#[derive(Debug, Clone, Serialize)]
+pub struct BoardLayout {
+    /// The raw SIV word, eight upper-case hex digits (`"A008090A"`).
+    pub siv: String,
+    /// The catalogue platform the key used: `"AMD"` or `"Intel"`.
+    pub platform: String,
+    /// Whether the catalogue has any block for this SIV on this platform. False
+    /// means a layout nobody has mapped yet: `channels` is then empty.
+    pub in_catalogue: bool,
+    /// The upstream it87 commit the catalogue was generated from.
+    pub catalogue_commit: String,
+    /// The board names upstream lists for this SIV. Empty where upstream says
+    /// "names not currently known", and when `in_catalogue` is false.
+    pub listed_boards: Vec<String>,
+    /// Whether this board's DMI `board_name` is one of `listed_boards`
+    /// (ASCII case-insensitive, trimmed).
+    pub board_listed: bool,
+    /// What the catalogue says about each discovered channel it covers, sorted
+    /// by `id`. A channel the driver labelled, or one the catalogue withholds or
+    /// never mentions, is not listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<BoardLayoutChannel>,
+}
+
+/// One discovered channel the board catalogue covers (DEC-500).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BoardLayoutChannel {
+    /// The id this daemon publishes for the entity elsewhere: a header's
+    /// (`GET /hwmon/headers`), a monitor-only fan's (`GET /inventory/hwmon`
+    /// `monitor_only_fans`; such a tach is never on `/fans`), or a
+    /// temperature sensor's (`GET /sensors`).
+    pub id: String,
+    /// `"pwm"` (a controllable header), `"fan"` (a monitor-only tach) or
+    /// `"temp"`.
+    pub kind: &'static str,
+    /// The board's name for the channel. Exactly one of this and
+    /// `board_unmapped` is present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub board_label: Option<String>,
+    /// The board's config does not map this channel (upstream `ignore`: "not
+    /// mapped by this SIV configuration") — not a claim that it is unconnected.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub board_unmapped: bool,
+}
+
+impl BoardLayoutChannel {
+    pub(crate) fn new(
+        id: &str,
+        kind: &'static str,
+        channel: crate::hwmon::board_catalogue::BoardChannel,
+    ) -> Self {
+        use crate::hwmon::board_catalogue::BoardChannel;
+        let (board_label, board_unmapped) = match channel {
+            BoardChannel::Named(name) => (Some(name.to_string()), false),
+            BoardChannel::Unmapped => (None, true),
+        };
+        Self {
+            id: id.to_string(),
+            kind,
+            board_label,
+            board_unmapped,
+        }
+    }
 }
 
 /// One board voltage rail — an hwmon `inN_input` channel (`WIRE-ag`).
@@ -2084,7 +2174,7 @@ pub struct VoltageEntry {
 
 impl From<crate::hwmon::voltages::VoltageDescriptor> for VoltageEntry {
     fn from(v: crate::hwmon::voltages::VoltageDescriptor) -> Self {
-        use crate::hwmon::voltage_catalogue::BoardRail;
+        use crate::hwmon::board_catalogue::BoardRail;
         let (board_label, board_multiplier, board_unmapped) = match v.board {
             Some(BoardRail::Named { label, multiplier }) => {
                 (Some(label.to_string()), Some(multiplier), false)
@@ -3006,6 +3096,7 @@ mod tests {
             is_aio: false,
             role: crate::hwmon::roles::HeaderRole::Pump,
             role_source: crate::hwmon::roles::RoleSource::Label,
+            board_label: Some("SYS_FAN5_PUMP".into()),
             effective_min_pwm_pct: Some(30),
             stop_permitted: Some(false),
             cooling_device_id: Some("dev-1".into()),
@@ -3574,10 +3665,33 @@ mod tests {
                 board_multiplier: None,
                 board_unmapped: false,
             }],
+            board_layout: Some(BoardLayout {
+                siv: "A008090A".into(),
+                platform: "AMD".into(),
+                in_catalogue: true,
+                catalogue_commit: "bd7a566".into(),
+                listed_boards: vec!["X870E AORUS MASTER".into()],
+                board_listed: true,
+                channels: vec![BoardLayoutChannel {
+                    id: "hwmon:it8696:it87.2624:temp5".into(),
+                    kind: "temp",
+                    board_label: Some("VRM MOS".into()),
+                    board_unmapped: true,
+                }],
+            }),
         };
         expect(
             &serde_json::to_value(&hardware).unwrap(),
             "HardwareDiagnosticsResponse",
+        );
+        // DEC-500. Every optional field populated so the key set covers them; no
+        // real channel carries a name AND board_unmapped (`new` makes them
+        // exclusive).
+        let layout = hardware.board_layout.as_ref().unwrap();
+        expect(&serde_json::to_value(layout).unwrap(), "BoardLayout");
+        expect(
+            &serde_json::to_value(&layout.channels[0]).unwrap(),
+            "BoardLayoutChannel",
         );
 
         // DEC-404 Stage 4 (`PTR-u`): the DEC-407 stall probe, enrolled when the
@@ -4049,10 +4163,14 @@ mod tests {
                 amd_pci_devices: Vec::new(),
                 amdgpu_module_loaded: false,
                 voltages,
+                board_layout: None,
             })
             .unwrap()
         }
 
+        // DEC-500: no SIV, no layout — absent, so an older client's response is
+        // the one it always saw.
+        assert!(response(Vec::new()).get("board_layout").is_none());
         assert!(
             response(Vec::new()).get("voltages").is_none(),
             "an empty rail list must be omitted, not published as [] — an older \

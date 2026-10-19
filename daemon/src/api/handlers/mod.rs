@@ -708,6 +708,15 @@ pub struct AppState {
     /// (`[detection] allow_port_probe`). Off by default; the probe also needs the
     /// `CAP_SYS_RAWIO` drop-in to actually function.
     pub allow_port_probe: bool,
+    /// DEC-500: the board catalogue's key — the CPU vendor and the board's SIV —
+    /// read once at startup, before header discovery. Every surface that
+    /// publishes a catalogue fact reads this one value: the running controller's
+    /// descriptors took their `board` (and so their inferred role) from it, and
+    /// identify and the engine enforce exactly those, so `/hwmon/rescan` and
+    /// `board_layout` must not answer from a fresher read. An SIV that appears
+    /// later (a driver installed mid-session) takes effect at the next start,
+    /// like every other change to the header set.
+    pub board_context: crate::hwmon::board_catalogue::BoardContext,
     /// The fully-resolved config this process is *running* on — `daemon.toml`
     /// with the `runtime.toml` overlay applied, captured at startup (DEC-243).
     ///

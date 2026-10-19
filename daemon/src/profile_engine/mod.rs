@@ -185,6 +185,11 @@ pub struct HeaderFacts {
         crate::hwmon::roles::HeaderRole,
         crate::hwmon::roles::RoleSource,
     ),
+    /// DEC-500: the header's board-catalogue name — set only where its driver
+    /// publishes no label — carries a CPU/pump hint. DEC-252's "the daemon's own
+    /// label" term for a header whose own label is a synthesised `pwmN`; read
+    /// by [`board_label_earns_hard_floor`].
+    pub board_label_floors: bool,
 }
 
 impl ProfileEngineState {
@@ -724,6 +729,7 @@ pub fn evaluate_profile_with_overrides(
             // `ROLE-a`: an assigned CPU fan too, as a `CPU_FAN` label already is.
             let floor_is_hard = member_needs_hard_floor(member)
                 || assigned_role_earns_hard_floor(member, &assigned_roles)
+                || board_label_earns_hard_floor(member, &header_facts)
                 || member_pump_floor(member, &assigned_roles, &header_facts).is_some();
             let member_pwm = if effective_floor != control.minimum_pct || floor_is_hard {
                 // EFF-4: this per-member step-rate key allocates each tick for
@@ -10598,6 +10604,7 @@ mod tests {
         let pump = |mode| HeaderFacts {
             pwm_mode: mode,
             inferred_role: (HeaderRole::Pump, RoleSource::Label),
+            board_label_floors: false,
         };
         let dc = Some(crate::profile::PWM_MODE_DC);
         assert_eq!(
@@ -10641,6 +10648,7 @@ mod tests {
             HeaderFacts {
                 pwm_mode: dc,
                 inferred_role: (HeaderRole::Pump, RoleSource::Label),
+                board_label_floors: false,
             },
         )])));
         let mut overrides = OverrideSnapshot::default();
@@ -10663,6 +10671,7 @@ mod tests {
         let cpu = HeaderFacts {
             pwm_mode: dc,
             inferred_role: (HeaderRole::CpuFan, RoleSource::Label),
+            board_label_floors: false,
         };
         assert_eq!(
             floored_duty_with_facts("CPU Fan", Some(cpu), 0.0),
@@ -10671,6 +10680,7 @@ mod tests {
         let inferred_pump = HeaderFacts {
             pwm_mode: dc,
             inferred_role: (HeaderRole::Pump, RoleSource::Label),
+            board_label_floors: false,
         };
         assert_eq!(
             floored_duty_with_facts("Rear", Some(inferred_pump), 0.0),
@@ -10683,6 +10693,85 @@ mod tests {
             floored_duty_with_facts("Rear", Some(inferred_pump), 90.0),
             crate::profile::DC_PUMP_FLOOR_PCT as u8
         );
+    }
+
+    /// [SAFETY] DEC-500: a header whose driver publishes no label is floored by
+    /// its board-catalogue name — `CPU_FAN`, `CPU_OPT`, a `*_PUMP` — exactly as
+    /// the same driver label would floor it, whatever the member is called.
+    #[test]
+    fn a_board_catalogue_cpu_or_pump_name_earns_the_hard_floor() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        let facts = |floors| HeaderFacts {
+            pwm_mode: None,
+            inferred_role: (HeaderRole::Unknown, RoleSource::None),
+            board_label_floors: floors,
+        };
+        let curve = floored_duty_with_facts("pwm2", None, 0.0);
+        assert!(
+            curve < HARD_PUMP_CPU_FLOOR_PCT as u8,
+            "precondition: the curve alone sits below the floor ({curve})"
+        );
+        assert_eq!(
+            floored_duty_with_facts("pwm2", Some(facts(true)), 0.0),
+            HARD_PUMP_CPU_FLOOR_PCT as u8
+        );
+        // And the stop-snap exemption comes with it.
+        assert_eq!(
+            floored_duty_with_facts("pwm2", Some(facts(true)), 90.0),
+            HARD_PUMP_CPU_FLOOR_PCT as u8
+        );
+        // Negative: a catalogue name with no CPU/pump hint adds nothing.
+        assert_eq!(
+            floored_duty_with_facts("pwm2", Some(facts(false)), 0.0),
+            curve
+        );
+    }
+
+    /// [SAFETY] DEC-500 + DEC-443: a catalogue pump on a DC-mode header reaches
+    /// the DC pump floor through the inferred role, as a labelled pump does.
+    #[test]
+    fn a_board_catalogue_pump_on_a_dc_header_gets_the_dc_pump_floor() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        let dc = Some(crate::profile::PWM_MODE_DC);
+        let facts = HeaderFacts {
+            pwm_mode: dc,
+            inferred_role: (HeaderRole::Pump, RoleSource::BoardCatalogue),
+            board_label_floors: true,
+        };
+        assert_eq!(
+            floored_duty_with_facts("pwm2", Some(facts), 0.0),
+            crate::profile::pump_floor_pct(dc) as u8
+        );
+    }
+
+    /// [SAFETY] DEC-500: an override below the floor is clamped to it too — the
+    /// override path reads the same `member_effective_floor`.
+    #[test]
+    fn an_override_cannot_take_a_board_catalogue_cpu_header_below_the_floor() {
+        use crate::hwmon::roles::{HeaderRole, RoleSource};
+        const ID: &str = "hwmon:it8696:it87.2624:pwm1:pwm1";
+        let mut profile = make_profile("curve", "graph", 5.0);
+        profile.controls[0].minimum_pct = 0.0;
+        profile.controls[0].members = vec![ControlMember {
+            source: "hwmon".into(),
+            member_id: ID.into(),
+            member_label: "pwm1".into(),
+            fan_zero_rpm: false,
+        }];
+        let sensors = make_cache_with_sensor("cpu", 20.0).sensors_snapshot();
+        let mut state = ProfileEngineState::new();
+        state.set_header_facts(Arc::new(HashMap::from([(
+            ID.to_string(),
+            HeaderFacts {
+                pwm_mode: None,
+                inferred_role: (HeaderRole::CpuFan, RoleSource::BoardCatalogue),
+                board_label_floors: true,
+            },
+        )])));
+        let mut overrides = OverrideSnapshot::default();
+        overrides.controls.insert("ctrl1".into(), 5);
+        let cmds = evaluate_profile_with_overrides(&profile, &sensors, &mut state, &overrides);
+        assert_eq!(cmds[0].pwm_percent, HARD_PUMP_CPU_FLOOR_PCT as u8);
     }
 
     /// [SAFETY] DEC-311 + DEC-167. An assigned pump must also inherit the
@@ -10900,6 +10989,7 @@ mod tests {
         let dc = Some(HeaderFacts {
             pwm_mode: Some(crate::profile::PWM_MODE_DC),
             inferred_role: (HeaderRole::Unknown, RoleSource::None),
+            board_label_floors: false,
         });
         assert_eq!(
             label_less_duty(Some(HeaderRole::CpuFan), 0.0, None, dc),

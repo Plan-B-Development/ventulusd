@@ -5,6 +5,29 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Added
+
+- **Gigabyte fan headers and temperatures get their board names.** On a Gigabyte board running the
+  out-of-tree it87 driver, the daemon reads the board's firmware layout (its SIV) and names the
+  channels the driver leaves unlabelled from frankcrawford/it87's Gigabyte sensor configurations:
+  `CPU_FAN`, `SYS_FAN5_PUMP`, `VRM MOS`. `GET /hwmon/headers` carries the name as `board_label`, and
+  `GET /diagnostics/hardware` reports the layout and the name of every covered fan header, fan and
+  temperature as `board_layout`. A driver's own label always wins, and no id changes.
+- **A header the board catalogue names a pump is protected as one.** Its role is `pump` with
+  `role_source: "board_catalogue"`: identify moves it instead of stopping it, `stop_permitted` is
+  `false`, and a profile holds it at the pump floor (70 % on a DC header). A `CPU_FAN` or `CPU_OPT`
+  name earns the 30 % floor. Like every pump rule, this only adds protection; a role you assign can
+  add to it, never take it away.
+
+### Changed
+
+- **Board voltages: 39 inputs on nine layouts are now shown unnamed.** Where a second, independent
+  reading of GIGABYTE's sensor tables disagrees with the it87 configuration, the input is now left
+  unnamed rather than guessed. On the five X570S layouts the IT8689E's `in0`–`in6`, shown before as
+  not mapped, are now plain unnamed channels. On four layouts (`3008090B`, `3108090B`, `6008090B`,
+  `6108090B`) the IT8792E's `in4` loses its `Chipset Core 2.5V` name and divider. The catalogue
+  moves to it87 commit `bd7a566`.
+
 ## [5.2.0] — 2026-10-16
 
 Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.2.0 is the matching release.

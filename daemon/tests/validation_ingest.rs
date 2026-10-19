@@ -97,6 +97,7 @@ fn validation_app_state(device_id: &str) -> std::sync::Arc<ventulusd::api::handl
             ventulusd::control_override::OverrideTable::new(),
         )),
         allow_port_probe: false,
+        board_context: Default::default(),
         running_config: Default::default(),
         readiness_rollup: readiness_rollup.clone(),
         config_write: Default::default(),

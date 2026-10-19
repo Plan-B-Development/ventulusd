@@ -1356,6 +1356,7 @@ mod tests {
                 crate::control_override::OverrideTable::new(),
             )),
             allow_port_probe: false,
+            board_context: Default::default(),
             running_config: Default::default(),
             readiness_rollup: readiness_rollup.clone(),
             config_write: Default::default(),

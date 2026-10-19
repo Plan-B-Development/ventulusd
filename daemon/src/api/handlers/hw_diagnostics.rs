@@ -375,6 +375,38 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
         siv_word,
     );
 
+    // DEC-500: the catalogue's names for this board's channels, under the key
+    // the controller was built with (`AppState::board_context`), so a header's
+    // entry always repeats what `/hwmon/headers` publishes — even after an SIV
+    // appears or goes mid-session, which `board_firmware_counts` above, a fresh
+    // read, does show. Headers carry what discovery decided (it is what their
+    // role was inferred from); monitor-only fans (`/inventory/hwmon`) and
+    // temperatures (`/sensors`) are named here. Skipped — no scan — on a board
+    // with no SIV.
+    let board_context = &state.board_context;
+    let board_layout = if board_context.siv.is_some() {
+        let headers: Vec<&crate::hwmon::pwm_discovery::PwmHeaderDescriptor> =
+            match state.hwmon_controller {
+                Some(ref controller) => controller.headers().iter().collect(),
+                None => Vec::new(),
+            };
+        let fans = crate::hwmon::inventory::discover_monitor_only_fans(std::path::Path::new(
+            crate::hwmon::HWMON_SYSFS_ROOT,
+        ))
+        .unwrap_or_else(|e| {
+            log::warn!("Monitor-only fan discovery failed: {e}");
+            Vec::new()
+        });
+        let temps: Vec<(&str, &str, &str)> = snap
+            .sensors
+            .values()
+            .map(|r| (r.id.as_str(), r.chip_name.as_str(), r.label.as_str()))
+            .collect();
+        board_layout(board_context, &board.name, &headers, &fans, &temps)
+    } else {
+        None
+    };
+
     json_ok(
         StatusCode::OK,
         HardwareDiagnosticsResponse {
@@ -407,8 +439,69 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             amd_pci_devices,
             amdgpu_module_loaded,
             voltages,
+            board_layout,
         },
     )
+}
+
+/// The `board_layout` object (DEC-500): this board's SIV, whether upstream
+/// lists the board for it, and the catalogue's verdict on each discovered
+/// channel it covers.
+///
+/// `None` without an SIV or a known CPU vendor — the catalogue is keyed on
+/// both, and a layout object with no key would claim a match nobody made.
+/// `temps` is `(id, canonical chip, label)` per published sensor. A channel is
+/// named only where its driver published no label: a header's `board` was
+/// decided at discovery under that rule, and a monitor-only fan or temperature
+/// qualifies here only when its label is the synthesised `fanN` / `tempN`.
+fn board_layout(
+    board: &crate::hwmon::board_catalogue::BoardContext,
+    dmi_board_name: &str,
+    headers: &[&crate::hwmon::pwm_discovery::PwmHeaderDescriptor],
+    fans: &[crate::hwmon::inventory::FanInputDescriptor],
+    temps: &[(&str, &str, &str)],
+) -> Option<BoardLayout> {
+    use crate::hwmon::board_catalogue::{self, ChannelKind};
+    let siv = board.siv?;
+    let platform = match board.cpu_vendor.as_str() {
+        "AMD" | "Intel" => board.cpu_vendor.clone(),
+        _ => return None,
+    };
+    let listed = board_catalogue::listed_boards(&platform, siv);
+    let dmi = dmi_board_name.trim();
+    let board_listed = !dmi.is_empty() && listed.iter().any(|n| n.eq_ignore_ascii_case(dmi));
+
+    let mut channels: Vec<BoardLayoutChannel> = headers
+        .iter()
+        .filter_map(|h| Some(BoardLayoutChannel::new(&h.id, "pwm", h.board?)))
+        .collect();
+    for f in fans {
+        if f.label == format!("fan{}", f.fan_index) {
+            if let Some(c) = board.channel(&f.chip_name, ChannelKind::Fan, f.fan_index) {
+                channels.push(BoardLayoutChannel::new(&f.id, "fan", c));
+            }
+        }
+    }
+    for &(id, chip, label) in temps {
+        let index = label
+            .strip_prefix("temp")
+            .and_then(|n| n.parse::<u8>().ok())
+            .filter(|n| label == format!("temp{n}"));
+        if let Some(c) = index.and_then(|n| board.channel(chip, ChannelKind::Temp, n)) {
+            channels.push(BoardLayoutChannel::new(id, "temp", c));
+        }
+    }
+    channels.sort_by(|a, b| a.id.cmp(&b.id));
+
+    Some(BoardLayout {
+        siv: format!("{siv:08X}"),
+        in_catalogue: board_catalogue::knows_siv(&platform, siv),
+        platform,
+        catalogue_commit: board_catalogue::UPSTREAM_COMMIT.to_string(),
+        listed_boards: listed.iter().map(|n| n.to_string()).collect(),
+        board_listed,
+        channels,
+    })
 }
 
 /// The `voltages` array: discovery, then the board catalogue (`VOLT-b`,
@@ -593,5 +686,207 @@ mod tests {
             .expect("a GPU")
             .kernel_warnings
             .is_empty());
+    }
+
+    // ── DEC-500: board_layout ─────────────────────────────────────────────
+
+    mod board_layout_tests {
+        use super::super::board_layout;
+        use crate::hwmon::board_catalogue::{BoardChannel, BoardContext};
+        use crate::hwmon::inventory::FanInputDescriptor;
+        use crate::hwmon::pwm_discovery::PwmHeaderDescriptor;
+
+        const HOST_SIV: u32 = 0xA008_090A;
+
+        fn ctx(vendor: &str, siv: Option<u32>) -> BoardContext {
+            BoardContext {
+                cpu_vendor: vendor.into(),
+                siv,
+            }
+        }
+
+        fn header(chip: &str, idx: u8, board: Option<BoardChannel>) -> PwmHeaderDescriptor {
+            PwmHeaderDescriptor {
+                id: format!("hwmon:{chip}:nodev:pwm{idx}:pwm{idx}"),
+                label: format!("pwm{idx}"),
+                chip_name: chip.into(),
+                pwm_index: idx,
+                board,
+                ..Default::default()
+            }
+        }
+
+        fn fan(chip: &str, idx: u8, label: &str) -> FanInputDescriptor {
+            FanInputDescriptor {
+                id: format!("hwmon:{chip}:nodev:fan{idx}:{label}"),
+                chip_name: chip.into(),
+                fan_index: idx,
+                label: label.into(),
+                input_path: std::path::PathBuf::new(),
+            }
+        }
+
+        fn names(
+            layout: &crate::api::responses::BoardLayout,
+        ) -> Vec<(&str, &str, Option<&str>, bool)> {
+            layout
+                .channels
+                .iter()
+                .map(|c| {
+                    (
+                        c.id.as_str(),
+                        c.kind,
+                        c.board_label.as_deref(),
+                        c.board_unmapped,
+                    )
+                })
+                .collect()
+        }
+
+        /// The reference board: the catalogue's verdict on each unlabelled
+        /// channel, joined on the ids the other endpoints publish; driver
+        /// labels win, and a header carries what discovery decided.
+        #[test]
+        fn the_reference_board_layout_names_its_unlabelled_channels() {
+            let cpu = header("it8696", 1, Some(BoardChannel::Named("CPU_FAN")));
+            let spare = header("it8696", 6, Some(BoardChannel::Unmapped));
+            let labelled = header("it87952", 3, None);
+            let fans = [
+                fan("it87952", 3, "fan3"),
+                // A driver label: the catalogue's SYS_FAN5_PUMP is not offered.
+                fan("it87952", 1, "CHA_FAN9"),
+            ];
+            let temps = [
+                ("hwmon:it8696:nodev:temp5", "it8696", "temp5"),
+                ("hwmon:it8696:nodev:temp3", "it8696", "CPU"),
+                ("hwmon:it87952:nodev:temp2", "it87952", "temp2"),
+                ("hwmon:k10temp:pci:Tctl", "k10temp", "Tctl"),
+            ];
+            let layout = board_layout(
+                &ctx("AMD", Some(HOST_SIV)),
+                "X870E AORUS MASTER",
+                &[&cpu, &spare, &labelled],
+                &fans,
+                &temps,
+            )
+            .expect("a layout");
+
+            assert_eq!(layout.siv, "A008090A");
+            assert_eq!(layout.platform, "AMD");
+            assert!(layout.in_catalogue);
+            assert!(layout.board_listed);
+            assert_eq!(
+                layout.catalogue_commit,
+                crate::hwmon::board_catalogue::UPSTREAM_COMMIT
+            );
+            assert!(layout.listed_boards.iter().any(|b| b == "X870E AORUS PRO"));
+            assert_eq!(
+                names(&layout),
+                vec![
+                    (
+                        "hwmon:it8696:nodev:pwm1:pwm1",
+                        "pwm",
+                        Some("CPU_FAN"),
+                        false
+                    ),
+                    ("hwmon:it8696:nodev:pwm6:pwm6", "pwm", None, true),
+                    ("hwmon:it8696:nodev:temp5", "temp", Some("VRM MOS"), false),
+                    (
+                        "hwmon:it87952:nodev:fan3:fan3",
+                        "fan",
+                        Some("SYS_FAN4"),
+                        false
+                    ),
+                    ("hwmon:it87952:nodev:temp2", "temp", Some("EC_TEMP2"), false),
+                ]
+            );
+        }
+
+        /// Upstream lists boards per SIV; the match is the DMI name, trimmed and
+        /// case-folded. An unlisted board on a known layout still gets the
+        /// names — the key is the SIV, never the board name.
+        #[test]
+        fn board_listing_follows_the_dmi_name_but_never_gates_the_names() {
+            let cpu = header("it8696", 1, Some(BoardChannel::Named("CPU_FAN")));
+            for (dmi, listed) in [
+                ("X870E AORUS PRO", true),
+                ("  x870e aorus master ", true),
+                ("B650 AORUS ELITE AX", false),
+                ("", false),
+            ] {
+                let layout = board_layout(&ctx("AMD", Some(HOST_SIV)), dmi, &[&cpu], &[], &[])
+                    .expect("a layout");
+                assert_eq!(layout.board_listed, listed, "{dmi:?}");
+                assert_eq!(layout.channels.len(), 1, "{dmi:?}");
+            }
+        }
+
+        #[test]
+        fn no_siv_or_an_unknown_platform_publishes_no_layout() {
+            for c in [
+                ctx("AMD", None),
+                ctx("", Some(HOST_SIV)),
+                ctx("Hygon", Some(HOST_SIV)),
+            ] {
+                assert!(
+                    board_layout(&c, "X870E AORUS MASTER", &[], &[], &[]).is_none(),
+                    "{c:?}"
+                );
+            }
+        }
+
+        /// An SIV nobody has mapped — or a CPU platform the layout was not
+        /// written for — is reported as such, with nothing named.
+        #[test]
+        fn an_unmapped_layout_is_reported_with_no_channels() {
+            let temps = [("hwmon:it8696:nodev:temp5", "it8696", "temp5")];
+            for c in [ctx("AMD", Some(0xDEAD_BEEF)), ctx("Intel", Some(HOST_SIV))] {
+                let layout =
+                    board_layout(&c, "X870E AORUS MASTER", &[], &[], &temps).expect("a layout");
+                assert!(!layout.in_catalogue, "{c:?}");
+                assert!(
+                    layout.listed_boards.is_empty() && !layout.board_listed,
+                    "{c:?}"
+                );
+                assert!(layout.channels.is_empty(), "{c:?}");
+            }
+        }
+
+        /// A0030507 has a block for the primary chip only: its names stand, and
+        /// a second chip on the board gets none rather than cancelling them.
+        #[test]
+        fn a_partial_layout_names_only_the_chip_it_covers() {
+            use crate::hwmon::board_catalogue::ChannelKind;
+            let c = ctx("AMD", Some(0xA003_0507));
+            let primary = c.name("it8696", ChannelKind::Temp, 1);
+            assert!(primary.is_some(), "precondition: the primary chip is named");
+            assert_eq!(c.channel("it87952", ChannelKind::Temp, 1), None);
+            let temps = [
+                ("hwmon:it8696:nodev:temp1", "it8696", "temp1"),
+                ("hwmon:it87952:nodev:temp1", "it87952", "temp1"),
+            ];
+            let layout = board_layout(&c, "", &[], &[], &temps).expect("a layout");
+            assert!(layout.in_catalogue);
+            assert_eq!(
+                names(&layout),
+                vec![("hwmon:it8696:nodev:temp1", "temp", primary, false)]
+            );
+        }
+
+        /// A channel the two derivations disagree on is withheld: no name, and
+        /// no unmapped verdict either — it is simply not listed.
+        #[test]
+        fn a_withheld_channel_is_not_listed() {
+            let temps = [
+                ("hwmon:it87952:nodev:temp1", "it87952", "temp1"),
+                ("hwmon:it87952:nodev:temp3", "it87952", "temp3"),
+            ];
+            let layout = board_layout(&ctx("AMD", Some(0xA108_090A)), "", &[], &[], &temps)
+                .expect("a layout");
+            assert_eq!(
+                names(&layout),
+                vec![("hwmon:it87952:nodev:temp3", "temp", Some("System 2"), false)]
+            );
+        }
     }
 }

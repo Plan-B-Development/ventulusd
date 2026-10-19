@@ -104,6 +104,7 @@
         "is_aio",
         "role",
         "role_source",
+        "board_label",
         "effective_min_pwm_pct",
         "stop_permitted",
         "cooling_device_id",
@@ -126,6 +127,7 @@
         "is_aio",
         "role",
         "role_source",
+        "board_label",
         "effective_min_pwm_pct",
         "stop_permitted",
         "cooling_device_id",
@@ -193,6 +195,7 @@
         "is_aio",
         "role",
         "role_source",
+        "board_label",
         "effective_min_pwm_pct",
         "stop_permitted",
         "cooling_device_id",
@@ -215,6 +218,7 @@
         "is_aio",
         "role",
         "role_source",
+        "board_label",
         "effective_min_pwm_pct",
         "stop_permitted",
         "cooling_device_id",
@@ -491,6 +495,54 @@
         "label": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
       },
       "note": "WIRE-ag / DEC-331. Pinned from the first release that publishes it rather than after a divergence: WIRE-h is what an unpinned new struct costs. `label` is genuinely read (it is the Rail column) but is excluded from must_be_read by test_must_be_read_names_are_distinctive \u2014 the name is too common to prove a read site; tests/test_wire_ag_voltages.py asserts it at the call site instead. `id` has no GUI consumer yet, and the wire identity is modelled anyway because the model mirrors the wire; `channel` is read only as a display sort key. VOLT-b / DEC-464 added `board_label`, `board_multiplier` and `board_unmapped` (the board voltage catalogue), all omitted when the catalogue says nothing."
+    },
+    {
+      "daemon": "BoardLayout",
+      "gui": "BoardLayout",
+      "endpoints": [
+        "GET /diagnostics/hardware .board_layout"
+      ],
+      "fields": [
+        "siv",
+        "platform",
+        "in_catalogue",
+        "catalogue_commit",
+        "listed_boards",
+        "board_listed",
+        "channels"
+      ],
+      "must_be_read": [
+        "siv",
+        "platform",
+        "in_catalogue",
+        "catalogue_commit",
+        "listed_boards",
+        "board_listed",
+        "channels"
+      ],
+      "note": "DEC-500. The board's GIGABYTE firmware layout (SIV) and the board-catalogue verdict on its channels; omitted with no SIV or an unknown CPU vendor. Pinned from the first release that publishes it (WIRE-h is what an unpinned new struct costs)."
+    },
+    {
+      "daemon": "BoardLayoutChannel",
+      "gui": "BoardLayoutChannel",
+      "endpoints": [
+        "GET /diagnostics/hardware .board_layout.channels"
+      ],
+      "fields": [
+        "id",
+        "kind",
+        "board_label",
+        "board_unmapped"
+      ],
+      "must_be_read": [
+        "board_label",
+        "board_unmapped"
+      ],
+      "not_assertable": {
+        "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
+        "kind": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)"
+      },
+      "note": "DEC-500. `id` is the id the entity is published under elsewhere (a header, a monitor-only fan or a sensor) and is the GUI's join key; `kind` says which. Both names are too common for the name-based read check, so tests/test_board_layout_dec500.py asserts the join at the call site. `board_label` and `board_unmapped` are shared with VoltageEntry, so a read of either struct satisfies the name check for both."
     },
     {
       "daemon": "HwmonChipInfo",
@@ -1154,7 +1206,8 @@
         "cpu_vendor",
         "amd_pci_devices",
         "amdgpu_module_loaded",
-        "voltages"
+        "voltages",
+        "board_layout"
       ],
       "must_be_read": [
         "hwmon",
@@ -1173,7 +1226,8 @@
         "cpu_vendor",
         "amd_pci_devices",
         "amdgpu_module_loaded",
-        "voltages"
+        "voltages",
+        "board_layout"
       ],
       "inert": {
         "kernel_detected_chips": "parsed (DEC-101's kmsg chip detection) and read by no GUI surface today; the support bundle carries the raw payload instead."

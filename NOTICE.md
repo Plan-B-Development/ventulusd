@@ -25,21 +25,25 @@ or on anyone redistributing it. It is recorded here only because it is not the
 MIT licence the rest of the tree carries. It is OSI-approved and listed by the
 FSF as Free/Libre.
 
-## Board voltage-rail facts from the it87 project (DEC-464)
+## Board sensor facts from the it87 project (DEC-464, DEC-500)
 
-`daemon/src/hwmon/voltage_catalogue_data.rs` is generated from the Gigabyte sensor
+`daemon/src/hwmon/board_catalogue_data.rs` is generated from the Gigabyte sensor
 configurations in **frankcrawford/it87** (`Sensors configs/Gigabyte/configs/`:
-`gigabyte-it87-amd.conf`, `gigabyte-it87-intel.conf`, and the inputs on which
+`gigabyte-it87-amd.conf`, `gigabyte-it87-intel.conf`, and the channels on which
 `gigabyte-it87-intel-kabylakex.conf` and `gigabyte-it87-intel-skylakex.conf` agree),
 which are distributed under the **GNU General Public License v2.0**.
 <https://github.com/frankcrawford/it87>
 
-What the daemon carries is the factual content of their `label inN`, `compute inN`
-and `ignore inN` lines (which board rail each Super-I/O voltage input is wired to,
-the divider ratio on it, and which inputs a board's configuration does not map), re-expressed
-as a Rust table keyed the way those configurations key it (chip and Gigabyte SIV).
-No configuration file is copied or shipped. The generated file's header records the
-upstream commit it was produced from. The same approach was already taken for the
+What the daemon carries is the factual content of their `label`, `compute` and
+`ignore` lines for voltage inputs (`inN`), fan tachometers (`fanN`), PWM outputs
+(`pwmN`) and temperatures (`tempN`): which board rail, fan header or temperature
+each Super-I/O channel is wired to, the divider ratio on an input, and which
+channels a board's configuration does not map, plus the board names each SIV's
+comment block lists. It is re-expressed as a Rust table keyed the way those
+configurations key it (chip and Gigabyte SIV). No configuration file is copied or
+shipped. The generated file's header records the upstream commit it was produced
+from, and which channels were left out because an independent derivation
+disagrees with the configuration. The same approach was already taken for the
 catalogue-derived fan-header labels in `ventulus` (DEC-421). We thank the it87
 maintainers and contributors for publishing this per-board data.
 

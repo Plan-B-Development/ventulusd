@@ -202,6 +202,46 @@ The daemon publishes a **read-only** view of your cooling hardware for the GUI
 - **GPUs are handled separately:** GPU fan discovery and control are not part of
   this hwmon path (§ GPU fan control).
 
+### Board names for unlabelled headers (Gigabyte)
+
+The ITE chips on Gigabyte boards publish no fan, PWM or temperature labels, so
+their channels appear as `pwm1`, `fan3`, `temp5`. When the board publishes its
+GIGABYTE firmware layout (the SIV, which only the out-of-tree
+[`frankcrawford/it87`](https://github.com/frankcrawford/it87) driver exposes, at
+`/sys/class/gigabyte/id/gigabyte_siv`), the daemon looks the layout up in a board
+catalogue built from that project's Gigabyte sensor configurations and names what
+the driver left unnamed: `CPU_FAN`, `SYS_FAN5_PUMP`, `VRM MOS`.
+
+- **The key is the layout, not the board name.** The catalogue is keyed on the CPU
+  platform (AMD or Intel), the chip and the SIV. `GET /diagnostics/hardware`
+  reports the match as `board_layout`: the SIV, whether the catalogue knows it, the
+  upstream commit, the board names upstream lists for it and whether yours is one
+  of them. A board on a known layout gets the names whether or not it is listed.
+- **Read once, at start.** The daemon reads the layout as it starts, before it
+  discovers the headers, and answers every catalogue fact from that read. After
+  installing the out-of-tree driver, restart the daemon
+  (`sudo systemctl restart ventulusd`); a rescan does not change the running
+  header set.
+- **A driver label always wins.** Only a channel whose driver publishes no label is
+  named. Ids never change: a header is `hwmon:it8696:it87.2624:pwm1:pwm1` with or
+  without the catalogue.
+- **The names are role evidence.** On `GET /hwmon/headers` a named header carries
+  `board_label`, and a header the catalogue names a pump (`*_PUMP`) or a CPU fan
+  classifies as one, with `role_source: "board_catalogue"`. So a catalogue pump is
+  never stopped by identify, `stop_permitted` reads `false`, and a profile holds
+  it at the pump floor; a `CPU_FAN` or `CPU_OPT` name earns the 30 % floor, as
+  the same label from the driver would. These names are not verified on your
+  machine: if one is wrong, assign the header its real role
+  (`POST /config/header-role`). An assignment can add protection, never remove it.
+- **Some channels stay generic.** A channel the board's configuration does not map
+  is reported as unmapped (not mapped by this layout, which does not mean nothing
+  is connected). A channel where a second, independent reading of GIGABYTE's own
+  sensor tables disagrees with the configuration is left unnamed rather than
+  guessed. A layout nobody has mapped yet names nothing.
+- **Temperatures are named for display only.** A temperature the catalogue calls
+  `CPU` is still classified by the daemon's own rules, and the thermal emergency
+  never reads a catalogue name.
+
 ## Configuration
 
 Configuration is optional. The package installs `/etc/ventulus/daemon.toml` with
@@ -320,9 +360,10 @@ Configuration is split between two files (see
   permissions through an atomic rename. It holds everything set through the API:
   - **the fan header roles you assign** (`[hardware] header_roles`,
     `POST /config/header-role`). On a board whose Super-I/O publishes no fan
-    labels, a `pump` assignment here is the **only** evidence that a header drives
-    a pump, so it is what gives that header the 30 % floor and keeps fan identify
-    from stopping it;
+    labels, and which the board catalogue does not cover (§ Board names for
+    unlabelled headers), a `pump` assignment here is the **only** evidence that a
+    header drives a pump, so it is what gives that header the 30 % floor and keeps
+    fan identify from stopping it;
   - the cooling devices (`[[cooling_devices]]`, `POST /config/cooling-device`);
   - the preferred CPU and motherboard temperature sensors and the exit minimum;
   - any key from the table above changed through the API.
@@ -713,15 +754,16 @@ timer runs out, so a crashed client can never leave a fan held.
 
 **A pump is never stopped.** You always send `action: "stop"`, and the daemon
 decides what that means from the header's role. An ordinary fan is driven to 0. A
-header the daemon holds as a pump, because its role or its own label says so or
-the active profile's name for it contains `pump` or `aio`, is moved instead: about
+header the daemon holds as a pump, because its role, its own label or (where the
+driver gives no label) the board catalogue's name for it says so, or the active
+profile's name for it contains `pump` or `aio`, is moved instead: about
 25 points clear of its current duty, upward wherever there is room, and never
 below its pump floor. The response's `mode` field says which happened (`"stop"` or
 `"pump_perturb"`), with `identify_pwm_percent` and `baseline_pwm_percent`.
 
 If your pump is on a header the daemon cannot classify (common on boards whose
-Super-I/O publishes no fan labels, where every header reads `role: "unknown"`),
-tell it first:
+Super-I/O publishes no fan labels and whose layout the board catalogue does not
+cover, where every header reads `role: "unknown"`), tell it first:
 
 ```bash
 curl -s --unix-socket /run/ventulus/ventulus.sock \

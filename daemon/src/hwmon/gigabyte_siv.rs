@@ -86,7 +86,7 @@ pub fn parse_siv(raw: &str) -> Option<GigabyteSiv> {
 /// can never disagree about whether the descriptor is valid.
 ///
 /// The word itself is what the board voltage catalogue keys on (`VOLT-b`,
-/// [`super::voltage_catalogue`]): it identifies a board family, which the
+/// [`super::board_catalogue`]): it identifies a board family, which the
 /// decoded counts alone cannot — rebuilding it from them is lossy.
 pub fn parse_siv_text(raw: &str) -> Option<u32> {
     let trimmed = raw.trim();
