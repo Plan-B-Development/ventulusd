@@ -5,6 +5,13 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+## [5.3.0] — 2026-10-19
+
+Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.4.0 is the matching release
+and shows the board names, layout and driver-readiness detail below. The new fields are additive and
+optional; no capability flag, curve or thermal-ladder change. Floor values are unchanged; a board
+name can only add a floor to a header (below), never remove one.
+
 ### Added
 
 - **Gigabyte fan headers and temperatures get their board names.** On a Gigabyte board running the
@@ -43,7 +50,6 @@ rename. Version numbers carry on from Control-OFC.
   (IT87952E, and IT8689E from Linux 7.1). The tarball installer points to the GUI's Hardware page
   to check which driver your board needs. No package installs DKMS or kernel headers by default,
   and a test keeps it that way.
-
 - **Board voltages: 39 inputs on nine layouts are now shown unnamed.** Where a second, independent
   reading of GIGABYTE's sensor tables disagrees with the it87 configuration, the input is now left
   unnamed rather than guessed. On the five X570S layouts the IT8689E's `in0`–`in6`, shown before as

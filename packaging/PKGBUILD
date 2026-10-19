@@ -1,6 +1,6 @@
 # Maintainer: Plan-B-Development <Mitchell.R.Palmer@gmail.com>
 pkgname=ventulusd
-pkgver=5.2.0
+pkgver=5.3.0
 pkgrel=1
 pkgdesc="Hardware fan control daemon for Linux (OpenFan, hwmon, GPU)"
 arch=('x86_64')
