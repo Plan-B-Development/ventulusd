@@ -353,7 +353,7 @@ fn compute_hardware_assessment(state: &AppState) -> crate::hwmon::readiness::Har
 /// GET /inventory/superio — passive Super-I/O chip detection report.
 ///
 /// Read-only and passive: composes the DMI board table, bound hwmon chips,
-/// `/proc/modules`, `/dev/kmsg`, and ACPI I/O-port conflicts into a per-chip
+/// `/proc/modules` and `/dev/kmsg` into a per-chip
 /// presence report with allowlisted "load this driver" recommendations. Never
 /// probes I/O ports, loads modules, or writes hardware. Runs on the blocking
 /// pool (sysfs/procfs reads). Gated purely by 404 on older daemons, mirroring
@@ -482,7 +482,6 @@ fn map_superio_report(
         api_version: API_VERSION,
         arch_supported: report.arch_supported,
         chips: report.chips.iter().map(map_superio_chip).collect(),
-        acpi_conflict_drivers: report.acpi_conflict_drivers.clone(),
         notes: report.notes.clone(),
         port_probe_available,
         port_probe_reason,
@@ -1152,7 +1151,6 @@ mod tests {
                 }),
                 caveats: vec![],
             }],
-            acpi_conflict_drivers: vec!["it87".into()],
             notes: vec!["present != control".into()],
             signed_modules_only: None,
         };

@@ -1140,8 +1140,9 @@ sets `ReadWritePaths=/sys/devices`, so look for a drop-in that overrides it
 `sudo systemctl daemon-reload && sudo systemctl restart ventulusd`.
 
 Without that line, the cause is a hardware prerequisite: the GUI's **Hardware**
-page detects a missing Super-I/O driver, an ACPI conflict or a missing
-`amdgpu.ppfeaturemask`, and shows the fix. If the header is flagged
+page detects a missing Super-I/O driver or a missing `amdgpu.ppfeaturemask`, and
+shows the fix. An ACPI conflict shows only in the kernel log (see *ACPI conflicts*
+above). If the header is flagged
 `duty_not_holding`, another program is writing it (see the table above).
 
 ### The profile does not come back after a reboot

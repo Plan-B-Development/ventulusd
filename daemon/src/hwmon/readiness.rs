@@ -504,10 +504,10 @@ use crate::hwmon::chip_db::SUPERIO_GUARD_MODULES;
 /// here (not in the handler) because `ReadinessItem`'s builders are private to
 /// this module. The handler appends the result and recomputes `overall`.
 ///
-/// Two aggregate items at most (unique codes — the GUI keys off `code`):
+/// One aggregate item at most (the GUI keys off `code`):
 /// `superio_driver_unloaded` when any detected chip is present-but-unbound with
-/// a load recommendation, and `superio_acpi_conflict` when a Super-I/O driver's
-/// I/O range collides with an ACPI OperationRegion.
+/// a load recommendation. The `superio_acpi_conflict` item is retired (SBR-07):
+/// its `/proc/ioports` source never lists an ACPI OpRegion.
 pub fn superio_readiness_items(
     report: &crate::hwmon::superio::SuperIoReport,
 ) -> Vec<ReadinessItem> {
@@ -604,28 +604,6 @@ pub fn superio_readiness_items(
                  and copy-paste command; a reboot or module reload may be needed."
             })
             .reboot(),
-        );
-    }
-
-    if !report.acpi_conflict_drivers.is_empty() {
-        items.push(
-            ReadinessItem::new(
-                "superio_acpi_conflict",
-                ReadinessSeverity::Warning,
-                "hwmon",
-                "ACPI claims a Super-I/O chip's I/O ports",
-                format!(
-                    "ACPI firmware has reserved the I/O ports used by {}. Under \
-                     acpi_enforce_resources=strict (the default) the driver may refuse to bind, so \
-                     the chip's sensors/fans stay unavailable.",
-                    report.acpi_conflict_drivers.join(", ")
-                ),
-            )
-            .action(
-                "See the Hardware page's Super-I/O Architecture section. Do not switch to \
-                 acpi_enforce_resources=lax without understanding the driver/ACPI race it \
-                 reintroduces.",
-            ),
         );
     }
 
@@ -909,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn superio_items_emitted_for_unbound_chip_and_acpi_conflict() {
+    fn superio_item_emitted_for_unbound_chip() {
         use crate::hwmon::superio::{
             Evidence, SuperIoChip, SuperIoRecommendation, SuperIoReport, SuperIoVendor,
         };
@@ -933,14 +911,12 @@ mod tests {
                 }),
                 caveats: vec![],
             }],
-            acpi_conflict_drivers: vec!["it87".into()],
             notes: vec![],
             signed_modules_only: None,
         };
         let items = superio_readiness_items(&report);
         let codes: Vec<&str> = items.iter().map(|i| i.code.as_str()).collect();
-        assert!(codes.contains(&"superio_driver_unloaded"));
-        assert!(codes.contains(&"superio_acpi_conflict"));
+        assert_eq!(codes, vec!["superio_driver_unloaded"]);
         let unloaded = items
             .iter()
             .find(|i| i.code == "superio_driver_unloaded")
@@ -981,7 +957,6 @@ mod tests {
                     }),
                     caveats: vec![],
                 }],
-                acpi_conflict_drivers: vec![],
                 notes: vec![],
                 signed_modules_only: None,
             };
@@ -1065,7 +1040,6 @@ mod tests {
                 }),
                 caveats: vec![],
             }],
-            acpi_conflict_drivers: vec![],
             notes: vec![],
             signed_modules_only: None,
         };
@@ -1142,7 +1116,6 @@ mod tests {
                 }),
                 caveats: vec![],
             }],
-            acpi_conflict_drivers: vec![],
             notes: vec![],
             signed_modules_only: signed,
         };
@@ -1169,7 +1142,6 @@ mod tests {
         let report = SuperIoReport {
             arch_supported: true,
             chips: vec![],
-            acpi_conflict_drivers: vec![],
             notes: vec![],
             signed_modules_only: None,
         };
@@ -1206,7 +1178,6 @@ mod tests {
                 }),
                 caveats: vec![],
             }],
-            acpi_conflict_drivers: vec!["it87".into()],
             notes: vec![],
             signed_modules_only: None,
         };
@@ -1233,7 +1204,6 @@ mod tests {
         let superio = "the Hardware page's Super-I/O Architecture section";
         assert!(action(&loaded, "superio_driver_unloaded").contains(superio));
         assert!(action(&not_loaded, "superio_driver_unloaded").contains(superio));
-        assert!(action(&loaded, "superio_acpi_conflict").contains(superio));
         assert!(action(&items, "sensors_unavailable").contains("the Overview page's Sensors table"));
 
         items.extend(loaded);

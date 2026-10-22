@@ -1239,7 +1239,6 @@
         "nvidia_gpu",
         "thermal_safety",
         "kernel_modules",
-        "acpi_conflicts",
         "board",
         "kernel_release",
         "expected_chips",
@@ -1254,6 +1253,7 @@
         "kernel_security"
       ],
       "inert": {
+        "acpi_conflicts": "SBR-07 (DEC-501): always [] from daemons after 5.3.0, and an older daemon's entries came from a /proc/ioports match that could not see an ACPI OpRegion, so the GUI deliberately reads none; parsed only so the payload still loads.",
         "kernel_detected_chips": "parsed (DEC-101's kmsg chip detection) and read by no GUI surface today; the support bundle carries the raw payload instead."
       },
       "not_assertable": {

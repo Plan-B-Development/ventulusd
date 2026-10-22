@@ -13,6 +13,14 @@ rename. Version numbers carry on from Control-OFC.
   `rpm_min_threshold` and `rpm_max_threshold`, which the Hardware page shows as "RPM thresholds".
   The daemon now leaves both out for those two drivers, read from the driver actually bound to the
   chip. The in-kernel nct6683 driver, which uses the same chip names, keeps its real minimum.
+- **No more false ACPI I/O-port conflict reports.** The daemon looked for them in `/proc/ioports`,
+  where the kernel never lists the ACPI regions that cause a real conflict, so it could not see one
+  and could report only harmless firmware ranges. The check is removed: `acpi_conflicts` in
+  `GET /diagnostics/hardware` is now always empty (the field stays for older GUIs), the Super-I/O
+  report no longer sends `acpi_conflict_drivers` or an ACPI risk note, and the
+  `superio_acpi_conflict` readiness item is gone. A real conflict shows in the kernel log
+  (`sudo dmesg | grep -i "conflicts with OpRegion"`), which the daemon's sandbox does not let it
+  read.
 
 ## [5.3.0] — 2026-10-19
 

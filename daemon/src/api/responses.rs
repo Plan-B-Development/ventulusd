@@ -962,9 +962,6 @@ pub struct SuperIoResponse {
     pub api_version: u32,
     pub arch_supported: bool,
     pub chips: Vec<SuperIoChipEntry>,
-    /// Driver names whose ISA I/O range collides with an ACPI OperationRegion.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub acpi_conflict_drivers: Vec<String>,
     /// Report-level notes (always carries the "present ≠ controllable" caveat).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
@@ -2455,7 +2452,9 @@ pub struct KernelModuleInfo {
     pub out_of_tree: Option<bool>,
 }
 
-/// Detected ACPI I/O port conflict.
+/// An ACPI I/O port conflict. Never constructed (SBR-07): the
+/// `/proc/ioports` detector that filled it could not see an ACPI OpRegion, so
+/// `acpi_conflicts` is always empty. Kept for the wire shape older clients parse.
 #[derive(Debug, Clone, Serialize)]
 pub struct AcpiConflictInfo {
     pub io_range: String,
@@ -4720,7 +4719,6 @@ mod tests {
                 api_version: API_VERSION,
                 arch_supported: true,
                 chips: Vec::new(),
-                acpi_conflict_drivers: Vec::new(),
                 notes: Vec::new(),
                 port_probe_available: false,
                 port_probe_reason: "flag off".into(),

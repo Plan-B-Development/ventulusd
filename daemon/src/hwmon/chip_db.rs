@@ -2,15 +2,15 @@
 //! primitives.
 //!
 //! This is the single source of truth for "which kernel module drives this
-//! Super-I/O chip, is it in mainline, does its I/O range collide with ACPI,
-//! and what board is this". It is composed by two consumers:
+//! Super-I/O chip, is it in mainline, and what board is this". It is composed
+//! by two consumers:
 //!   - the `GET /diagnostics/hardware` endpoint (via the thin `api::diagnostics`
 //!     re-export shim), and
 //!   - the `hwmon::superio` passive Super-I/O detector.
 //!
 //! Everything here is a passive read of already-populated kernel surfaces
-//! (`/proc/modules`, `/proc/ioports`, `/sys/class/dmi`, `/dev/kmsg`,
-//! `/proc/cpuinfo`) plus static lookup tables — it never probes I/O ports,
+//! (`/proc/modules`, `/sys/class/dmi`, `/dev/kmsg`, `/proc/cpuinfo`) plus
+//! static lookup tables — it never probes I/O ports,
 //! loads modules, or writes any sysfs attribute. Extracted from
 //! `api::diagnostics` so the Super-I/O detector can depend on it without an
 //! `hwmon → api` layering inversion (DEC-202 groundwork).
@@ -20,7 +20,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use crate::api::responses::{AcpiConflictInfo, KernelModuleInfo, ModuleCollisionInfo};
+use crate::api::responses::{KernelModuleInfo, ModuleCollisionInfo};
 
 /// Known hwmon driver modules and whether they're in the mainline kernel.
 ///
@@ -606,86 +606,6 @@ pub fn conflicting_loaded_module<'a>(module: &str, loaded: &'a [String]) -> Opti
         }
     }
     None
-}
-
-/// I/O port ranges used by common Super I/O chips.
-const SIO_IO_RANGES: &[(&str, u16, u16)] = &[
-    ("nct6775", 0x0290, 0x0299),
-    ("nct6775", 0x04E0, 0x04EF),
-    ("it87", 0x0290, 0x029F),
-    ("it87", 0x0A20, 0x0A2F),
-    ("it87", 0x0A40, 0x0A4F),
-    ("it87", 0x0A60, 0x0A6F),
-    // `BRD-k`: the Intel IT87952E secondaries sit here — the Z790 AORUS MASTER
-    // (it87 #22, `it87952-isa-0b10`) and the Z890 AORUS MASTER (it87 #139,
-    // "Found IT87952E chip at 0xb10"). Every AMD-board secondary reported
-    // (it87 #15/#39/#51/#70/#73/#89/#93/#103) is at 0x0A60, above, and so is the
-    // one Intel IT8792E reported (a W480 board, it87 #86: sensors-detect
-    // "address 0xa60"). The other Intel dual-chip rows' bases are unknown — no
-    // capture for them exists (searched 2026-10-15; `BRD-ab`).
-    ("it87", 0x0B10, 0x0B1F),
-];
-
-/// Detect ACPI I/O port conflicts with hwmon drivers.
-pub fn detect_acpi_conflicts() -> Vec<AcpiConflictInfo> {
-    detect_acpi_conflicts_from(Path::new("/proc/ioports"))
-}
-
-/// Testable variant with injectable path.
-pub fn detect_acpi_conflicts_from(proc_ioports: &Path) -> Vec<AcpiConflictInfo> {
-    let content = match std::fs::read_to_string(proc_ioports) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("Cannot read {}: {e}", proc_ioports.display());
-            return vec![];
-        }
-    };
-
-    let mut conflicts = Vec::new();
-
-    // Parse /proc/ioports lines like:
-    //   0290-0299 : ACPI OpRegion AMW0.SHWM
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if !trimmed.contains("ACPI") && !trimmed.contains("acpi") {
-            continue;
-        }
-
-        // Parse the range: "0290-0299 : description"
-        let parts: Vec<&str> = trimmed.splitn(2, " : ").collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let range_str = parts[0].trim();
-        let description = parts[1].trim();
-
-        let range_parts: Vec<&str> = range_str.split('-').collect();
-        if range_parts.len() != 2 {
-            continue;
-        }
-
-        let start = match u16::from_str_radix(range_parts[0].trim(), 16) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let end = match u16::from_str_radix(range_parts[1].trim(), 16) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Check overlap with known SIO ranges
-        for (driver, sio_start, sio_end) in SIO_IO_RANGES {
-            if start <= *sio_end && end >= *sio_start {
-                conflicts.push(AcpiConflictInfo {
-                    io_range: range_str.to_string(),
-                    claimed_by: description.to_string(),
-                    conflicts_with_driver: driver.to_string(),
-                });
-            }
-        }
-    }
-
-    conflicts
 }
 
 // ── DMI board identification ──────────────────────────────────────
@@ -2021,59 +1941,6 @@ mod tests {
         let nct6687 = modules.iter().find(|m| m.name == "nct6687").unwrap();
         assert!(!nct6687.loaded);
         assert!(!nct6687.in_mainline);
-    }
-
-    #[test]
-    fn detect_acpi_conflict() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ioports_path = tmp.path().join("ioports");
-        fs::write(
-            &ioports_path,
-            "0000-0cf7 : PCI Bus 0000:00\n\
-             0290-0299 : ACPI OpRegion AMW0.SHWM\n\
-             0cf8-0cff : PCI conf1\n",
-        )
-        .unwrap();
-
-        let conflicts = detect_acpi_conflicts_from(&ioports_path);
-        assert_eq!(conflicts.len(), 2); // Overlaps with both nct6775 and it87 ranges
-        assert!(conflicts
-            .iter()
-            .any(|c| c.conflicts_with_driver == "nct6775"));
-    }
-
-    /// `BRD-k`: an ACPI claim over the Z790 AORUS MASTER's IT87952E base (0x0B10)
-    /// is reported against it87; the window beside it is not.
-    #[test]
-    fn detect_acpi_conflict_on_the_z790_master_secondary_base() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ioports_path = tmp.path().join("ioports");
-        fs::write(
-            &ioports_path,
-            "0b10-0b1f : ACPI OpRegion GSA1.SIO2\n\
-             0b20-0b2f : ACPI OpRegion GSA1.OTHR\n",
-        )
-        .unwrap();
-
-        let conflicts = detect_acpi_conflicts_from(&ioports_path);
-        assert_eq!(conflicts.len(), 1, "{conflicts:?}");
-        assert_eq!(conflicts[0].io_range, "0b10-0b1f");
-        assert_eq!(conflicts[0].conflicts_with_driver, "it87");
-    }
-
-    #[test]
-    fn no_acpi_conflict_when_no_overlap() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ioports_path = tmp.path().join("ioports");
-        fs::write(
-            &ioports_path,
-            "0000-001f : ACPI something\n\
-             0400-040f : ACPI PM_TMR\n",
-        )
-        .unwrap();
-
-        let conflicts = detect_acpi_conflicts_from(&ioports_path);
-        assert!(conflicts.is_empty());
     }
 
     #[test]

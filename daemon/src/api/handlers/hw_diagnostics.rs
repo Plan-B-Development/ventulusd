@@ -89,7 +89,7 @@ fn amd_gpu_diagnostics(
 
 /// GET /diagnostics/hardware — comprehensive hardware readiness report.
 ///
-/// The report performs ~6 blocking sysfs/procfs reads (modules, ioports, DMI,
+/// The report performs ~5 blocking sysfs/procfs reads (modules, DMI,
 /// cpuinfo, kmsg, ppfeaturemask), so it runs on the blocking pool rather than
 /// stalling a Tokio worker — mirroring the OpenFan write handlers (DEC-099).
 pub async fn hardware_diagnostics_handler(
@@ -296,9 +296,6 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     // Kernel module detection
     let kernel_modules = diagnostics::detect_loaded_modules();
 
-    // ACPI conflict detection
-    let acpi_conflicts = diagnostics::detect_acpi_conflicts();
-
     // Revert counts from pwm_enable watchdog
     let (enable_revert_counts, enable_revert_last_seen_ms) = state
         .hwmon_controller
@@ -446,7 +443,11 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
             nvidia_gpu: nvidia_gpu_diag,
             thermal_safety,
             kernel_modules,
-            acpi_conflicts,
+            // SBR-07: always empty. The daemon cannot see an ACPI OpRegion
+            // conflict: OpRegions never appear in `/proc/ioports`, and the
+            // kernel log that names them is closed by `ProtectKernelLogs`.
+            // The field stays so older clients keep parsing.
+            acpi_conflicts: Vec::new(),
             board,
             // DEC-405: the same read the GPU advisories above use, now also
             // published — capped like every other environment fact.

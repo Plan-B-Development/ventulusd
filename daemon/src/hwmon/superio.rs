@@ -8,8 +8,8 @@
 //!
 //! ## Safety posture (non-negotiable)
 //! - **Passive only.** Detection composes read-only evidence the kernel already
-//!   exposes (DMI board table, bound hwmon chips, `/proc/modules`, `/dev/kmsg`,
-//!   `/proc/ioports`) via [`crate::hwmon::chip_db`]. It never probes an I/O
+//!   exposes (DMI board table, bound hwmon chips, `/proc/modules`, `/dev/kmsg`)
+//!   via [`crate::hwmon::chip_db`]. It never probes an I/O
 //!   port, never loads a module, never writes any sysfs attribute, and never
 //!   touches PWM. (Active `/dev/port` probing and module loading are separate,
 //!   opt-in, later phases — not here.)
@@ -141,8 +141,6 @@ pub struct SuperIoReport {
     pub arch_supported: bool,
     /// Detected chips, ordered by chip name.
     pub chips: Vec<SuperIoChip>,
-    /// Driver names whose I/O range collides with an ACPI OperationRegion.
-    pub acpi_conflict_drivers: Vec<String>,
     /// Report-level notes (always includes the "present ≠ controllable" caveat).
     pub notes: Vec<String>,
     /// Whether this kernel refuses unsigned modules (DEC-500,
@@ -179,8 +177,6 @@ pub trait SuperIoEvidence {
     /// reach the detector via `bound_chips` (or, for ITE boards, the DMI table).
     /// The trait itself is source-agnostic — tests may inject any chip name.
     fn kmsg_chips(&self) -> Vec<String>;
-    /// Driver names with an ACPI I/O-port conflict.
-    fn acpi_conflict_drivers(&self) -> Vec<String>;
     /// Is the currently-loaded `module` an out-of-tree build? (`HOST-d`.)
     ///
     /// On the trait rather than read inline, because `detect_superio` is
@@ -355,14 +351,12 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
         return SuperIoReport {
             arch_supported: false,
             chips: Vec::new(),
-            acpi_conflict_drivers: Vec::new(),
             notes: vec!["Super-I/O detection is only supported on x86 / x86_64.".to_string()],
             signed_modules_only: None,
         };
     }
 
     let loaded = ev.loaded_modules();
-    let acpi_conflict_drivers = ev.acpi_conflict_drivers();
     let kernel = KernelContext {
         version: ev.kernel_version(),
         signed_modules_only: ev.signed_modules_only(),
@@ -405,7 +399,6 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
             &chip_name,
             &ev_acc,
             &loaded,
-            &acpi_conflict_drivers,
             &|m| ev.module_out_of_tree(m),
             guard_declines,
             kernel,
@@ -425,7 +418,6 @@ pub fn detect_superio(ev: &dyn SuperIoEvidence) -> SuperIoReport {
     SuperIoReport {
         arch_supported: true,
         chips,
-        acpi_conflict_drivers,
         notes,
         signed_modules_only: kernel.signed_modules_only,
     }
@@ -440,7 +432,6 @@ fn build_chip(
     chip_name: &str,
     ev: &EvidenceAcc,
     loaded: &[String],
-    acpi_conflict_drivers: &[String],
     // `HOST-d`: "is the loaded build out-of-tree?", taken from the evidence
     // trait rather than read here, so `build_chip` stays a pure function of its
     // inputs and the recommendation path is testable without a real `/sys`.
@@ -511,7 +502,6 @@ fn build_chip(
                 }
             },
             loaded,
-            acpi_conflict_drivers,
             guard_declines,
             kernel,
             &mut caveats,
@@ -785,7 +775,6 @@ fn build_recommendation(
     ev: &EvidenceAcc,
     driver: DriverState,
     loaded: &[String],
-    acpi_conflict_drivers: &[String],
     guard_declines: bool,
     kernel: KernelContext,
     caveats: &mut Vec<String>,
@@ -875,13 +864,6 @@ fn build_recommendation(
     let mut risk_notes = Vec::new();
     if !entry.risk_note.is_empty() {
         risk_notes.push(entry.risk_note.to_string());
-    }
-    if acpi_conflict_drivers.iter().any(|d| d == module) {
-        risk_notes.push(format!(
-            "ACPI firmware claims this chip's I/O ports; under acpi_enforce_resources=strict (the \
-             default) the {module} driver may refuse to bind. Do not switch to lax or force the \
-             driver without understanding the race it reintroduces."
-        ));
     }
     risk_notes.extend(kernel_risk_notes(
         chip_name,
@@ -988,16 +970,6 @@ impl SuperIoEvidence for SysfsSuperIoEvidence {
     fn kmsg_chips(&self) -> Vec<String> {
         chip_db::read_kernel_detected_chips()
     }
-
-    fn acpi_conflict_drivers(&self) -> Vec<String> {
-        let mut v: Vec<String> = chip_db::detect_acpi_conflicts()
-            .into_iter()
-            .map(|c| c.conflicts_with_driver)
-            .collect();
-        v.sort();
-        v.dedup();
-        v
-    }
 }
 
 #[cfg(test)]
@@ -1011,7 +983,6 @@ mod tests {
         bound: Vec<BoundChip>,
         loaded: Vec<String>,
         kmsg: Vec<String>,
-        acpi: Vec<String>,
         /// Modules the fake reports as out-of-tree builds (`HOST-d`).
         out_of_tree: Vec<String>,
         /// Modules whose taint the fake cannot read (DEC-500).
@@ -1046,9 +1017,6 @@ mod tests {
         }
         fn kmsg_chips(&self) -> Vec<String> {
             self.kmsg.clone()
-        }
-        fn acpi_conflict_drivers(&self) -> Vec<String> {
-            self.acpi.clone()
         }
     }
 
@@ -1365,28 +1333,6 @@ mod tests {
         assert!(
             !rec.risk_notes.iter().any(|n| n.contains("also loading")),
             "must not frame an already-active collision as a hypothetical future load"
-        );
-    }
-
-    #[test]
-    fn acpi_conflict_is_surfaced_in_recommendation() {
-        let ev = FakeEvidence {
-            board: (
-                "Gigabyte Technology Co., Ltd.".into(),
-                "X570 AORUS MASTER".into(),
-            ),
-            acpi: vec!["it87".into()],
-            ..Default::default()
-        };
-        let r = detect_superio(&ev);
-        assert_eq!(r.acpi_conflict_drivers, vec!["it87".to_string()]);
-        let rec = find(&r, "it8688").recommendation.as_ref().unwrap();
-        assert!(
-            rec.risk_notes
-                .iter()
-                .any(|n| n.contains("acpi_enforce_resources")),
-            "ACPI conflict must appear as a caveat, got {:?}",
-            rec.risk_notes
         );
     }
 
@@ -1996,7 +1942,6 @@ mod tests {
                 module,
                 &ev,
                 DriverState::NotLoaded,
-                &[],
                 &[],
                 false,
                 KernelContext::default(),
