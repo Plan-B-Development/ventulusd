@@ -592,6 +592,33 @@ mod tests {
         assert_eq!(headers[0].min_pwm_percent, 0);
     }
 
+    /// `SBR-03` wiring: discovery audits each header against the driver bound
+    /// to its own hwmon device, so the out-of-tree nct6687d's speed history
+    /// never reaches the descriptor while mainline nct6683's limit does.
+    #[test]
+    fn discovery_drops_speed_history_thresholds_by_bound_driver() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (dir, driver) in [("hwmon0", "nct6687"), ("hwmon1", "nct6683")] {
+            let hw = create_pwm_fixture(tmp.path(), dir, "nct6687", &[(1, None, false, true)]);
+            fs::write(hw.join("fan1_min"), "412\n").unwrap();
+            let drv = tmp.path().join("drivers").join(driver);
+            fs::create_dir_all(&drv).unwrap();
+            fs::create_dir_all(hw.join("device")).unwrap();
+            std::os::unix::fs::symlink(&drv, hw.join("device/driver")).unwrap();
+        }
+        let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
+        assert_eq!(headers.len(), 2, "headers: {headers:#?}");
+        assert_eq!(
+            headers[0].caps.rpm_min_threshold, None,
+            "out-of-tree nct6687"
+        );
+        assert_eq!(
+            headers[1].caps.rpm_min_threshold,
+            Some(412),
+            "mainline nct6683"
+        );
+    }
+
     #[test]
     fn discover_empty_directory() {
         let tmp = tempfile::tempdir().unwrap();

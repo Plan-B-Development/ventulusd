@@ -5,6 +5,15 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **MSI and ASRock boards on the out-of-tree nct6687 or nct6686 driver no longer show fake RPM
+  thresholds.** Builds of those drivers that publish `fanN_min` and `fanN_max` fill them with the
+  slowest and fastest speeds seen since the module loaded, and the daemon passed them on as
+  `rpm_min_threshold` and `rpm_max_threshold`, which the Hardware page shows as "RPM thresholds".
+  The daemon now leaves both out for those two drivers, read from the driver actually bound to the
+  chip. The in-kernel nct6683 driver, which uses the same chip names, keeps its real minimum.
+
 ## [5.3.0] — 2026-10-19
 
 Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.4.0 is the matching release

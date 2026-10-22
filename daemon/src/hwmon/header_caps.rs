@@ -48,9 +48,11 @@ pub struct HeaderCaps {
     /// a narrow duty band — the `it87` docs recommend lowering it when a fan is
     /// controllable only at very small PWM values.
     pub pwm_freq_hz: Option<u32>,
-    /// Low RPM alarm threshold, from `fanN_min`.
+    /// Low RPM alarm threshold, from `fanN_min`. `None` where the bound driver
+    /// publishes speed history under that name (`SPEED_HISTORY_DRIVERS`).
     pub rpm_min_threshold: Option<u16>,
-    /// High RPM threshold, from `fanN_max`. Absent on most Super-I/O chips.
+    /// High RPM threshold, from `fanN_max`. Absent on most Super-I/O chips;
+    /// `None` on the same drivers as `rpm_min_threshold`.
     pub rpm_max_threshold: Option<u16>,
     /// Tachometer pulses per revolution, from `fanN_pulses`.
     ///
@@ -79,12 +81,38 @@ fn read_attr<T: std::str::FromStr>(hwmon_dir: &Path, name: &str) -> Option<T> {
     }
 }
 
+/// Drivers whose `fanN_min`/`fanN_max` are the slowest and fastest speeds seen
+/// since the module loaded, not limits (`SBR-03`).
+///
+/// - out-of-tree `nct6687` (Fred78290/nct6687d): every build that exposed the
+///   pair served `rpm[1] = MIN(rpm, rpm[1])` / `rpm[2] = MAX(...)`, from
+///   `17236ea` (2020-11-08) to `060728e`; PR #220 (`2a553b9`, merged 2026-10-19)
+///   removed both per the hwmon ABI. Read 2026-10-22.
+/// - out-of-tree `nct6686` (s25g5d4/nct6686d): the same code at `e993da9`.
+///
+/// Mainline `nct6683` is not here: it reads `fanN_min` from the EC's fan-minimum
+/// register (`NCT6683_REG_FAN_MIN`, v7.3). It names its hwmon devices exactly as
+/// these two do, so the bound driver decides, never the chip name.
+const SPEED_HISTORY_DRIVERS: &[&str] = &["nct6687", "nct6686"];
+
 /// Audit one header's driver-reported capabilities. Pure reads; never writes.
+///
+/// The RPM thresholds are left out when the driver bound to `hwmon_dir`
+/// publishes speed history under their names ([`SPEED_HISTORY_DRIVERS`]): a
+/// run's slowest speed shown as a limit is a fabricated measurement, the same
+/// as a `0` for an absent attribute. An unobserved driver changes nothing.
 pub fn read_header_caps(hwmon_dir: &Path, pwm_index: u8) -> HeaderCaps {
+    let thresholds_are_limits = crate::hwmon::bound_driver::read_bound_driver(hwmon_dir)
+        .is_none_or(|driver| !SPEED_HISTORY_DRIVERS.contains(&driver.as_str()));
+    let threshold = |name: &str| {
+        thresholds_are_limits
+            .then(|| read_attr(hwmon_dir, &format!("fan{pwm_index}_{name}")))
+            .flatten()
+    };
     HeaderCaps {
         pwm_freq_hz: read_attr(hwmon_dir, &format!("pwm{pwm_index}_freq")),
-        rpm_min_threshold: read_attr(hwmon_dir, &format!("fan{pwm_index}_min")),
-        rpm_max_threshold: read_attr(hwmon_dir, &format!("fan{pwm_index}_max")),
+        rpm_min_threshold: threshold("min"),
+        rpm_max_threshold: threshold("max"),
         tach_pulses_per_rev: read_attr(hwmon_dir, &format!("fan{pwm_index}_pulses")),
     }
 }
@@ -184,6 +212,59 @@ mod tests {
         let caps = read_header_caps(tmp.path(), 1);
         assert_eq!(caps.pwm_freq_hz, None);
         assert_eq!(caps.rpm_min_threshold, None);
+    }
+
+    /// Bind the fixture to `driver` the way the kernel publishes it:
+    /// `device/driver` links to `.../drivers/<driver>`.
+    fn bind(dir: &Path, driver: &str) {
+        let drv = dir.join("bus/platform/drivers").join(driver);
+        fs::create_dir_all(&drv).unwrap();
+        fs::create_dir_all(dir.join("device")).unwrap();
+        std::os::unix::fs::symlink(&drv, dir.join("device/driver")).unwrap();
+    }
+
+    /// An NCT6687D board as both drivers present it: hwmon name `nct6687`, a
+    /// slowest-seen `fan1_min` and a fastest-seen `fan1_max`.
+    fn nct6687_fixture(driver: &str) -> tempfile::TempDir {
+        let tmp = fixture();
+        fs::write(tmp.path().join("name"), "nct6687\n").unwrap();
+        fs::write(tmp.path().join("fan1_max"), "3000\n").unwrap();
+        bind(tmp.path(), driver);
+        tmp
+    }
+
+    /// `SBR-03`: the out-of-tree drivers' `fanN_min`/`fanN_max` are the run's
+    /// slowest and fastest speeds, so neither is published as a threshold.
+    /// The rest of the audit is unaffected.
+    #[test]
+    fn speed_history_drivers_publish_no_thresholds() {
+        // Spelled out, not read from the list: an entry dropped from it must red.
+        for driver in ["nct6687", "nct6686"] {
+            let tmp = nct6687_fixture(driver);
+            assert!(tmp.path().join("fan1_min").exists());
+            assert!(tmp.path().join("fan1_max").exists());
+            let caps = read_header_caps(tmp.path(), 1);
+            assert_eq!(
+                caps.rpm_min_threshold, None,
+                "{driver}: history, not a limit"
+            );
+            assert_eq!(
+                caps.rpm_max_threshold, None,
+                "{driver}: history, not a limit"
+            );
+            assert_eq!(caps.pwm_freq_hz, Some(23437), "{driver}: rest of the audit");
+        }
+    }
+
+    /// The other arm: mainline `nct6683` names the same chip `nct6687` but
+    /// reads the EC's fan-minimum register, so the bound driver — not the
+    /// name — decides, and its thresholds stand.
+    #[test]
+    fn mainline_nct6683_under_the_same_name_keeps_its_thresholds() {
+        let tmp = nct6687_fixture("nct6683");
+        let caps = read_header_caps(tmp.path(), 1);
+        assert_eq!(caps.rpm_min_threshold, Some(300));
+        assert_eq!(caps.rpm_max_threshold, Some(3000));
     }
 
     /// An empty header directory audits cleanly to "nothing known".
