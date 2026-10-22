@@ -5,6 +5,12 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+## [5.3.1] — 2026-10-22
+
+Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.4.1 is the matching release
+and drops the ACPI I/O port conflict card on its side too. `acpi_conflicts` stays on the wire, now
+always empty; no capability flag, curve, floor or thermal-ladder change.
+
 ### Fixed
 
 - **MSI and ASRock boards on the out-of-tree nct6687 or nct6686 driver no longer show fake RPM
