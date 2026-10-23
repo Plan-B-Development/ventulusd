@@ -13,7 +13,18 @@
 # RustSec advisory DB (default source). Vulnerabilities fail by default; treat a
 # yanked crate as a hard failure too. Justified, specific waivers go in `ignore`.
 yanked = "deny"
-ignore = []
+# DNY-a: zbus 6.0.0 (2026-10-16) absorbed zvariant, zbus_names and
+# zvariant_derive, and RustSec marked the standalone crates unmaintained. They
+# are not vulnerabilities, and they reach us only through the tray
+# (ventulus-tray -> ksni 0.3.x -> zbus 5); the daemon does not link them. No
+# ksni release uses zbus 6 yet, so there is no upgrade to take. The waiver
+# matches these three IDs only; every other advisory, including a new one
+# against zbus 5 or ksni, is judged by this section as before.
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "DNY-a: zvariant unmaintained (merged into zbus 6), tray-only via ksni -> zbus 5; remove when a ksni release on zbus 6 lands (iovxw/ksni#44)" },
+    { id = "RUSTSEC-2026-0371", reason = "DNY-a: zbus_names unmaintained (merged into zbus 6), tray-only via ksni -> zbus 5; remove when a ksni release on zbus 6 lands (iovxw/ksni#44)" },
+    { id = "RUSTSEC-2026-0372", reason = "DNY-a: zvariant_derive unmaintained (merged into zbus 6), tray-only via ksni -> zbus 5; remove when a ksni release on zbus 6 lands (iovxw/ksni#44)" },
+]
 
 [licenses]
 # Allow-list is the EXACT minimal set the current dependency tree resolves to
