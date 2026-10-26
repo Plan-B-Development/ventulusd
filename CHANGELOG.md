@@ -5,6 +5,11 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+## [5.4.0] — 2026-10-26
+
+Pairs with `ventulus` >= v2.23.0; ventulus 5.5.0 is the first GUI that shows the two new
+`GET /fans` fields.
+
 ### Added
 
 - **`GET /fans` reports a fan whose writes keep failing.** Every hwmon and OpenFAN entry
