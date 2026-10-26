@@ -494,6 +494,26 @@ pub struct DaemonState {
     /// with one producer needs no carry-forward rule. A header absent here has
     /// never been corrected and is not flagged — the wire reports 0 / false.
     pub hwmon_duty_reconciliation: HashMap<String, DutyReconciliation>,
+    /// Fans whose engine writes are failing, by fan id (an hwmon header id or
+    /// an OpenFan member id): `write_failing` on `/fans`.
+    ///
+    /// Produced by the profile engine: every write it makes to a fan, forced or
+    /// not, reports how it ended (`StateCache::note_fan_write_outcome`), and an
+    /// entry is removed when that fan's next write lands. A fan the engine
+    /// stops writing keeps its entry and ages out of the flag instead
+    /// ([`FanWriteFailure::failing`]).
+    pub fan_write_failures: HashMap<String, FanWriteFailure>,
+    /// The hwmon headers that were already in manual mode (`pwmN_enable` = 1,
+    /// with a readable duty) when the daemon first took them:
+    /// `found_in_manual_mode` on `/fans`.
+    ///
+    /// Such a header's hand-back record is manual mode at the duty it had
+    /// (DEC-382), so a stop leaves it there instead of returning it to the
+    /// firmware — the trace of another fan program still holding it when the
+    /// daemon started. Produced only by `HwmonPwmController::set_pwm` at the
+    /// take that records the original, and never emptied: the original is
+    /// never overwritten either.
+    pub hwmon_found_in_manual_mode: HashSet<String>,
     /// The hwmon headers whose fan the daemon has seen spinning (RPM above 0)
     /// since it started (DEC-458).
     ///
@@ -671,6 +691,28 @@ impl MaintenanceRefusal {
     }
 }
 
+/// A fan whose engine writes are failing (`write_failing` on `/fans`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanWriteFailure {
+    /// Consecutive failed engine writes to this fan, from any path: a profile's,
+    /// an override's, the thermal force's or the no-sensor floor's.
+    pub consecutive: u32,
+    /// When the latest of them failed.
+    pub last_failed_at: Instant,
+}
+
+impl FanWriteFailure {
+    /// `write_failing` at `now`: at least
+    /// [`crate::constants::FAN_WRITE_FAILING_STREAK`] writes in a row have
+    /// failed, the latest no longer ago than
+    /// [`crate::constants::FAN_WRITE_FAILING_STALE_AFTER`].
+    pub fn failing(&self, now: Instant) -> bool {
+        self.consecutive >= crate::constants::FAN_WRITE_FAILING_STREAK
+            && now.saturating_duration_since(self.last_failed_at)
+                <= crate::constants::FAN_WRITE_FAILING_STALE_AFTER
+    }
+}
+
 /// One hwmon header's duty-reconciliation record (DEC-406).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DutyReconciliation {
@@ -770,6 +812,8 @@ impl Default for DaemonState {
             skipped_controls: Vec::new(),
             control_outputs: Vec::new(),
             hwmon_duty_reconciliation: HashMap::new(),
+            fan_write_failures: HashMap::new(),
+            hwmon_found_in_manual_mode: HashSet::new(),
             hwmon_seen_spinning: HashSet::new(),
             hwmon_diagnostic_commanded: HashMap::new(),
             openfan_link: None,

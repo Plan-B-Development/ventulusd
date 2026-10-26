@@ -1202,6 +1202,11 @@ impl OpenFanBackend {
                     let streak = self.channel_failures.entry(*ch).or_insert(0);
                     *streak += 1;
                     let n = *streak;
+                    self.cache.note_fan_write_outcome(
+                        &crate::serial::openfan_member_id(*ch),
+                        false,
+                        std::time::Instant::now(),
+                    );
                     log::warn!(
                         "Profile engine: OpenFan ch{ch} write failed ({n} consecutive): {e}"
                     );
@@ -1215,6 +1220,11 @@ impl OpenFanBackend {
                 Ok(()) => {
                     any_ok = true;
                     self.channel_failures.remove(ch);
+                    self.cache.note_fan_write_outcome(
+                        &crate::serial::openfan_member_id(*ch),
+                        true,
+                        std::time::Instant::now(),
+                    );
                 }
             }
         }
@@ -1612,9 +1622,22 @@ impl SafetyWriteBackend for OpenFanBackend {
                         .into_iter()
                         .chain(held_duty)
                         .fold(pct, u8::max);
-                    if let Err(e) = guard.set_pwm(ch, duty) {
-                        log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
-                    }
+                    let landed = match guard.set_pwm(ch, duty) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            log::error!("THERMAL SAFETY: OpenFan ch{ch} write FAILED: {e}");
+                            false
+                        }
+                    };
+                    drop(guard);
+                    // `write_failing`: a forced write counts like any other. It
+                    // is logged above, so it goes to the cache only, never
+                    // through `note_outcomes`' per-failure log.
+                    cache.note_fan_write_outcome(
+                        &crate::serial::openfan_member_id(ch),
+                        landed,
+                        std::time::Instant::now(),
+                    );
                 }
                 force_suspended.store(suspended, std::sync::atomic::Ordering::SeqCst);
                 match give_back {
@@ -2326,6 +2349,9 @@ pub(crate) struct HwmonBackend {
     /// normally the next one, since the lock is held across one write at a time.
     /// A member saved under the catalogue name is floored by that label throughout.
     facts: Option<Arc<HashMap<String, super::HeaderFacts>>>,
+    /// Where `note_outcomes` publishes a header whose writes keep failing
+    /// (`write_failing` on `/fans`).
+    cache: Arc<StateCache>,
 }
 
 /// The per-header facts the engine's pump floor needs, read from the
@@ -2380,6 +2406,7 @@ impl HwmonBackend {
     /// this process.
     pub(crate) fn new(
         ctrl: Arc<Mutex<crate::hwmon::pwm_control::HwmonPwmController>>,
+        cache: Arc<StateCache>,
     ) -> Option<Self> {
         // [SAFETY] Timed, and it fails toward KEEPING the backend. `tokio::spawn`
         // only queues the engine task, so "the engine is spawned before
@@ -2431,6 +2458,7 @@ impl HwmonBackend {
             stall_logged: false,
             writable,
             facts,
+            cache,
         })
     }
 
@@ -2498,6 +2526,8 @@ impl HwmonBackend {
                     let streak = self.member_failures.entry(member_id.clone()).or_insert(0);
                     *streak += 1;
                     let n = *streak;
+                    self.cache
+                        .note_fan_write_outcome(member_id, false, std::time::Instant::now());
                     if n == 1 {
                         log::warn!("hwmon write failed for {member_id}: {e}");
                     } else if n.is_multiple_of(constants::HWMON_FAIL_SUMMARY_INTERVAL) {
@@ -2508,6 +2538,10 @@ impl HwmonBackend {
                     }
                 }
                 Ok(()) => {
+                    // Ends a run the thermal force extended too, whether or not
+                    // this backend's own (log) streak saw it.
+                    self.cache
+                        .note_fan_write_outcome(member_id, true, std::time::Instant::now());
                     // Recovery edge: a member that had been failing wrote again.
                     if let Some(prev) = self.member_failures.remove(member_id) {
                         log::info!(
@@ -2844,7 +2878,9 @@ impl SafetyWriteBackend for HwmonBackend {
             .map(|c| (c.member_id.clone(), c.pwm_percent))
             .collect();
         // Same outcome type as `apply` so both share one `BoundedWrite`
-        // (DEC-289); this path logs inline, so the vec is always empty.
+        // (DEC-289); this path logs inline, so the vec is always empty. Each
+        // write's outcome goes to the cache from inside the loop instead.
+        let cache = self.cache.clone();
         let join = self.writes.run(WRITE_JOIN_BUDGET, move || {
             let (hdr_ids, mut lease_id, held_duties) = {
                 let mut guard = ctrl.lock();
@@ -2904,8 +2940,8 @@ impl SafetyWriteBackend for HwmonBackend {
                     .copied()
                     .fold(pct, u8::max);
                 let mut guard = ctrl.lock();
-                match guard.set_pwm(hdr_id, duty, &lease_id) {
-                    Ok(_) => {}
+                let landed = match guard.set_pwm(hdr_id, duty, &lease_id) {
+                    Ok(_) => true,
                     Err(HwmonControlError::Lease(_)) => {
                         // A concurrent GUI verify force-took the lease in the
                         // window DEC-099 leaves between headers, invalidating
@@ -2921,16 +2957,26 @@ impl SafetyWriteBackend for HwmonBackend {
                             .force_take_lease(HwmonWriter::ThermalSafety)
                             .lease_id;
                         guard.forget_manual_mode();
-                        if let Err(e) = guard.set_pwm(hdr_id, duty, &lease_id) {
-                            log::error!(
-                                "THERMAL SAFETY: hwmon {hdr_id} write FAILED after lease re-take: {e}"
-                            );
+                        match guard.set_pwm(hdr_id, duty, &lease_id) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                log::error!(
+                                    "THERMAL SAFETY: hwmon {hdr_id} write FAILED after lease re-take: {e}"
+                                );
+                                false
+                            }
                         }
                     }
                     Err(e) => {
                         log::error!("THERMAL SAFETY: hwmon {hdr_id} write FAILED: {e}");
+                        false
                     }
-                }
+                };
+                drop(guard);
+                // `write_failing`: a forced write counts like any other. It is
+                // logged above, so it goes to the cache only, never through
+                // `note_outcomes`' log throttle.
+                cache.note_fan_write_outcome(hdr_id, landed, std::time::Instant::now());
             }
             if let (Some(m), true) = (&members, give_back) {
                 give_back_unheld(&ctrl, &lease_id, m);
@@ -4089,7 +4135,8 @@ mod tests {
             }),
             Arc::new(StateCache::new()),
         );
-        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl))).expect("writable headers");
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)), Arc::new(StateCache::new()))
+            .expect("writable headers");
         let facts = be.header_facts();
         let floors = |id: &str| facts[id].board_label_floors;
         assert!(floors("opt") && floors("pump"));
@@ -4143,7 +4190,7 @@ mod tests {
             }),
             cache,
         );
-        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)))
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)), Arc::new(StateCache::new()))
             .expect("this fixture's headers are writable");
 
         // Tick 1: an emergency force_all_with_floor wedges.
@@ -4241,7 +4288,10 @@ mod tests {
         };
         let cache = Arc::new(StateCache::new());
         let ctrl = HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
-        (HwmonBackend::new(Arc::new(Mutex::new(ctrl))), writes)
+        (
+            HwmonBackend::new(Arc::new(Mutex::new(ctrl)), Arc::new(StateCache::new())),
+            writes,
+        )
     }
 
     /// Like `TestWriter`, but reports `pwm_enable` as already manual (`1`) so the
@@ -4330,10 +4380,16 @@ mod tests {
             writes: Arc::new(Mutex::new(Vec::new())),
             fail_fragment: frag.clone(),
         };
+        // One cache, as in production: the controller and the engine share it.
         let cache = Arc::new(StateCache::new());
-        let ctrl = HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
+        let ctrl = HwmonPwmController::new(
+            headers,
+            LeaseManager::new(),
+            Box::new(writer),
+            cache.clone(),
+        );
         (
-            HwmonBackend::new(Arc::new(Mutex::new(ctrl)))
+            HwmonBackend::new(Arc::new(Mutex::new(ctrl)), cache)
                 .expect("carveout fixtures always include a writable header"),
             frag,
         )
@@ -4418,7 +4474,8 @@ mod tests {
             Box::new(writer),
             cache.clone(),
         );
-        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl))).expect("writable header");
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)), Arc::new(StateCache::new()))
+            .expect("writable header");
 
         be.apply(&[cmd(id, "hwmon", 40)]).await;
         let duty_writes = || writes.lock().iter().filter(|(p, _)| p == pwm).count();
@@ -4461,7 +4518,7 @@ mod tests {
             Box::new(writer),
             cache,
         );
-        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)))
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)), Arc::new(StateCache::new()))
             .expect("this fixture's headers are writable");
 
         // 1. Engine controls the header → first pwm_enable=1 write.
@@ -4569,7 +4626,7 @@ mod tests {
             let from_controller = !ctrl.lock().forced_target_ids().is_empty();
 
             assert_eq!(
-                HwmonBackend::new(ctrl).is_some(),
+                HwmonBackend::new(ctrl, Arc::new(StateCache::new())).is_some(),
                 from_controller,
                 "the construction gate disagrees with forced_target_ids() \
                  (writable={writable})"
@@ -4639,6 +4696,87 @@ mod tests {
             be.member_failure_streak("hwmon:it8696:pwm1"),
             0,
             "a successful write must reset the member's failure streak"
+        );
+    }
+
+    /// `write_failing` on `/fans` comes from this streak: published on every
+    /// failed tick, failing from the streak, gone with the first write that lands.
+    #[tokio::test]
+    async fn hwmon_write_failing_is_published_from_the_streak_and_cleared_on_recovery() {
+        let id = "hwmon:it8696:pwm1";
+        let (mut be, frag) = hwmon_backend_carveout(vec![make_header(id)], Some("pwm1"));
+        let record = |be: &HwmonBackend| be.cache.snapshot().fan_write_failures.get(id).copied();
+
+        for tick in 1..=constants::FAN_WRITE_FAILING_STREAK {
+            be.apply(&[cmd(id, "hwmon", 55)]).await;
+            let r = record(&be).expect("every failed tick is published");
+            assert_eq!(r.consecutive, tick, "the published count is the streak");
+            assert_eq!(
+                r.failing(std::time::Instant::now()),
+                tick >= constants::FAN_WRITE_FAILING_STREAK,
+                "failing from the streak on, not before (tick {tick})"
+            );
+        }
+
+        *frag.lock() = None;
+        be.apply(&[cmd(id, "hwmon", 55)]).await;
+        assert_eq!(record(&be), None, "a write that lands clears it");
+    }
+
+    /// [SAFETY] `write_failing` must see the thermal force: on a forced tick the
+    /// profile path does not run, so without this the flag aged out during an
+    /// emergency and never rose under the no-sensor floor. A forced write's run
+    /// is the same run a profile write extends, it never feeds the log
+    /// streak (the force logs inline), and the forced duty is still written.
+    #[tokio::test]
+    async fn hwmon_forced_writes_extend_and_end_the_write_failing_run() {
+        let id = "hwmon:it8696:pwm1";
+        let (mut be, frag) = hwmon_backend_carveout(vec![make_header(id)], Some("pwm1"));
+        let consecutive = |be: &HwmonBackend| {
+            be.cache
+                .snapshot()
+                .fan_write_failures
+                .get(id)
+                .map(|f| f.consecutive)
+        };
+
+        for _ in 1..constants::FAN_WRITE_FAILING_STREAK {
+            be.apply(&[cmd(id, "hwmon", 55)]).await;
+        }
+        let profile_streak = be.member_failure_streak(id);
+        assert_eq!(
+            profile_streak,
+            constants::FAN_WRITE_FAILING_STREAK - 1,
+            "precondition: the profile writes failed"
+        );
+
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert_eq!(
+            consecutive(&be),
+            Some(constants::FAN_WRITE_FAILING_STREAK),
+            "a failed forced write extends the run the profile writes started"
+        );
+        assert!(
+            be.cache.snapshot().fan_write_failures[id].failing(std::time::Instant::now()),
+            "so the fan reads write_failing during the emergency"
+        );
+        assert_eq!(
+            be.member_failure_streak(id),
+            profile_streak,
+            "a forced failure is logged by the force, not through the log streak"
+        );
+
+        *frag.lock() = None;
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert_eq!(
+            consecutive(&be),
+            None,
+            "a forced write that lands ends the run"
+        );
+        assert_eq!(
+            be.ctrl.lock().last_commanded_pct(id),
+            Some(100),
+            "the force still writes its duty"
         );
     }
 
@@ -4820,7 +4958,8 @@ mod tests {
             "arctic_fan",
             "precondition: discovery order puts the hub first, so the test can tell"
         );
-        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl))).expect("writable headers");
+        let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)), Arc::new(StateCache::new()))
+            .expect("writable headers");
 
         be.force_all_with_floor(100, &[], ForceReach::All).await;
 
@@ -5513,7 +5652,7 @@ mod tests {
             let cache = Arc::new(StateCache::new());
             let ctrl =
                 HwmonPwmController::new(headers, LeaseManager::new(), Box::new(writer), cache);
-            let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)))
+            let mut be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)), Arc::new(StateCache::new()))
                 .expect("this fixture's headers are writable");
 
             // Exactly one mid-scan preemption: a GUI verify force-takes the lease
@@ -5732,7 +5871,8 @@ mod tests {
             }),
             cache.clone(),
         );
-        let be = HwmonBackend::new(Arc::new(Mutex::new(ctrl))).expect("writable headers");
+        let be = HwmonBackend::new(Arc::new(Mutex::new(ctrl)), Arc::new(StateCache::new()))
+            .expect("writable headers");
         (be, writes, cache)
     }
 
@@ -6713,6 +6853,78 @@ mod tests {
         // The dead channel's own success — and only that — resets its streak.
         be.note_outcomes(&[(3, Ok(()))]);
         assert_eq!(be.channel_failure_streak(3), 0);
+    }
+
+    #[test]
+    fn openfan_write_failing_is_published_per_channel_and_cleared_on_recovery() {
+        let (mut be, _written, cache) = openfan_backend();
+        let dead = crate::serial::openfan_member_id(3);
+        let healthy = crate::serial::openfan_member_id(0);
+        for _ in 0..constants::FAN_WRITE_FAILING_STREAK {
+            be.note_outcomes(&[(0, Ok(())), (3, Err("timeout".into()))]);
+        }
+        let snap = cache.snapshot();
+        assert!(
+            snap.fan_write_failures
+                .get(&dead)
+                .is_some_and(|f| f.failing(std::time::Instant::now())),
+            "the dead channel is failing"
+        );
+        assert!(
+            !snap.fan_write_failures.contains_key(&healthy),
+            "the healthy channel has no record"
+        );
+
+        be.note_outcomes(&[(3, Ok(()))]);
+        assert!(
+            !cache.snapshot().fan_write_failures.contains_key(&dead),
+            "its own success clears it"
+        );
+    }
+
+    /// [SAFETY] The OpenFan half of `hwmon_forced_writes_extend_and_end_the_write_failing_run`.
+    #[tokio::test]
+    async fn openfan_forced_writes_extend_and_end_the_write_failing_run() {
+        let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cache = Arc::new(StateCache::new());
+        let ctrl = crate::serial::controller::FanController::new(
+            Box::new(FlakySerial {
+                written: written.clone(),
+                fail: fail.clone(),
+            }),
+            cache.clone(),
+            std::time::Duration::from_millis(100),
+        );
+        let mut be = OpenFanBackend::new(Arc::new(Mutex::new(ctrl)), cache.clone());
+        let id = crate::serial::openfan_member_id(0);
+
+        for _ in 0..constants::FAN_WRITE_FAILING_STREAK {
+            be.force_all_with_floor(100, &[], ForceReach::All).await;
+        }
+        let snap = cache.snapshot();
+        assert!(
+            snap.fan_write_failures
+                .get(&id)
+                .is_some_and(|f| f.failing(std::time::Instant::now())),
+            "forced failures alone make the channel write_failing"
+        );
+        assert_eq!(
+            be.channel_failure_streak(0),
+            0,
+            "a forced failure is logged by the force, not through the log streak"
+        );
+
+        fail.store(false, std::sync::atomic::Ordering::Relaxed);
+        be.force_all_with_floor(100, &[], ForceReach::All).await;
+        assert!(
+            !cache.snapshot().fan_write_failures.contains_key(&id),
+            "a forced write that lands ends the run"
+        );
+        assert!(
+            written.lock().iter().any(|f| f.trim_end() == ">0200FF"),
+            "the force still writes its duty"
+        );
     }
 
     #[test]

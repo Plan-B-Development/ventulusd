@@ -738,9 +738,10 @@ Stop any other fan program before the daemon first drives a header, that is,
 before your first profile or fan test. The daemon records what each header was
 doing the first time it takes it and gives exactly that back when it stops
 (§ Safety), so a header another program still holds in manual mode goes back to
-that program's last duty, not to the BIOS. Restarting the daemon does not clear
-this: it puts the header back in that state as it stops, and finds it there again
-when it next takes it. A reboot should: the record does not survive one, and the
+that program's last duty, not to the BIOS. `GET /fans` reports such a header as
+`found_in_manual_mode: true`, and the GUI's **System State** page names it.
+Restarting the daemon does not clear this: it puts the header back in that state as
+it stops, and finds it there again when it next takes it. A reboot should: the record does not survive one, and the
 BIOS sets each header up again as the machine starts. Either way, check before the
 first profile: stop the other program, make sure no profile is active and no fan
 test is running, and list every header's mode. Each line gives a chip, a header
@@ -1116,13 +1117,15 @@ which show the same things.
 
 ### Conditions the daemon reports
 
-`GET /status` (and `GET /poll`) and `GET /fans` report four conditions the daemon
+`GET /status` (and `GET /poll`) and `GET /fans` report six conditions the daemon
 cannot fix by itself. The GUI shows each one; the fields are listed here for
 scripts and for reading a support bundle.
 
 | Field | What it means | What to do |
 |---|---|---|
 | `duty_not_holding: true` on an hwmon fan in `GET /fans` | Something else is writing this header. The daemon rewrote the duty it had set three times and the header did not keep it, so it has stopped fighting. It tries again when its curve asks for a different speed, and the flag clears when the header keeps a duty again. `duty_corrections` counts the rewrites since the daemon started. | Stop the other fan-control program (`fancontrol`, CoolerControl, CoreCtrl, `fan2go`, a vendor tool), or the BIOS/EC feature that drives the header. § Fan profiles, "Who writes the fans", has a check that finds a header still held. |
+| `write_failing: true` on an hwmon or OpenFAN fan in `GET /fans` | The daemon's last three or more writes to this fan failed, the latest within the last 30 seconds, so the fan is not at the speed the daemon chose and the thermal emergency cannot raise it. The emergency's own writes count, so the flag stays up during one. It clears when a write lands, and 30 seconds after the daemon stops writing the fan. The journal names the error. | See § Troubleshooting, "Fans are found but never change speed". |
+| `found_in_manual_mode: true` on an hwmon fan in `GET /fans` | The header was already in manual mode when the daemon first took it, so a stop gives it back in manual mode at the duty it had then, not to the BIOS. It is never cleared while the daemon runs, and a restart finds the header in manual mode again, because the stop gave it back that way. | Stop and disable the other program, then reboot (§ Fan profiles, "Who writes the fans"). If it is back after a reboot with nothing else running, the board itself starts that header in manual mode, and nothing needs doing. |
 | `skipped_controls[]` on `/status` | A control in the active profile has not been commanding its fans for at least 3 ticks, so they hold their last speed. `reason` says why: `curve_not_found` (the curve it names is gone), `sensor_unavailable` (its sensor is missing or has stopped updating), `mix_unresolvable` / `sync_unresolvable` (a combined curve cannot be worked out), or `backend_unavailable` (none of its fans can be reached, for example an OpenFAN fan with no controller attached, or an AMD GPU the daemon cannot drive: an RX 6000 or older, or an RX 7000/9000 without its firmware fan curve). | Fix the profile or the sensor. A frozen sensor is the usual cause: see § Safety, "Stalled sensors stop driving curves". |
 | `unavailable_sensors[]` on `/status` | A sensor the daemon found fails every read (a Wi-Fi card's temperature while the radio is off is the usual one) or reports an impossible temperature. It is logged once and left out of `GET /sensors`. | Nothing, unless a curve needs that sensor; then pick another. |
 | `runtime_config_degraded` on `/status` | The daemon could not read `runtime.toml`, which holds your header roles. | See § Runtime configuration, "When `runtime.toml` cannot be read". |
@@ -1168,7 +1171,8 @@ none, the absence is logged at `info`, not as a warning.
 
 ### Fans are found but never change speed
 
-If the journal repeats a line like
+`GET /fans` reports a fan whose writes keep failing as `write_failing: true`, and
+the journal says why. If it repeats a line like
 
 ```
 [WARN] hwmon write failed for hwmon:it8696:pwm1: … /sys/class/hwmon/hwmonN/pwm1_enable: Read-only file system (os error 30)

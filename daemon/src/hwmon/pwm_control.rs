@@ -1122,6 +1122,13 @@ impl HwmonPwmController {
                 // ExecStopPost replays (DEC-420 review, SR-2).
                 self.refuse_after_hand_back(header_id, owned_by_hand_back)?;
                 self.handback.note_take(header_id, original);
+                // Something already held the header in manual mode, so its
+                // hand-back is that mode and duty, not the firmware: say so on
+                // `/fans`. Only a recorded original is reported — a header whose
+                // mode or duty could not be read gets the full-speed fallback.
+                if matches!(original, Some(HandBack::Manual(_))) {
+                    self.cache.note_hwmon_found_in_manual_mode(header_id);
+                }
                 self.writer
                     .write_file(ep, PWM_ENABLE_MANUAL)
                     .map_err(HwmonControlError::Hardware)?;
@@ -2946,6 +2953,48 @@ mod tests {
             ctrl.enable_revert_counts().get("h1"),
             Some(&1),
             "enable=0 at a duty we did not command is a real loss of control"
+        );
+    }
+
+    /// `found_in_manual_mode`: published at the take that records a manual
+    /// original, and only then — a header the firmware had, or one whose duty
+    /// could not be read (the full-speed fallback), is not reported.
+    #[test]
+    fn a_header_found_in_manual_mode_is_published_at_its_first_take() {
+        let found = |enable: &str, duty: Option<&str>| {
+            let (mut ctrl, _writes, cache) = match duty {
+                Some(d) => setup_controller_with_enable_and_duty(
+                    vec![make_header("h1", "CHA_FAN1", 0)],
+                    enable,
+                    d,
+                ),
+                None => {
+                    setup_controller_with_enable(vec![make_header("h1", "CHA_FAN1", 0)], enable)
+                }
+            };
+            let lease = engine_lease(&mut ctrl);
+            assert!(
+                !cache.snapshot().hwmon_found_in_manual_mode.contains("h1"),
+                "precondition: nothing is reported before the take"
+            );
+            ctrl.set_pwm("h1", 50, &lease).unwrap();
+            let original = ctrl.handback().taken_header("h1").map(|t| t.action);
+            (
+                cache.snapshot().hwmon_found_in_manual_mode.contains("h1"),
+                original,
+            )
+        };
+
+        assert_eq!(
+            found("1", Some("102\n")),
+            (true, Some(HandBack::Manual(102))),
+            "manual mode at a readable duty is reported"
+        );
+        assert_eq!(found("2", Some("102\n")), (false, Some(HandBack::Mode(2))));
+        assert_eq!(
+            found("1", None),
+            (false, Some(HandBack::FullSpeed)),
+            "an unreadable duty is the full-speed fallback, not a manual hand-back"
         );
     }
 

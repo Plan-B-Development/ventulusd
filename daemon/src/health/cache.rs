@@ -551,6 +551,43 @@ impl StateCache {
             .insert(id.to_string(), record);
     }
 
+    /// Record how one engine write to fan `id` ended (`write_failing`): a
+    /// failure at `at` extends the fan's run of consecutive failures, a write
+    /// that landed ends it.
+    ///
+    /// Every write the engine makes to a fan reports here — a profile's, an
+    /// override's, and the thermal force's and no-sensor floor's — so the run
+    /// counts writes, whichever path made them. A landed write takes the write
+    /// lock only when there is a run to end: it is the common case, every tick.
+    pub fn note_fan_write_outcome(&self, id: &str, landed: bool, at: Instant) {
+        if landed {
+            if self.inner.read().fan_write_failures.contains_key(id) {
+                self.inner.write().fan_write_failures.remove(id);
+            }
+            return;
+        }
+        let mut state = self.inner.write();
+        let run = state
+            .fan_write_failures
+            .entry(id.to_string())
+            .or_insert(FanWriteFailure {
+                consecutive: 0,
+                last_failed_at: at,
+            });
+        run.consecutive = run.consecutive.saturating_add(1);
+        run.last_failed_at = at;
+    }
+
+    /// Record that hwmon header `id` was already in manual mode when the daemon
+    /// first took it (`found_in_manual_mode`). Never undone while the daemon
+    /// runs, like the hand-back original it mirrors.
+    pub fn note_hwmon_found_in_manual_mode(&self, id: &str) {
+        self.inner
+            .write()
+            .hwmon_found_in_manual_mode
+            .insert(id.to_string());
+    }
+
     /// Clear the `not_holding` flag on every header in `ids` (DEC-406), keeping
     /// each header's correction count, which is since boot.
     ///
@@ -1787,6 +1824,63 @@ fn merge_hwmon_fan(state: &mut DaemonState, mut fan: HwmonFanState) {
 
 #[cfg(test)]
 mod tests {
+    // ── `write_failing`: the streak, the age, and the clear ──
+
+    #[test]
+    fn a_fan_write_failure_is_failing_from_the_streak_until_it_ages_out() {
+        use crate::constants::{FAN_WRITE_FAILING_STALE_AFTER, FAN_WRITE_FAILING_STREAK};
+        let cache = StateCache::new();
+        let id = "hwmon:it8696:pwm1";
+        let t0 = Instant::now();
+        let failing = |at: Instant| {
+            cache
+                .snapshot()
+                .fan_write_failures
+                .get(id)
+                .is_some_and(|f| f.failing(at))
+        };
+
+        for _ in 1..FAN_WRITE_FAILING_STREAK {
+            cache.note_fan_write_outcome(id, false, t0);
+        }
+        assert!(
+            cache.snapshot().fan_write_failures.contains_key(id),
+            "precondition: the failures are recorded"
+        );
+        assert!(
+            !failing(t0),
+            "one failure short of the streak is not failing"
+        );
+
+        cache.note_fan_write_outcome(id, false, t0);
+        assert_eq!(
+            cache.snapshot().fan_write_failures[id].consecutive,
+            FAN_WRITE_FAILING_STREAK,
+            "each failure extends the run by one"
+        );
+        assert!(failing(t0), "the streak makes it failing");
+        assert!(
+            failing(t0 + FAN_WRITE_FAILING_STALE_AFTER),
+            "still failing at the age limit"
+        );
+        assert!(
+            !failing(t0 + FAN_WRITE_FAILING_STALE_AFTER + Duration::from_millis(1)),
+            "a fan the engine stopped writing ages out"
+        );
+
+        cache.note_fan_write_outcome(id, true, t0);
+        assert!(
+            !cache.snapshot().fan_write_failures.contains_key(id),
+            "a write that lands ends the run"
+        );
+        cache.note_fan_write_outcome(id, false, t0);
+        assert_eq!(
+            cache.snapshot().fan_write_failures[id].consecutive,
+            1,
+            "the next failure starts a new run"
+        );
+    }
+
     // ── DEC-255 / release review 2026-08-10: bounded GPU-write acquisition ──
 
     #[tokio::test]

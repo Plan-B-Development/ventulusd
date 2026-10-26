@@ -1292,7 +1292,7 @@ pub async fn profile_engine_loop(
     // reads `hwmon_be.is_some()` as "this daemon can write hwmon" — the thermal
     // log's reach and `note_backend_unavailable`'s `hwmon_available` both do —
     // and that reading is only true once the gate is here.
-    let mut hwmon_be = hwmon_controller.and_then(HwmonBackend::new);
+    let mut hwmon_be = hwmon_controller.and_then(|ctrl| HwmonBackend::new(ctrl, cache.clone()));
 
     // Track consecutive cycles with no CPU temperature sensor (P0-R1).
     // If no CpuTemp sensor is found for N cycles, force fans to a safe minimum.

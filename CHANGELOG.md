@@ -5,6 +5,27 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /fans` reports a fan whose writes keep failing.** Every hwmon and OpenFAN entry
+  carries `write_failing`, `true` once the daemon's last three or more writes to that fan have
+  failed, the latest within 30 seconds. The thermal emergency's and the no-sensor floor's
+  writes count as well as the profile's, so the flag stays up during an emergency. The fan is
+  then not at the speed the daemon chose, and the emergency cannot raise it either. It clears
+  when a write lands, and 30 seconds after the daemon stops writing the fan. Until now the failure was only in the
+  journal (`hwmon write failed for …`). The error itself stays in the journal, because it
+  names sysfs paths.
+- **`GET /fans` reports a header that was already in manual mode when the daemon first took
+  it.** Every hwmon entry carries `found_in_manual_mode`. Such a header is given back in manual
+  mode at the duty it had, not to the BIOS, because the daemon gives back exactly what it
+  found; the usual cause is another fan program still holding it. It is never cleared while
+  the daemon runs, and a restart finds the header in manual mode again; a reboot clears it
+  unless the board itself starts that header in manual mode.
+
+Both fields are optional and additive: no capability flag, since a client that does not see
+them has nothing to show. No curve, floor, hand-back or thermal-ladder change: the forced
+writes report their outcome to the state the API reads, and write and log exactly as before.
+
 ### Fixed
 
 - **The Super-I/O report's signing note now says that enrolling a key needs the shim boot

@@ -329,6 +329,29 @@ pub const OPENFAN_FAIL_ALERT_THRESHOLD: u32 = 5;
 /// respectively — so this covers the one remaining un-throttled backend.)
 pub const HWMON_FAIL_SUMMARY_INTERVAL: u32 = 300;
 
+// ── Profile engine — a fan the daemon cannot drive (`write_failing`) ──
+
+/// Consecutive failed engine writes to one fan before `/fans` reports it as
+/// `write_failing`. One failed write can be a passing EIO; both backends retry
+/// a failed write on the next tick rather than coalescing it, so three in a row
+/// is about three seconds of a fan the daemon cannot set.
+pub const FAN_WRITE_FAILING_STREAK: u32 = 3;
+
+/// How long after its latest failed write a fan still reports `write_failing`.
+///
+/// The flag describes a fan the engine is still trying to drive. Once the
+/// engine stops commanding it — a profile deactivated, a member removed — no
+/// write to it fails and none succeeds, so without an age the last failure
+/// would stand until the daemon restarted.
+///
+/// Sized for the slowest repeat: a forced pass over an OpenFan board that no
+/// longer answers waits out `serial.timeout_ms` on each of its ten channels
+/// (and on any poll read between them), so one channel's failures arrive about
+/// eleven timeouts apart. 30 s covers that up to a timeout of about 2.5 s (the
+/// default is 0.5 s); above it the flag can drop between two failures. The
+/// cost is that a fan the engine has stopped writing keeps the flag up to 30 s.
+pub const FAN_WRITE_FAILING_STALE_AFTER: Duration = Duration::from_secs(30);
+
 // ── Sensor polling — descriptor cache (DEC-133) ──────────────────────
 
 /// Consecutive failed value-reads for a single cached sensor descriptor

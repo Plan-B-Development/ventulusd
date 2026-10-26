@@ -210,6 +210,14 @@ fn hwmon_stall_verdict(snap: &DaemonState, id: &str, now: Instant) -> Option<boo
     Some(rpm == 0 && duty > constants::STALL_PWM_THRESHOLD)
 }
 
+/// `write_failing` for fan `id` at `now`: a fan with no failure record is not
+/// failing.
+fn write_failing(snap: &DaemonState, id: &str, now: Instant) -> bool {
+    snap.fan_write_failures
+        .get(id)
+        .is_some_and(|f| f.failing(now))
+}
+
 /// Build the sorted list of fan entries from a cache snapshot.
 pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntry> {
     let mut fans: Vec<FanEntry> = Vec::new();
@@ -250,6 +258,12 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             pwm_commanded_pct: None,
             duty_corrections: None,
             duty_not_holding: None,
+            found_in_manual_mode: None,
+            write_failing: Some(write_failing(
+                snap,
+                &crate::serial::openfan_member_id(*ch),
+                now,
+            )),
         });
     }
 
@@ -277,6 +291,8 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             // DEC-406: on every hwmon entry; a header never corrected reads 0.
             duty_corrections: Some(reconciliation.corrections),
             duty_not_holding: Some(reconciliation.not_holding),
+            found_in_manual_mode: Some(snap.hwmon_found_in_manual_mode.contains(id)),
+            write_failing: Some(write_failing(snap, id, now)),
         });
     }
 
@@ -306,6 +322,8 @@ pub(crate) fn build_fan_entries(snap: &DaemonState, now: Instant) -> Vec<FanEntr
             pwm_commanded_pct: None,
             duty_corrections: None,
             duty_not_holding: None,
+            found_in_manual_mode: None,
+            write_failing: None,
         });
     }
 
@@ -1974,6 +1992,102 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "hwmon:a_fan");
         assert_eq!(entries[1].id, "hwmon:z_fan");
+    }
+
+    #[test]
+    fn build_fan_entries_reports_write_failing_and_found_in_manual_mode() {
+        use crate::constants::{FAN_WRITE_FAILING_STALE_AFTER, FAN_WRITE_FAILING_STREAK};
+        use crate::health::state::FanWriteFailure;
+        let mut state = DaemonState::default();
+        let now = Instant::now();
+        for id in ["hwmon:a_fan", "hwmon:b_fan"] {
+            state.hwmon_fans.insert(
+                id.into(),
+                crate::health::state::HwmonFanState {
+                    id: id.into(),
+                    rpm: Some(900),
+                    last_commanded_pwm: None,
+                    pwm_readback_pct: None,
+                    pwm_commanded_pct: None,
+                    updated_at: now,
+                    alarm: None,
+                    pwm_enable_mode: None,
+                },
+            );
+        }
+        state.openfan_fans.insert(
+            3,
+            crate::health::state::OpenFanState {
+                channel: 3,
+                rpm: 900,
+                last_commanded_pwm: Some(50),
+                updated_at: now,
+                rpm_polled: true,
+                poll_seq: 0,
+            },
+        );
+        state.gpu_fans.insert(
+            "amd_gpu:0000:03:00.0".into(),
+            crate::health::state::AmdGpuFanState {
+                id: "amd_gpu:0000:03:00.0".into(),
+                rpm: Some(1200),
+                last_commanded_pct: None,
+                duty_pct: None,
+                updated_at: now,
+            },
+        );
+        let openfan_id = crate::serial::openfan_member_id(3);
+        let at_streak = FanWriteFailure {
+            consecutive: FAN_WRITE_FAILING_STREAK,
+            last_failed_at: now,
+        };
+        state
+            .fan_write_failures
+            .insert("hwmon:a_fan".into(), at_streak);
+        state
+            .fan_write_failures
+            .insert(openfan_id.clone(), at_streak);
+        state.fan_write_failures.insert(
+            "hwmon:b_fan".into(),
+            FanWriteFailure {
+                consecutive: FAN_WRITE_FAILING_STREAK - 1,
+                last_failed_at: now,
+            },
+        );
+        state
+            .hwmon_found_in_manual_mode
+            .insert("hwmon:b_fan".into());
+
+        let entries = build_fan_entries(&state, now);
+        let get = |id: &str| entries.iter().find(|e| e.id == id).unwrap().clone();
+        let (a, b, of, gpu) = (
+            get("hwmon:a_fan"),
+            get("hwmon:b_fan"),
+            get(&openfan_id),
+            get("amd_gpu:0000:03:00.0"),
+        );
+        assert_eq!(
+            (a.write_failing, a.found_in_manual_mode),
+            (Some(true), Some(false))
+        );
+        assert_eq!(
+            (b.write_failing, b.found_in_manual_mode),
+            (Some(false), Some(true)),
+            "one failure short of the streak is not failing"
+        );
+        assert_eq!(
+            (of.write_failing, of.found_in_manual_mode),
+            (Some(true), None),
+            "an OpenFan channel reports failing writes, and has no mode to be found in"
+        );
+        assert_eq!((gpu.write_failing, gpu.found_in_manual_mode), (None, None));
+
+        let later = now + FAN_WRITE_FAILING_STALE_AFTER + std::time::Duration::from_secs(1);
+        let aged = build_fan_entries(&state, later);
+        assert!(
+            aged.iter().all(|e| e.write_failing != Some(true)),
+            "a fan the engine stopped writing is not failing for ever"
+        );
     }
 
     #[test]

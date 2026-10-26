@@ -537,6 +537,28 @@ pub struct FanEntry {
     /// header. Same presence rule as `duty_corrections`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duty_not_holding: Option<bool>,
+    /// This hwmon header was already in manual mode, at a readable duty, when
+    /// the daemon first took it, so a stop gives it back in manual mode at that
+    /// duty rather than to the firmware (DEC-382's rule: give back exactly what
+    /// was found). The usual cause is another fan program still holding it.
+    ///
+    /// hwmon only, and present on EVERY hwmon entry from a daemon that reports
+    /// it — `false` for a header not taken yet or taken from another mode.
+    /// Never cleared while the daemon runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub found_in_manual_mode: Option<bool>,
+    /// The engine's last writes to this fan failed — at least
+    /// `FAN_WRITE_FAILING_STREAK` in a row, the latest within
+    /// `FAN_WRITE_FAILING_STALE_AFTER` — so it is not at the duty the daemon
+    /// chose, and a thermal force cannot reach it either. Forced writes count
+    /// with the profile's, so it holds through an emergency. Cleared by the
+    /// next write that lands, and by age once the engine stops writing the fan.
+    ///
+    /// Present on EVERY hwmon and OpenFan entry from a daemon that reports it;
+    /// absent on a GPU entry. The reason is in the journal, not here: the
+    /// error text names sysfs paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_failing: Option<bool>,
 }
 
 /// A validation session's progress, for the poll surface (AIO-MB Phase 5).
@@ -3127,6 +3149,8 @@ mod tests {
             pwm_commanded_pct: Some(40),
             duty_corrections: Some(2),
             duty_not_holding: Some(false),
+            found_in_manual_mode: Some(true),
+            write_failing: Some(false),
         };
         expect(&serde_json::to_value(&fan).unwrap(), "FanEntry");
 
@@ -4995,6 +5019,8 @@ mod tests {
             pwm_enable_mode: None,
             duty_corrections: None,
             duty_not_holding: None,
+            found_in_manual_mode: None,
+            write_failing: None,
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["rpm"], 1200);
@@ -5017,6 +5043,8 @@ mod tests {
             pwm_enable_mode: None,
             duty_corrections: None,
             duty_not_holding: None,
+            found_in_manual_mode: None,
+            write_failing: None,
         };
         let json = serde_json::to_value(&nvidia).unwrap();
         assert_eq!(json["duty_pct"], 47);

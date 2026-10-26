@@ -62,7 +62,9 @@
         "pwm_readback_pct",
         "pwm_commanded_pct",
         "duty_corrections",
-        "duty_not_holding"
+        "duty_not_holding",
+        "found_in_manual_mode",
+        "write_failing"
       ],
       "must_be_read": [
         "rpm",
@@ -75,7 +77,9 @@
         "pwm_readback_pct",
         "pwm_commanded_pct",
         "duty_corrections",
-        "duty_not_holding"
+        "duty_not_holding",
+        "found_in_manual_mode",
+        "write_failing"
       ],
       "not_assertable": {
         "id": "the name is too common to prove a read site; it matches unrelated code everywhere (see test_not_assertable_names_are_really_ambiguous)",
