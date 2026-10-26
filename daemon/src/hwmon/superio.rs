@@ -760,7 +760,10 @@ pub(crate) fn signed_modules_note(module: &str) -> String {
          `modprobe {module}` reports 'Key was rejected by service' or 'Operation not \
          permitted'. DKMS signs the module as it builds it and prints the certificate it \
          used; enrol that file once with `sudo mokutil --import <file>`, reboot, and choose \
-         'Enroll MOK' in the MOK Manager screen."
+         'Enroll MOK' in the MOK Manager screen. That screen comes from the shim boot loader, \
+         which Debian, Ubuntu and Fedora boot through with Secure Boot on. A key enrolled in \
+         the firmware with `sbctl` does not count for modules, so without shim the kernel \
+         loads only modules signed with a key built into it."
     )
 }
 
@@ -2185,6 +2188,10 @@ mod tests {
             .risk_notes
             .iter()
             .any(|n| n.contains("loads only signed modules")));
-        assert!(note.contains("Key was rejected by service") && note.contains("mokutil"));
+        assert!(
+            note.contains("Key was rejected by service")
+                && note.contains("mokutil")
+                && note.contains("shim boot loader")
+        );
     }
 }

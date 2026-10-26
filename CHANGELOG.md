@@ -5,6 +5,14 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The Super-I/O report's signing note now says that enrolling a key needs the shim boot
+  loader.** It told you to enroll the DKMS key with `mokutil` without saying that the MOK
+  Manager screen comes from shim, which Debian, Ubuntu and Fedora boot through with Secure Boot
+  on. A key enrolled in the firmware with `sbctl` does not count for modules, so without shim
+  the kernel loads only modules signed with a key built into it.
+
 ## [5.3.1] — 2026-10-22
 
 Pairs with `ventulus` >= v2.23.0, the recommended capability floor; GUI 5.4.1 is the matching release
