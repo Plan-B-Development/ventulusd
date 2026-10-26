@@ -97,6 +97,16 @@ tarball's `install.sh` put a missing one back at the next upgrade (apt leaves it
 deleted). Every format keeps an edited one, delivering a changed default beside
 it as `ventulus.conf.pacnew`, `.rpmnew` or `.new`; apt asks which to keep.
 
+No package loads the file as it installs, so the drivers arrive at the next boot.
+To load them without one, run `sudo systemctl restart systemd-modules-load` and
+then `sudo systemctl restart ventulusd`, because the daemon looks for fan headers
+only as it starts. On most boards other than Gigabyte's, the first command reports
+that the job failed, and `systemctl --failed` then lists
+`systemd-modules-load.service` after every boot. That is a fault in the package
+and stops nothing loading: `nct6775` or `w83627ehf` found no chip, and the
+Super-I/O guard below, which loads those two, passes that on as an error. Every
+other module still loads; `lsmod` shows which did.
+
 CPU temperature modules (`coretemp` for Intel, `k10temp` for AMD) and SMBus
 adapter modules (`i2c-i801`, `i2c-piix4`) load automatically through PCI/ACPI
 matching.
@@ -115,8 +125,15 @@ unchanged. Each time it declines a module it says so in the journal:
 `/etc/modprobe.d/ventulus-superio.conf`: the same name masks it. A file of any
 other name does not reliably win, because modprobe reads every directory's files
 in one name order and, for a module named twice, the first `install` line read
-takes effect. The guard prevents the latch; it does not clear one already set.
-For that, see the GUI manual's
+takes effect. The guard stops only modules. It cannot stop a program that writes
+the ports itself: `sensors-detect` (below), or CoolerControl's built-in Super-I/O
+detection, which runs each time `coolercontrold` starts and, at a port where no
+chip identifies itself, writes each chip family's config-mode unlock
+([CoolerControl docs](https://docs.coolercontrol.org/devices/kernel-modules#built-in-super-i-o-detection)).
+If you keep CoolerControl on a Gigabyte board, turn that off (Settings → General,
+or `sensors_auto_detect = false` in `/etc/coolercontrol/config.toml`). The guard
+prevents the latch; it does not clear one already set. For that, see the GUI
+manual's
 [Hardware Troubleshooting](https://github.com/Plan-B-Development/ventulus/blob/main/manual/hardware-troubleshooting.md#some-of-my-fan-headers-are-missing--only-5-of-8-show-up).
 
 **If your hardware is not detected,** check the GUI first: the **Hardware** page's
@@ -726,12 +743,17 @@ this: it puts the header back in that state as it stops, and finds it there agai
 when it next takes it. A reboot should: the record does not survive one, and the
 BIOS sets each header up again as the machine starts. Either way, check before the
 first profile: stop the other program, make sure no profile is active and no fan
-test is running, and list every header's mode. A line ending in `:1` is a header
-something still holds in manual mode:
+test is running, and list every header's mode. Each line gives a chip, a header
+and its mode; a line ending in `1` is a header something still holds in manual
+mode:
 
 ```bash
-find /sys/devices -path '*/hwmon/hwmon*/pwm*_enable' -exec grep -H . {} +
+find /sys/devices -path '*/hwmon/hwmon*/pwm*_enable' -exec sh -c 'for f; do echo "$(cat "${f%/*}/name") ${f##*/} $(cat "$f")"; done' sh {} +
 ```
+
+The GUI manual's
+[Migrating from Another Fan Program](https://github.com/Plan-B-Development/ventulus/blob/main/manual/migrating.md)
+walks through the whole switch.
 
 ## Setting fan speeds
 
@@ -1100,7 +1122,7 @@ scripts and for reading a support bundle.
 
 | Field | What it means | What to do |
 |---|---|---|
-| `duty_not_holding: true` on an hwmon fan in `GET /fans` | Something else is writing this header. The daemon rewrote the duty it had set three times and the header did not keep it, so it has stopped fighting. It tries again when its curve asks for a different speed, and the flag clears when the header keeps a duty again. `duty_corrections` counts the rewrites since the daemon started. | Stop the other fan-control program (`fancontrol`, CoolerControl, CoreCtrl, `fan2go`, a vendor tool), or the BIOS/EC feature that drives the header. |
+| `duty_not_holding: true` on an hwmon fan in `GET /fans` | Something else is writing this header. The daemon rewrote the duty it had set three times and the header did not keep it, so it has stopped fighting. It tries again when its curve asks for a different speed, and the flag clears when the header keeps a duty again. `duty_corrections` counts the rewrites since the daemon started. | Stop the other fan-control program (`fancontrol`, CoolerControl, CoreCtrl, `fan2go`, a vendor tool), or the BIOS/EC feature that drives the header. § Fan profiles, "Who writes the fans", has a check that finds a header still held. |
 | `skipped_controls[]` on `/status` | A control in the active profile has not been commanding its fans for at least 3 ticks, so they hold their last speed. `reason` says why: `curve_not_found` (the curve it names is gone), `sensor_unavailable` (its sensor is missing or has stopped updating), `mix_unresolvable` / `sync_unresolvable` (a combined curve cannot be worked out), or `backend_unavailable` (none of its fans can be reached, for example an OpenFAN fan with no controller attached, or an AMD GPU the daemon cannot drive: an RX 6000 or older, or an RX 7000/9000 without its firmware fan curve). | Fix the profile or the sensor. A frozen sensor is the usual cause: see § Safety, "Stalled sensors stop driving curves". |
 | `unavailable_sensors[]` on `/status` | A sensor the daemon found fails every read (a Wi-Fi card's temperature while the radio is off is the usual one) or reports an impossible temperature. It is logged once and left out of `GET /sensors`. | Nothing, unless a curve needs that sensor; then pick another. |
 | `runtime_config_degraded` on `/status` | The daemon could not read `runtime.toml`, which holds your header roles. | See § Runtime configuration, "When `runtime.toml` cannot be read". |

@@ -67,22 +67,29 @@ curl --unix-socket /run/ventulus/ventulus.sock http://localhost/status
 ## Prerequisites
 
 The package loads the common Super-I/O drivers at boot
-(`/etc/modules-load.d/ventulus.conf`), so many machines need nothing more. The
-GUI's **Hardware** page reports what yours needs. The usual extras:
+(`/etc/modules-load.d/ventulus.conf`), so many machines need nothing more. They
+load from the next boot; [Getting Started § After installing][after-installing]
+loads them without one. The GUI's **Hardware** page reports what yours needs. The
+usual extras:
 
 | You need | When | How |
 |---|---|---|
 | An out-of-tree driver (`frankcrawford/it87`, `Fred78290/nct6687d`), built with DKMS | Most 2022-and-later Gigabyte and MSI boards, many ASRock boards, ASUS AM4 300/400-series | [Driver Setup][driver-setup], per distribution |
-| Signed DKMS modules, or Secure Boot off | An out-of-tree driver with Secure Boot on | [Secure Boot and DKMS modules][secure-boot] |
+| The DKMS signing key enrolled (turning Secure Boot off is the last resort) | An out-of-tree driver on a kernel that loads only signed modules, as Debian, Ubuntu and Fedora do with Secure Boot on | [Secure Boot and DKMS modules][secure-boot] |
 | Sensible BIOS fan settings | Every board: the BIOS still runs the fans at boot, so never give its curve a 0 % point | [BIOS settings][bios] |
 | `amdgpu.ppfeaturemask=0xfff7ffff` (any mask with bit `0x4000`) | Fan control on an RX 7000 or RX 9000 | [AMD GPU prerequisite][amd-gpu] |
 | A driver option for an ACPI resource conflict | A driver that fails with *Device or resource busy* | [Module parameters][module-params] |
 | A full power cut | A dual-chip Gigabyte board whose second fan chip has vanished | [Missing fan headers][missing-headers] |
 
-Stop any other fan tool (fancontrol, CoolerControl, CoreCtrl, fan2go) before the
-daemon takes over: two programs writing one fan header fight each other. The
+Stop any other fan tool (fancontrol, CoolerControl, CoreCtrl, fan2go) before your
+first profile or fan test: two programs writing one fan header fight each other,
+and the daemon gives each header back as it first found it, so a header the other
+tool still holds goes back to that tool's speed.
+[Migrating from Another Fan Program][migrating] covers the switch, and the
 [Setup Checklist][setup-checklist] walks through all of this in order.
 
+[after-installing]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#after-installing
+[migrating]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/migrating.md
 [driver-setup]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md
 [secure-boot]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md#secure-boot-and-dkms-modules
 [bios]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md#step-5--bios-settings-the-half-people-skip
