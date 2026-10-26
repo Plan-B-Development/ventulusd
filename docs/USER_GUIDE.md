@@ -132,10 +132,12 @@ This probes for further sensor chips and saves what it finds. Probing is at your
 own risk: it "can access chips in a way these chips do not like, causing problems
 ranging from SMBus lockup to permanent hardware damage (a rare case, thankfully)"
 ([sensors-detect(8)](https://man.archlinux.org/man/extra/lm_sensors/sensors-detect.8.en)).
-Accept the conservative defaults, and never run it on a Gigabyte board: it writes
-a Super-I/O unlock to 0x4E that can wedge the ITE bridge in front of a second
-chip, which then vanishes, sometimes until the machine is powered down at the
-wall, because the bridge runs on standby power and survives a reboot. The guard
+Its default answers are not a safe mode: the Super-I/O scan defaults to yes, and
+the man page warns that `--auto`, which takes every default, "isn't necessarily
+safe". Answer each question yourself, and never run it on a Gigabyte board: its
+Super-I/O scan writes an unlock to 0x4E that can wedge the ITE bridge in front of
+a second chip, which then vanishes, sometimes until the machine is powered down at
+the wall, because the bridge runs on standby power and survives a reboot. The guard
 cannot stop it, because `sensors-detect` probes the ports itself rather than
 loading a module. Then restart the daemon:
 
@@ -714,6 +716,22 @@ following its curve. The safety rules take priority over both, as **floors**
 rather than replacements: each fan receives `max(commanded, forced)`. A fan no
 control commands receives the forced duty only in the 100 % emergency; the 40 %
 no-CPU-sensor floor reaches the active profile's fans alone (§ Safety).
+
+Stop any other fan program before the daemon first drives a header, that is,
+before your first profile or fan test. The daemon records what each header was
+doing the first time it takes it and gives exactly that back when it stops
+(§ Safety), so a header another program still holds in manual mode goes back to
+that program's last duty, not to the BIOS. Restarting the daemon does not clear
+this: it puts the header back in that state as it stops, and finds it there again
+when it next takes it. A reboot should: the record does not survive one, and the
+BIOS sets each header up again as the machine starts. Either way, check before the
+first profile: stop the other program, make sure no profile is active and no fan
+test is running, and list every header's mode. A line ending in `:1` is a header
+something still holds in manual mode:
+
+```bash
+find /sys/devices -path '*/hwmon/hwmon*/pwm*_enable' -exec grep -H . {} +
+```
 
 ## Setting fan speeds
 
@@ -1315,6 +1333,9 @@ None can be turned off; the only setting is the coolant limit.
   to the firmware's own curve with zero-RPM idle stop re-enabled, and each
   motherboard header the daemon took goes back to exactly what it was doing
   before: its recorded `pwm_enable`, or its duty if it was already in manual mode.
+  "Before" is the moment the daemon first took the header in that run, so if
+  another fan program held it then, that program's setting is what comes back
+  (§ Who writes the fans).
   A GPU the daemon never wrote a curve to is not touched, so a curve LACT or
   CoreCtrl put on a card your profile does not name survives a stop or a restart;
   so does one put on a card after **Restore GPU Fan to Automatic** handed it back.
