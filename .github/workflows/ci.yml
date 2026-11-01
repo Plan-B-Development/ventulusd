@@ -64,7 +64,7 @@ jobs:
           # SHA on the next line, per the supply-chain note at the top of the
           # file, so the bundled one is turned off rather than layered on top.
           cache: false
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
       # `--locked` is load-bearing, not tidiness (DEC-272 round 2). Without it
@@ -123,7 +123,7 @@ jobs:
       # with one deliberately stable across jobs, which is the opposite of what is
       # wanted — it was set here briefly with a comment claiming it provided the
       # separation the default already provides.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # Both steps below set RUSTUP_TOOLCHAIN, and it is load-bearing rather than
       # belt-and-braces. The rustup shim reads the repo's pin file and would
       # override whatever the action above installed, so WITHOUT this the job
