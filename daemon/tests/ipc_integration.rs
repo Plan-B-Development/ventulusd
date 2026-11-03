@@ -10026,3 +10026,85 @@ async fn a_removal_through_a_symlink_cannot_prune_a_dir_outside_the_callers_home
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+/// Captures the diagnostic request log (DEC-503) for this test binary. Only
+/// `ventulusd::api::diagnostic_log` records are kept, so other tests' logging
+/// neither shows up here nor grows the buffer.
+struct DiagnosticLogCapture;
+
+static DIAGNOSTIC_LOG: Mutex<Vec<String>> = parking_lot::const_mutex(Vec::new());
+
+impl log::Log for DiagnosticLogCapture {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata
+            .target()
+            .starts_with("ventulusd::api::diagnostic_log")
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            DIAGNOSTIC_LOG.lock().push(record.args().to_string());
+        }
+    }
+    fn flush(&self) {}
+}
+
+fn install_diagnostic_log_capture() {
+    static CAPTURE: DiagnosticLogCapture = DiagnosticLogCapture;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        log::set_logger(&CAPTURE).expect("no other logger in this test binary");
+        log::set_max_level(log::LevelFilter::Info);
+    });
+}
+
+/// DEC-503: a request that starts a hardware-writing diagnostic is logged on
+/// arrival with the caller's uid and pid, and again with the daemon's answer —
+/// a refusal included — through the real router and socket. A read route is
+/// not logged.
+#[tokio::test]
+async fn a_diagnostic_start_request_is_logged_with_its_caller_and_answer() {
+    install_diagnostic_log_capture();
+    // No hwmon controller in the test state: the verify is refused, which is
+    // still a request worth naming.
+    let (path, shutdown, _dir) = start_test_server(test_app_state()).await;
+    let header = "dec503-log-probe";
+
+    let (status, _) = uds_post(
+        &path,
+        &format!("/hwmon/{header}/verify"),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert!(
+        status >= 400,
+        "precondition: the verify is refused ({status})"
+    );
+    let (read_status, _) =
+        uds_get(&path, &format!("/diagnostics/preflight?header_id={header}")).await;
+    assert!(read_status > 0);
+
+    let mine: Vec<String> = DIAGNOSTIC_LOG
+        .lock()
+        .iter()
+        .filter(|l| l.contains(header))
+        .cloned()
+        .collect();
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let caller = format!("uid {uid}, pid {}", std::process::id());
+    assert!(
+        mine.iter().any(
+            |l| l.contains("requested: POST /hwmon/dec503-log-probe/verify") && l.contains(&caller)
+        ),
+        "the request line names the caller ({caller}): {mine:?}"
+    );
+    assert!(
+        mine.iter()
+            .any(|l| l.contains("refused") && l.ends_with(&format!("answered {status}"))),
+        "the answer line carries the daemon's status: {mine:?}"
+    );
+    assert_eq!(mine.len(), 2, "the preflight read is not logged: {mine:?}");
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

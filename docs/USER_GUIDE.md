@@ -1119,6 +1119,15 @@ Start with the journal (`journalctl -u ventulusd`) and
 `GET /diagnostics/hardware`, or the GUI's **System State** and **Hardware** pages,
 which show the same things.
 
+Every request that starts a test which changes fan speeds (a PWM verify,
+characterisation, control-path discovery, the stall probe, OpenFAN calibration,
+a GPU fan test, a validation session, or a Super-I/O port probe) is logged when
+it arrives, with the user id and process id of the program that sent it, and
+again with the daemon's answer. `journalctl -u ventulusd | grep 'hardware
+diagnostic'` lists them, so a fan that changed speed during a test can be told
+apart from the profile's own control. The ids name the caller; they grant
+nothing, and any local user can still start these tests.
+
 ### Conditions the daemon reports
 
 `GET /status` (and `GET /poll`) and `GET /fans` report six conditions the daemon

@@ -939,7 +939,10 @@ mod wiring_tests {
     }
 
     fn peer(uid: u32) -> ConnectInfo<UdsConnectInfo> {
-        ConnectInfo(UdsConnectInfo { uid: Some(uid) })
+        ConnectInfo(UdsConnectInfo {
+            uid: Some(uid),
+            pid: None,
+        })
     }
 
     /// The bound the routes promise: the budget, plus slack for a loaded host.

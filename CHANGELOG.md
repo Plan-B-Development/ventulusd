@@ -5,6 +5,16 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Added
+
+- **The journal names every test that changes fan speeds, and who asked for it.** A request
+  that starts a PWM verify, characterisation, control-path discovery, the stall probe, OpenFAN
+  calibration, a GPU fan test, a validation session or a Super-I/O port probe is logged when it
+  arrives, with the caller's user id and process id, and again with the daemon's answer.
+  Before this, only the OpenFAN firmware update logged its start, so a test's fan changes could
+  not be told apart from the profile's. `journalctl -u ventulusd | grep 'hardware diagnostic'`
+  lists them.
+
 ### Fixed
 
 - **A stop no longer leaves a GPU fan test's card at its test speed.** A GPU fan test waits six

@@ -6,6 +6,7 @@
 pub mod calibration;
 pub mod characterization;
 pub mod diagnostic_gates;
+pub mod diagnostic_log;
 pub mod diagnostics;
 pub mod discovery;
 pub mod handlers;

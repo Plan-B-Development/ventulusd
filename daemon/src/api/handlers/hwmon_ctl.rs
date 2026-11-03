@@ -3084,7 +3084,10 @@ pub(crate) mod tests {
         *state.profile_search_dirs.write() = vec![dir.path().to_path_buf()];
         let (status, Json(body)) = crate::api::handlers::activate_profile_handler(
             axum::extract::State(state.clone()),
-            axum::extract::ConnectInfo(crate::api::server::UdsConnectInfo { uid: Some(0) }),
+            axum::extract::ConnectInfo(crate::api::server::UdsConnectInfo {
+                uid: Some(0),
+                pid: None,
+            }),
             Json(serde_json::json!({ "profile_id": "p" })),
         )
         .await;

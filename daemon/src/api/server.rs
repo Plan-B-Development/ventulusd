@@ -20,7 +20,9 @@ pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// `uid` is the connecting process's effective user id read from `SO_PEERCRED`,
 /// or `None` when it could not be read. Handlers treat `None` as untrusted and
-/// fail closed. Consumed by `POST /config/profile-search-dirs` to confine a
+/// fail closed. `pid` is the same read's process id, used only to name the
+/// caller in the journal (DEC-503); it is never an authorisation input.
+/// `uid` is consumed by `POST /config/profile-search-dirs` to confine a
 /// non-root caller's added search directories to its own home directory on
 /// multi-user hosts (the file-picker UX is preserved for single-user desktops
 /// and for root/CLI callers, which are exempt).
@@ -28,6 +30,8 @@ pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
 pub struct UdsConnectInfo {
     /// Effective uid of the peer, or `None` if `SO_PEERCRED` was unavailable.
     pub uid: Option<u32>,
+    /// Process id of the peer at connect time, or `None` if unavailable.
+    pub pid: Option<i32>,
 }
 
 impl<'a> Connected<IncomingStream<'a, UnixListener>> for UdsConnectInfo {
@@ -35,8 +39,10 @@ impl<'a> Connected<IncomingStream<'a, UnixListener>> for UdsConnectInfo {
         // `io()` yields the accepted `UnixStream`; `peer_cred()` reads
         // SO_PEERCRED. A read failure degrades to `None` (fail-closed for the
         // caller) rather than dropping the connection.
+        let cred = stream.io().peer_cred().ok();
         Self {
-            uid: stream.io().peer_cred().ok().map(|cred| cred.uid()),
+            uid: cred.map(|cred| cred.uid()),
+            pid: cred.and_then(|cred| cred.pid()),
         }
     }
 }
@@ -349,6 +355,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(handlers::update_nvidia_telemetry_handler),
         )
         .fallback(handlers::fallback_handler)
+        // Names every diagnostic start and its caller in the journal (DEC-503).
+        // Observes only: it reads `MatchedPath`, so it sits after the routes.
+        .layer(axum::middleware::from_fn(
+            super::diagnostic_log::log_diagnostic_requests,
+        ))
         // Explicit 4 MiB request-body cap (S1): profile POSTs are the only
         // large ingress; matches the file-read cap in `atomic_io`.
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
@@ -587,5 +598,36 @@ mod tests {
             .filter(|(m, p, _)| !served.iter().any(|(sm, sp)| sm == m && sp == p))
             .collect();
         assert!(stale.is_empty(), "no longer served: {stale:?}");
+    }
+
+    /// DEC-503: every route that claims the diagnostic slot is a logged start
+    /// (rescan is the one `Refused` route that starts no diagnostic), the port
+    /// probe is logged although it claims no slot, and every listed start is
+    /// still served.
+    #[test]
+    fn every_diagnostic_start_route_is_logged() {
+        use super::super::diagnostic_log::DIAGNOSTIC_START_ROUTES;
+        let served = served_routes();
+        let listed = |m: &str, p: &str| {
+            DIAGNOSTIC_START_ROUTES
+                .iter()
+                .any(|(lm, lp)| *lm == m && *lp == p)
+        };
+        let claimants: Vec<_> = ROUTES
+            .iter()
+            .filter(|(_, p, d)| *d == Refused && *p != "/fans/openfan/rescan")
+            .collect();
+        assert!(claimants.len() >= 8, "precondition: {claimants:?}");
+        let unlogged: Vec<_> = claimants.iter().filter(|(m, p, _)| !listed(m, p)).collect();
+        assert!(
+            unlogged.is_empty(),
+            "slot claimants not logged: {unlogged:?}"
+        );
+        assert!(listed("POST", "/inventory/superio/probe"));
+        let stale: Vec<_> = DIAGNOSTIC_START_ROUTES
+            .iter()
+            .filter(|(m, p)| !served.iter().any(|(sm, sp)| sm == m && sp == p))
+            .collect();
+        assert!(stale.is_empty(), "listed but not served: {stale:?}");
     }
 }
