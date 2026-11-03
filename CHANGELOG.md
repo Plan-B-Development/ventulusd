@@ -43,6 +43,18 @@ The script stays as the backstop for exits no daemon code survives: a crash, `SI
 kill, and a watchdog stop cut off after 10 s. No configuration or unit change and no new package
 dependency; the `ExecStopPost` script gains the lock check above.
 
+### Changed
+
+- **Installing, removing and running the daemon are documented once, in the GUI manual's
+  Administration section.** The User Guide is now the reference for configuration, the
+  service unit, profiles and the API, the conditions the daemon reports and the safety rules,
+  and links to that section for the rest; the README, `SECURITY.md`, the man page and the
+  install messages point to it too. The User Guide and man page now say the missing-CPU-sensor
+  floor starts after 5 seconds with no current reading (they said 5 poll cycles). On Arch,
+  removing the package now also names a leftover OpenFAN firmware-write drop-in, and the
+  example udev rule says which serial group to use on each distribution.
+
+
 ## [5.4.0] — 2026-10-26
 
 Pairs with `ventulus` >= v2.23.0; ventulus 5.5.0 is the first GUI that shows the two new

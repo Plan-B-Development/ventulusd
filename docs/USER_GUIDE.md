@@ -18,6 +18,12 @@ things: activate a profile, take a short manual override, identify a fan, run a
 diagnostic. The GUI (`ventulus`) and the tray (`ventulus-tray`) are clients, and
 so can your scripts be (§ Scripting the daemon). No client writes a fan.
 
+> **This guide is the daemon's reference:** every configuration key, the service
+> unit, profiles and the API, the conditions the daemon reports, and the safety rules
+> in full. Installing, upgrading, permissions, drivers, recovery, logs and removal
+> are in the GUI manual's [Administration](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/README.md) section, which applies
+> whether or not the desktop app is installed.
+>
 > **New to Ventulus?** The GUI manual walks through setup step by step. Start
 > with the [Setup Checklist](https://github.com/Plan-B-Development/ventulus/blob/main/manual/setup-checklist.md);
 > [Understanding Motherboard Fan Control](https://github.com/Plan-B-Development/ventulus/blob/main/manual/understanding-fan-control.md)
@@ -43,172 +49,21 @@ so can your scripts be (§ Scripting the daemon). No client writes a fan.
 
 ## Installation
 
-Install the package from the signed Ventulus repository for your distribution:
-pacman on Arch Linux and its derivatives, APT on Debian 13 and Ubuntu 26.04, DNF
-on Fedora 44 and 45. The GUI manual's
-[Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#installation)
-has the steps, a tarball for Debian, Ubuntu and Fedora without a repository, and
-the distributions that are not supported. A headless machine needs only
-`ventulusd`:
-
-```bash
-sudo pacman -Syu ventulusd               # Arch
-sudo apt install ventulusd               # Debian, Ubuntu
-sudo dnf install ventulusd               # Fedora
-sudo systemctl enable --now ventulusd    # Arch, Fedora and the tarball
-```
-
-Each platform starts the service its own way. The Debian and Ubuntu package
-enables and starts it as it installs, and restarts it after an upgrade. Fedora
-and the tarball's `install.sh` leave a new install disabled, and restart the
-daemon after an upgrade only if it was running. Arch leaves a new install
-disabled and does not restart the daemon after an upgrade: pacman prints
-`sudo systemctl restart ventulusd` for you to run. Every one of those stops is a
-systemd stop, so the daemon's hand-back (§ Safety) runs on each.
-
-Do not install by copying the binary and unit file in by hand. The unit runs
-`/usr/bin/ventulusd` and, after every stop, `/usr/bin/ventulus-restore-auto`,
-which, after a crash or a kill, gives each fan header back to what it was doing
-before the daemon took it.
-The package also installs the sleep hook, the Super-I/O guard and
-`/etc/modules-load.d/ventulus.conf`; a hand-copied binary gets none of these.
-To build the package yourself or run your own build, see
-[`daemon/README.md`](https://github.com/Plan-B-Development/ventulusd/blob/main/daemon/README.md).
+[Installing](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/install.md) has the steps for each distribution, a machine with no
+desktop (`ventulusd` alone, or with `ventulus-diag`), and what the packages set up;
+[Upgrading](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/upgrade.md) says what an upgrade does to the running daemon. Install
+a package rather than copying the binary in by hand: the unit's hand-back after
+every stop, the sleep hook, the Super-I/O guard and the modules-load file come with
+it.
 
 ## Hardware sensor modules
 
 The daemon finds sensors and fan headers by scanning `/sys/class/hwmon/`. A
-device appears there only once its kernel driver is loaded.
-
-**Loaded for you.** The package installs `/etc/modules-load.d/ventulus.conf`,
-which loads the common Super-I/O drivers at boot. The kernel cannot load them by
-itself, because the chips sit on ISA ports:
-
-| Module | Chipset | Common boards |
-|--------|---------|---------------|
-| `nct6775` | Nuvoton NCT6775–NCT6799 (incl. NCT5585D and the ASUS NCT6701D, which it reports as `nct6799`) | ASUS (AM4 500-series onward, Intel), ASRock, older MSI (AM4 300/400, the original X570 boards, Intel ≤ 300-series) |
-| `it87` | ITE IT87xx/IT86xx: the in-kernel driver covers only older parts plus IT8689E (7.1+) and IT87952E (6.3+); IT8686E/IT8688E/IT8696E/IT8665E need the out-of-tree `frankcrawford/it87`. The daemon reads the running kernel's version for the IT8689E | Gigabyte; ASUS AM4 300/400-series (IT8665E) |
-| `w83627ehf` | Winbond W83627EHF/DHG | Older boards |
-| `drivetemp` | SATA/SAS drive temperature | All SATA drives |
-
-To stop loading one, comment out its line and run
-`sudo systemctl restart systemd-modules-load` (`start` does nothing once the unit
-has run) or reboot. Do not rename or delete the file: pacman, dnf and the
-tarball's `install.sh` put a missing one back at the next upgrade (apt leaves it
-deleted). Every format keeps an edited one, delivering a changed default beside
-it as `ventulus.conf.pacnew`, `.rpmnew` or `.new`; apt asks which to keep.
-
-No package loads the file as it installs, so the drivers arrive at the next boot.
-To load them without one, run `sudo systemctl restart systemd-modules-load` and
-then `sudo systemctl restart ventulusd`, because the daemon looks for fan headers
-only as it starts. On most boards other than Gigabyte's, the first command reports
-that the job failed, and `systemctl --failed` then lists
-`systemd-modules-load.service` after every boot. That is a fault in the package
-and stops nothing loading: `nct6775` or `w83627ehf` found no chip, and the
-Super-I/O guard below, which loads those two, passes that on as an error. Every
-other module still loads; `lsmod` shows which did.
-
-CPU temperature modules (`coretemp` for Intel, `k10temp` for AMD) and SMBus
-adapter modules (`i2c-i801`, `i2c-piix4`) load automatically through PCI/ACPI
-matching.
-
-**The Super-I/O guard.** On a Gigabyte board the package stops `nct6775` and
-`w83627ehf` from loading, even though the file above lists them. Gigabyte boards
-use ITE Super-I/O chips, which those Nuvoton/Winbond drivers can never bind, and
-their probe writes a config-mode unlock that can latch the ITE bridge in front of
-a board's second fan chip. That hides the chip until a reboot, and on some boards
-until the machine is powered down at the wall. The guard covers every Gigabyte
-board, and any board it lists whose firmware reports no vendor. It is
-`/usr/lib/modprobe.d/ventulus-superio.conf`, with its helper
-`/usr/lib/ventulus/ventulus-superio-guard`; on any other board it loads the module
-unchanged. Each time it declines a module it says so in the journal:
-`journalctl -b -t ventulus-superio-guard`. To turn it off, create an **empty**
-`/etc/modprobe.d/ventulus-superio.conf`: the same name masks it. A file of any
-other name does not reliably win, because modprobe reads every directory's files
-in one name order and, for a module named twice, the first `install` line read
-takes effect. The guard stops only modules. It cannot stop a program that writes
-the ports itself: `sensors-detect` (below), or CoolerControl's built-in Super-I/O
-detection, which runs each time `coolercontrold` starts and, at a port where no
-chip identifies itself, writes each chip family's config-mode unlock
-([CoolerControl docs](https://docs.coolercontrol.org/devices/kernel-modules#built-in-super-i-o-detection)).
-If you keep CoolerControl on a Gigabyte board, turn that off (Settings → General,
-or `sensors_auto_detect = false` in `/etc/coolercontrol/config.toml`). The guard
-prevents the latch; it does not clear one already set. For that, see the GUI
-manual's
-[Hardware Troubleshooting](https://github.com/Plan-B-Development/ventulus/blob/main/manual/hardware-troubleshooting.md#some-of-my-fan-headers-are-missing--only-5-of-8-show-up).
-
-**If your hardware is not detected,** check the GUI first: the **Hardware** page's
-readiness checklist and Super-I/O section identify your board's chips and the
-exact module or package needed, **without probing the hardware**. As a last
-resort, install `lm_sensors` and run:
-
-```bash
-sudo sensors-detect
-```
-
-This probes for further sensor chips and saves what it finds. Probing is at your
-own risk: it "can access chips in a way these chips do not like, causing problems
-ranging from SMBus lockup to permanent hardware damage (a rare case, thankfully)"
-([sensors-detect(8)](https://man.archlinux.org/man/extra/lm_sensors/sensors-detect.8.en)).
-Its default answers are not a safe mode: the Super-I/O scan defaults to yes, and
-the man page warns that `--auto`, which takes every default, "isn't necessarily
-safe". Answer each question yourself, and never run it on a Gigabyte board: its
-Super-I/O scan writes an unlock to 0x4E that can wedge the ITE bridge in front of
-a second chip, which then vanishes, sometimes until the machine is powered down at
-the wall, because the bridge runs on standby power and survives a reboot. The guard
-cannot stop it, because `sensors-detect` probes the ports itself rather than
-loading a module. Then restart the daemon:
-
-```bash
-sudo systemctl restart ventulusd
-```
-
-**ACPI conflicts.** If a Super-I/O module fails to bind with `ACPI resource
-conflict` or *Device or resource busy* in the kernel log, update the driver first:
-current builds of the out-of-tree it87 driver avoid the conflict through MMIO on IT8688E,
-IT8689E, IT8696E and IT8698E chips. Boards with an IT8686E, or with an IT8792E or
-IT87952E second chip, can still need the option below (it87 PRs
-[#135](https://github.com/frankcrawford/it87/pull/135) and
-[#141](https://github.com/frankcrawford/it87/pull/141), X399 boards; issue
-[#139](https://github.com/frankcrawford/it87/issues/139), Z890). For `it87`,
-prefer the driver-local `options it87 ignore_resource_conflict=1` in
-`/etc/modprobe.d/it87.conf`; the it87 documentation notes that the system-wide
-`acpi_enforce_resources=lax` can cause boot failures on some systems. The Nuvoton
-drivers (`nct6775`, `nct6687`) have no driver-local option, so for them
-`acpi_enforce_resources=lax` on the kernel command line is the only kernel-side
-remedy.
-
-**Out-of-tree modules.** Newer boards need drivers that are not in the mainline
-kernel, built with DKMS from their upstream projects:
-[`frankcrawford/it87`](https://github.com/frankcrawford/it87) for newer ITE chips,
-[`Fred78290/nct6687d`](https://github.com/Fred78290/nct6687d) for MSI NCT6687D boards
-and some ASRock NCT6686D boards (on Arch, the AUR packages `it87-dkms-git` and
-`nct6687d-dkms-git`). The GUI manual's
-[Driver Setup](https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md)
-covers installing, signing and verifying them on each distribution, and the GUI's
-Hardware page shows the steps for the one it runs on. Things to know:
-
-- it87 builds from 2026-09-09 (it87 v2.0) give Gigabyte chips longer
-  names, such as `it8696_a008090a`. The daemon strips that suffix, so fan header,
-  sensor and voltage ids, and the pump roles, fan names and profiles that use
-  them, do not change.
-- On Intel Z890 / B860 Gigabyte boards, it87 builds from 2026-09-09 to
-  2026-10-01 can fail to load ("Invalid argument") or bind no chip. Rebuild from
-  2026-10-02 or later ([it87 PR #140](https://github.com/frankcrawford/it87/pull/140)).
-  Current builds need kernel 6.4 or newer.
-- Never load `nct6687` with `force=1` on a board whose chip is an NCT679x.
-- **After a kernel update** the new kernel can boot with its own `it87`, when the
-  DKMS build for it failed or its headers were not installed. On most Gigabyte
-  boards that driver cannot drive the main chip. The daemon tells the two apart
-  (the module's out-of-tree taint) and says so in the Super-I/O advice, with
-  `dkms status` and `sudo dkms autoinstall`. It never reads the DKMS tree itself:
-  the sandbox keeps it out, and that stays so.
-- **A kernel that loads only signed modules** refuses an unsigned out-of-tree build
-  (*Key was rejected by service*, or *Operation not permitted* under lockdown).
-  `GET /diagnostics/hardware` reports `kernel_security`: Secure Boot, the lockdown
-  level, `module.sig_enforce` and the verdict, read from sysfs, securityfs and
-  efivarfs. When the verdict is yes and a chip needs a driver that is not loaded,
-  the Super-I/O advice says how to enrol the key DKMS signed the driver with.
+device appears there only once its kernel driver is loaded. What the packages
+load, the Gigabyte Super-I/O guard, ACPI conflicts, the out-of-tree driver notes
+and `sensors-detect` are in [Drivers and Other Fan Software](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/drivers.md); the
+step-by-step install of an out-of-tree driver is
+[Driver Setup](https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md).
 
 ### What the daemon detects, and what it deliberately doesn't
 
@@ -962,44 +817,9 @@ the GUI manual's
 
 ### Serial permissions
 
-The daemon runs as root, so no group membership is needed for it to open the
-serial device, and Debian/Ubuntu need no `dialout` drop-in. What does limit it is
-the unit's device allow-list, `DeviceAllow=char-ttyACM rw` and
-`DeviceAllow=char-ttyUSB rw`: the service can open only `/dev/ttyACM*` and
-`/dev/ttyUSB*` nodes (a `/dev/serial/by-id/` link to one of them is fine). A
-controller on any other kind of node needs a drop-in adding its device class:
-
-```bash
-sudo systemctl edit ventulusd
-# Add, for example:
-#   [Service]
-#   DeviceAllow=char-ttyS rw
-```
-
-A udev rule is **not required**: the daemon finds the controller on
-`/dev/ttyACM*` and `/dev/ttyUSB*` by itself. Use one only if you want a specific
-group or mode on the device node. For a stable path, use the `/dev/serial/by-id/`
-link above: the daemon opens only `/dev/ttyS*`, `ttyUSB*`, `ttyACM*`, `ttyAMA*`
-and `/dev/serial/` paths, so a custom udev symlink such as
-`/dev/ventulus-controller` is refused.
-
-The package installs an example rule, as documentation only, at
-`/usr/share/doc/ventulusd/99-ventulus.rules.example`. To use it, copy it into
-`/etc/udev/rules.d/` and edit it there (an upgrade overwrites the shipped
-example):
-
-```bash
-sudo install -m644 \
-  /usr/share/doc/ventulusd/99-ventulus.rules.example \
-  /etc/udev/rules.d/99-ventulus.rules
-
-# Find VID/PID for your device:
-udevadm info --attribute-walk --name=/dev/ttyACM0 | grep -E "idVendor|idProduct"
-
-# Edit /etc/udev/rules.d/99-ventulus.rules and replace XXXX/YYYY, then:
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=tty
-```
+The service needs no serial group and no udev rule. Which device nodes it may
+open, a controller on another kind of node, and the optional example udev rule
+are in [Permissions and Security § Device access](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/security.md#device-access).
 
 ## GPU fan control
 
@@ -1117,16 +937,12 @@ diagnostics have run. A session interrupted by a stop or a reboot is kept as
 
 Start with the journal (`journalctl -u ventulusd`) and
 `GET /diagnostics/hardware`, or the GUI's **System State** and **Hardware** pages,
-which show the same things.
-
-Every request that starts a test which changes fan speeds (a PWM verify,
-characterisation, control-path discovery, the stall probe, OpenFAN calibration,
-a GPU fan test, a validation session, or a Super-I/O port probe) is logged when
-it arrives, with the user id and process id of the program that sent it, and
-again with the daemon's answer. `journalctl -u ventulusd | grep 'hardware
-diagnostic'` lists them, so a fan that changed speed during a test can be told
-apart from the profile's own control. The ids name the caller; they grant
-nothing, and any local user can still start these tests.
+which show the same things. What the journal records (each hardware test's start
+included), what to collect and where to report it are in
+[Logs and Bug Reports](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/logs-and-bug-reports.md); a service that does not start
+or keeps restarting is in [The Service](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/service.md#when-the-service-misbehaves);
+hardware symptoms are in the GUI manual's
+[Hardware Troubleshooting](https://github.com/Plan-B-Development/ventulus/blob/main/manual/hardware-troubleshooting.md).
 
 ### Conditions the daemon reports
 
@@ -1143,112 +959,23 @@ scripts and for reading a support bundle.
 | `unavailable_sensors[]` on `/status` | A sensor the daemon found fails every read (a Wi-Fi card's temperature while the radio is off is the usual one) or reports an impossible temperature. It is logged once and left out of `GET /sensors`. | Nothing, unless a curve needs that sensor; then pick another. |
 | `runtime_config_degraded` on `/status` | The daemon could not read `runtime.toml`, which holds your header roles. | See § Runtime configuration, "When `runtime.toml` cannot be read". |
 
-### The daemon does not start
+### Where the rest went
 
-`sudo systemctl status ventulusd` and `journalctl -u ventulusd` say why. The usual
-causes are a bad edit to `daemon.toml`, which the journal names (§ Configuration),
-and another `ventulusd` already running, which exits with status 75 and
-*another ventulusd is already running*.
-
-### A client cannot connect
-
-The GUI shows itself as disconnected, or `curl` cannot reach the socket:
-
-- `systemctl is-active ventulusd` should say `active`;
-- `ls -la /run/ventulus/ventulus.sock` should show a socket that everyone can read
-  and write (`srw-rw-rw-`);
-- a client started with a different socket path (`ventulus --socket <path>`) has
-  to match `[ipc] socket_path`.
-
-### No OpenFAN controller is found
-
-See § Serial device setup. `journalctl -u ventulusd | grep -i openfan` shows
-`OpenFanController connected on <port>` once one is adopted; on a machine with
-none, the absence is logged at `info`, not as a warning.
-
-### Motherboard fan headers are missing
-
-- Check that the driver is loaded and the files exist:
-  `ls /sys/class/hwmon/hwmon*/pwm[0-9]`. (A plain
-  `find /sys/class/hwmon -name 'pwm[0-9]'` finds nothing, because each `hwmonN`
-  entry is a symlink, which `find` does not follow.)
-- A sensor chip whose driver you have just loaded appears after a rescan:
-  **Rescan Hardware** in the GUI footer, or
-  `curl -X POST --unix-socket /run/ventulus/ventulus.sock http://localhost/hwmon/rescan`.
-  **New fan headers need a daemon restart**
-  (`sudo systemctl restart ventulusd`): the rescan lists them but does not add
-  them to the running controller.
-- § Hardware sensor modules covers drivers, and the GUI manual's
-  [Hardware Troubleshooting](https://github.com/Plan-B-Development/ventulus/blob/main/manual/hardware-troubleshooting.md)
-  covers a second chip that has vanished.
-
-### Fans are found but never change speed
-
-`GET /fans` reports a fan whose writes keep failing as `write_failing: true`, and
-the journal says why. If it repeats a line like
-
-```
-[WARN] hwmon write failed for hwmon:it8696:pwm1: … /sys/class/hwmon/hwmonN/pwm1_enable: Read-only file system (os error 30)
-```
-
-the service's sandbox does not let it write the device tree. The packaged unit
-sets `ReadWritePaths=/sys/devices`, so look for a drop-in that overrides it
-(`systemctl cat ventulusd` shows every file in effect), remove it, then
-`sudo systemctl daemon-reload && sudo systemctl restart ventulusd`.
-
-Without that line, the cause is a hardware prerequisite: the GUI's **Hardware**
-page detects a missing Super-I/O driver or a missing `amdgpu.ppfeaturemask`, and
-shows the fix. An ACPI conflict shows only in the kernel log (see *ACPI conflicts*
-above). If the header is flagged
-`duty_not_holding`, another program is writing it (see the table above).
-
-### The profile does not come back after a reboot
-
-- Check § Loading a profile: a `--profile` or `OPENFAN_PROFILE` in a drop-in wins
-  over the profile you activated in the GUI.
-- `sudo cat /var/lib/ventulus/daemon_state.json` shows the saved choice (the state
-  directory is `0700`, readable by root only).
-- The journal says why a profile did not load at startup.
+- **The daemon does not start**, or **the profile does not come back after a
+  reboot:** [The Service § When the service misbehaves](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/service.md#when-the-service-misbehaves).
+- **A client cannot connect:** [Hardware Troubleshooting § The app cannot reach the daemon](https://github.com/Plan-B-Development/ventulus/blob/main/manual/hardware-troubleshooting.md#the-app-cannot-reach-the-daemon).
+- **No OpenFAN controller is found:** § Serial device setup above, and
+  `journalctl -u ventulusd | grep -i openfan`, which shows
+  `OpenFanController connected on <port>` once one is adopted.
+- **Motherboard fan headers are missing:** [Hardware Troubleshooting](https://github.com/Plan-B-Development/ventulus/blob/main/manual/hardware-troubleshooting.md#no-motherboard-fans-at-all).
+  New fan headers need a daemon restart: a rescan lists them but does not add them
+  to the running controller.
+- **Fans are found but never change speed:** [Hardware Troubleshooting § A fan's speed shows, but the fan cannot be controlled](https://github.com/Plan-B-Development/ventulus/blob/main/manual/hardware-troubleshooting.md#a-fans-speed-shows-but-the-fan-cannot-be-controlled).
 
 ## Uninstall
 
-```bash
-sudo pacman -R ventulusd                 # Arch
-sudo apt remove ventulusd                # Debian, Ubuntu
-sudo dnf remove ventulusd                # Fedora
-sudo /usr/lib/ventulus/uninstall         # the tarball
-```
-
-Each one stops and disables the service before it removes anything (the
-tarball's uninstaller refuses to remove anything while the daemon is still
-running). Stopping the daemon gives every motherboard fan header it took back to
-what it was doing before, usually its BIOS fan mode, both in-process as it exits
-and again through `ExecStopPost`. OpenFAN channels and headers with no mode
-switch are left at the exit minimum (§ Safety).
-
-What stays behind:
-
-- `/var/lib/ventulus/`, the daemon's state, on every format: `runtime.toml` (your
-  header roles and API-set settings), the saved active profile, the profile store
-  and diagnostic records;
-- configuration under `/etc` (`/etc/ventulus/daemon.toml`,
-  `/etc/ventulus/profiles/quiet.json`, `/etc/modules-load.d/ventulus.conf`, and on
-  Debian, Ubuntu, Fedora and the tarball also the tray's autostart entry
-  `/etc/xdg/autostart/ventulus-tray.desktop`): pacman keeps an edited file with a
-  `.pacsave` suffix, dnf with `.rpmsave`, and the tarball's uninstaller keeps it
-  under its own name; `apt remove` keeps every one of them, edited or not, and
-  `apt purge ventulusd` deletes them. Any profile you added under
-  `/etc/ventulus/profiles/` stays too;
-- anything you installed by hand: a udev rule in `/etc/udev/rules.d/`, or a
-  drop-in under `/etc/systemd/system/ventulusd.service.d/`.
-
-Remove those by hand if you no longer want them:
-
-```bash
-sudo rm -rf /var/lib/ventulus/ /etc/ventulus/
-sudo rm -f /etc/udev/rules.d/99-ventulus.rules && sudo udevadm control --reload-rules
-sudo rm -rf /etc/systemd/system/ventulusd.service.d/ && sudo systemctl daemon-reload
-```
+[Uninstalling](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/uninstall.md) lists the command for each format, what removing the
+daemon does to your fans, and every file it leaves behind on purpose.
 
 ## Safety
 
@@ -1313,8 +1040,9 @@ None can be turned off; the only setting is the coolant limit.
   because a voltage-driven pump stalls much higher in its range. This applies
   wherever the pump floor does: curves, manual overrides, identify, and every
   diagnostic. A header whose driver does not report its mode keeps the 30 % floor.
-- **Missing sensor fallback.** If no CPU temperature sensor reports for 5
-  consecutive polling cycles and no emergency is under way, the fans your active
+- **Missing sensor fallback.** If no CPU temperature sensor has given a current
+  reading for 5 seconds (five of the engine's one-second cycles) and no emergency
+  is under way, the fans your active
   profile controls are held at 40 % or more (GPU fans excluded, as above); a fan
   whose own curve can no longer be read keeps the speed it had. Fans no profile
   controls are left to their own firmware curve, which reads its own CPU sensor: a

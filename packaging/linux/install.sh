@@ -124,7 +124,8 @@ if [ -z "$root" ] && [ -d /run/systemd/system ] &&
 ventulusd is installed.
   Start it now and at every boot:  sudo systemctl enable --now ventulusd
   Load the sensor modules:         sudo systemctl restart systemd-modules-load   (or reboot)
-  Setup guide:                     /usr/share/doc/ventulusd/USER_GUIDE.md
+  Administration:                  https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/README.md
+  Reference:                       /usr/share/doc/ventulusd/USER_GUIDE.md
   Check your fan hardware:         the Ventulus GUI's Hardware page names any driver your board needs
   Uninstall:                       sudo /usr/lib/ventulus/uninstall
 EOF

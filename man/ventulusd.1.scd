@@ -25,8 +25,8 @@ the machine has to 100% PWM, holds that until a fresh reading at or below
 80°C (a CPU sensor that stops updating or disappears does not release it),
 then returns to active control at once, and gives every other fan it took back
 to what it was doing before. With no emergency latched, holds the fans the
-active profile controls at 40% or more if no CPU sensor is reachable for 5
-consecutive poll cycles; a fan whose curve can no longer be read keeps its last
+active profile controls at 40% or more if no CPU sensor has given a current
+reading for 5 seconds; a fan whose curve can no longer be read keeps its last
 speed, and fans no profile controls stay under their firmware curve. (An
 ARCTIC Fan Controller has no firmware curve: every write to it carries all
 ten channels, so once the daemon writes any of them, each channel reading 0
@@ -281,8 +281,11 @@ fan_curve interface is reachable.
 
 *ventulus-tray*(1), *ventulus*(1)
 
-_/usr/share/doc/ventulusd/USER_GUIDE.md_ -- setup, sensor drivers,
-configuration, troubleshooting.
+_/usr/share/doc/ventulusd/USER_GUIDE.md_ -- configuration, the service unit,
+profiles and the API, the conditions the daemon reports, the safety rules.
+
+https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/README.md -- installing, upgrading, the service, permissions and security, drivers,
+recovery, logs and bug reports, uninstalling.
 
 Project: https://github.com/Plan-B-Development/ventulusd
 

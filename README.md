@@ -36,39 +36,21 @@ upgrades with the rest of your system:
 | Debian 13, Ubuntu 26.04 LTS | `sudo apt install ventulusd` | `sudo apt update && sudo apt upgrade` |
 | Fedora 44, Fedora 45 | `sudo dnf install ventulusd` | `sudo dnf upgrade` |
 
-Add the repository first: the
-[pacman-repo README](https://github.com/Plan-B-Development/pacman-repo#readme) and
-the GUI's [Getting Started](https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#installation)
-have the steps (the key, its fingerprint and the repository entry), the signed
-bootstrap script for Arch, a tarball for Debian, Ubuntu and Fedora without a
-repository, one-off installs from a release with their Sigstore check, and the
+Add the repository first, and on Arch and Fedora enable the service afterwards
+(`sudo systemctl enable --now ventulusd`). The GUI manual's
+[Installing](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/install.md)
+has every step: the key and its fingerprint, the repository entry, the tarball,
+one-off installs from a release, a machine with no desktop (`ventulusd`, plus
+`ventulus-diag` for the diagnostic tests), what the packages set up, and the
 distributions that are not supported. Install `ventulus` instead for the desktop
-app; it pulls in the daemon.
-
-On Debian and Ubuntu the service is enabled and started as it installs. On Arch
-and Fedora, and from the tarball, enable it yourself:
-
-```bash
-sudo systemctl enable --now ventulusd
-```
-
-A headless machine needs only `ventulusd`; the tray starts only where `ventulus`
-is installed. Install a package rather than copying the binary: the unit, the
-hand-back script that runs after every stop, the sleep hook and the Super-I/O
-guard all come with it. To build the packages yourself or run your own build, see
-[`daemon/README.md`](https://github.com/Plan-B-Development/ventulusd/blob/main/daemon/README.md).
-
-Check that the daemon is answering:
-
-```bash
-curl --unix-socket /run/ventulus/ventulus.sock http://localhost/status
-```
+app; it pulls in the daemon. Install a package rather than copying the binary: the
+hand-back after every stop comes with the unit.
 
 ## Prerequisites
 
 The package loads the common Super-I/O drivers at boot
 (`/etc/modules-load.d/ventulus.conf`), so many machines need nothing more. They
-load from the next boot; [Getting Started § After installing][after-installing]
+load from the next boot; [Installing § After installing][after-installing]
 loads them without one. The GUI's **Hardware** page reports what yours needs. The
 usual extras:
 
@@ -81,14 +63,15 @@ usual extras:
 | A driver option for an ACPI resource conflict | A driver that fails with *Device or resource busy* | [Module parameters][module-params] |
 | A full power cut | A dual-chip Gigabyte board whose second fan chip has vanished | [Missing fan headers][missing-headers] |
 
-Stop any other fan tool (fancontrol, CoolerControl, CoreCtrl, fan2go) before your
-first profile or fan test: two programs writing one fan header fight each other,
-and the daemon gives each header back as it first found it, so a header the other
-tool still holds goes back to that tool's speed.
+Stop any other fan program before your first profile or fan test
+([the list][other-fan-software]): two programs writing one fan header fight each
+other, and the daemon gives each header back as it first found it, so a header the
+other program still holds goes back to that program's speed.
 [Migrating from Another Fan Program][migrating] covers the switch, and the
 [Setup Checklist][setup-checklist] walks through all of this in order.
 
-[after-installing]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/getting-started.md#after-installing
+[after-installing]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/install.md#after-installing
+[other-fan-software]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/drivers.md#other-fan-software
 [migrating]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/migrating.md
 [driver-setup]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md
 [secure-boot]: https://github.com/Plan-B-Development/ventulus/blob/main/manual/driver-setup.md#secure-boot-and-dkms-modules
@@ -112,8 +95,8 @@ It also owns thermal safety, and none of it can be turned off:
   least 105 °C, and up to 115 °C on a CPU that reports its own ceiling.
 - A coolant sensor at or above `[safety] coolant_limit_c` (60 °C by default) does
   the same until it is 5 °C cooler.
-- With no CPU reading for five polls, the active profile's fans are held at 40 %
-  or more.
+- With no current CPU reading for five seconds, the active profile's fans are
+  held at 40 % or more.
 - A pump is never stopped and never driven below 30 %, or 70 % on a header in DC
   mode. A pump that stalls is driven to 100 %.
 - When the daemon stops, every motherboard header and GPU fan curve it took goes
@@ -129,7 +112,8 @@ are in the [User Guide § Safety](https://github.com/Plan-B-Development/ventulus
 
 | Document | For | Covers |
 |---|---|---|
-| [User Guide](https://github.com/Plan-B-Development/ventulusd/blob/main/docs/USER_GUIDE.md) | operators | Sensor drivers, configuration, the service, profiles, the OpenFAN controller, GPU fans, safety, troubleshooting, uninstalling |
+| [Administration](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/README.md) | operators | The one place for installing, upgrading, the service, permissions and security, drivers and other fan software, the diagnostic command, recovery, logs and bug reports, known limits and uninstalling |
+| [User Guide](https://github.com/Plan-B-Development/ventulusd/blob/main/docs/USER_GUIDE.md) | operators, script authors | Reference: every configuration key, the service unit, profiles and their storage, setting fan speeds through the API, the OpenFAN controller, GPU fans, the conditions the daemon reports, the safety rules in full |
 | `man ventulusd`, `man ventulus-tray` | operators | Options, files, environment and signals |
 | [GUI manual](https://github.com/Plan-B-Development/ventulus/blob/main/manual/README.md) | everyone | Setting up and using Ventulus, driver setup, hardware troubleshooting |
 | [API contract](https://github.com/Plan-B-Development/ventulus/blob/main/docs/08_API_Integration_Contract.md) | script and client authors | Every endpoint, payload, error code and capability flag |

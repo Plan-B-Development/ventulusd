@@ -94,7 +94,10 @@ post_install() {
 
    Start now:        sudo systemctl enable --now ventulusd
    Load modules:     sudo systemctl restart systemd-modules-load   (or reboot)
-   Setup guide:      /usr/share/doc/ventulusd/USER_GUIDE.md
+   Administration:   https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/README.md
+                     (install, service, security, drivers, recovery, removal)
+   Reference:        /usr/share/doc/ventulusd/USER_GUIDE.md
+   No desktop?       ventulus-diag runs the diagnostic tests without the GUI
    Command, files:   man ventulusd
    Hardware check:   open the GUI -> Hardware page
 
@@ -111,8 +114,8 @@ post_install() {
    discovered but never responds, one of these is usually missing:
      * Super I/O driver: motherboard headers need the matching chip driver
                          (e.g. it87-dkms-git / nct6687d-dkms-git — see the
-                         package optdepends and USER_GUIDE.md, "Hardware
-                         sensor modules").
+                         package optdepends and the administration section's
+                         "Drivers and Other Fan Software").
      * ACPI conflict:    an it87 chip (Gigabyte; ASUS AM4) may need
                          'options it87 ignore_resource_conflict=1' in
                          /etc/modprobe.d/it87.conf to bind. The Nuvoton
@@ -245,6 +248,11 @@ post_remove() {
     if [[ -f /etc/systemd/system/ventulusd.service.d/nvidia-telemetry.conf ]]; then
         echo ":: Opt-in NVIDIA telemetry drop-in left in place:"
         echo "   /etc/systemd/system/ventulusd.service.d/nvidia-telemetry.conf"
+        echo "   Remove it manually (it was installed by hand, not by the package)."
+    fi
+    if [[ -f /etc/systemd/system/ventulusd.service.d/openfan-firmware-write.conf ]]; then
+        echo ":: Opt-in OpenFAN firmware-write drop-in left in place:"
+        echo "   /etc/systemd/system/ventulusd.service.d/openfan-firmware-write.conf"
         echo "   Remove it manually (it was installed by hand, not by the package)."
     fi
 }

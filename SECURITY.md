@@ -49,6 +49,12 @@ The systemd unit applies a hardening set (`ProtectSystem=strict`,
 `SystemCallFilter=@system-service`, etc.). See
 `packaging/ventulusd.service` for the full list.
 
+This section is for reporting a vulnerability. For running the daemon (who can do
+what over the open socket, device access, the opt-in drop-ins and what each one
+grants, and what never to loosen), see
+[Permissions and Security](https://github.com/Plan-B-Development/ventulus/blob/main/manual/admin/security.md)
+in the GUI manual's administration section.
+
 ## Supported versions
 
 | Version | Supported |
