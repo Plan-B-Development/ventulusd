@@ -5,6 +5,11 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+## [5.5.0] — 2026-11-03
+
+Pairs with `ventulus` >= v2.23.0; ventulus 6.0.0 is the matching GUI release, and its
+`ventulus-diag` starts the tests this release now names in the journal.
+
 ### Added
 
 - **The journal names every test that changes fan speeds, and who asked for it.** A request
