@@ -82,6 +82,51 @@ where
     (handle, rx)
 }
 
+/// The signals that stop the daemon (SIGTERM, SIGINT) or reload it (SIGHUP),
+/// each `None` when the kernel refused its handler.
+///
+/// [SAFETY] DEC-502: registered by [`StopSignals::register`] just before the
+/// profile engine — the only fan writer — is spawned, and handed to
+/// [`wait_for_stop`]. Until then the SIGTERM handler was registered after the
+/// engine started and SIGINT's only when the wait first polled, so a stop in
+/// that window took the default action and killed the process with no
+/// in-process hand-back. A signal that arrives after registration is queued
+/// until the wait polls, so it takes the ordinary stop.
+#[derive(Default)]
+struct StopSignals {
+    hup: Option<tokio::signal::unix::Signal>,
+    term: Option<tokio::signal::unix::Signal>,
+    int: Option<tokio::signal::unix::Signal>,
+}
+
+impl StopSignals {
+    /// Register all three. Fail-soft, each on its own: a refused handler is
+    /// logged and left `None`, and the daemon still stops on the others.
+    fn register() -> Self {
+        use tokio::signal::unix::{signal, SignalKind};
+        let one = |kind: SignalKind, name: &str, without: &str| match signal(kind) {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                log::warn!("Failed to register the {name} handler, {without}: {e}");
+                None
+            }
+        };
+        Self {
+            hup: one(SignalKind::hangup(), "SIGHUP", "config reload unavailable"),
+            term: one(
+                SignalKind::terminate(),
+                "SIGTERM",
+                "only SIGINT will trigger graceful shutdown",
+            ),
+            int: one(
+                SignalKind::interrupt(),
+                "SIGINT",
+                "only SIGTERM will trigger graceful shutdown",
+            ),
+        }
+    }
+}
+
 /// Why the main loop stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StopReason {
@@ -122,12 +167,17 @@ struct StopOutcome {
 /// Leaving that sweep at the call site would have left the one property most
 /// worth pinning outside the tested unit.
 ///
-/// `sighup`/`sigterm` are `Option` because registration is fail-soft on the real
-/// path; tests pass `None` and drive the death channels directly. `ctrl_c` has no
-/// such switch, and simply never fires under test.
+/// The signals are `Option` because registration is fail-soft on the real path
+/// ([`StopSignals::register`]); tests pass `None` and drive the death channels
+/// directly. SIGINT is a registered stream like the other two (DEC-502), not
+/// `tokio::signal::ctrl_c()`, which installed its handler only when this loop
+/// first polled — a Ctrl-C before that killed the process with no hand-back.
 async fn wait_for_stop(
-    mut sighup: Option<tokio::signal::unix::Signal>,
-    mut sigterm: Option<tokio::signal::unix::Signal>,
+    StopSignals {
+        hup: mut sighup,
+        term: mut sigterm,
+        int: mut sigint,
+    }: StopSignals,
     ipc_dead_rx: tokio::sync::oneshot::Receiver<String>,
     engine_dead_rx: tokio::sync::oneshot::Receiver<()>,
     hwmon_dead_rx: tokio::sync::oneshot::Receiver<()>,
@@ -142,7 +192,7 @@ async fn wait_for_stop(
 
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = async { sigint.as_mut().expect("guarded by if predicate").recv().await }, if sigint.is_some() => {
                 log::info!("Received SIGINT — shutting down");
                 reason = StopReason::Signal("SIGINT");
                 break;
@@ -564,6 +614,56 @@ static INSTANCE_LOCK: OnceLock<single_instance::InstanceGuard> = OnceLock::new()
 fn release_instance_lock() {
     if let Some(guard) = INSTANCE_LOCK.get() {
         guard.release();
+    }
+}
+
+/// The hand-back records' lock (DEC-502), parked like [`INSTANCE_LOCK`] and
+/// released at the same point of a graceful stop, once the hardware has been
+/// handed back: from then on `ExecStopPost` may replay what a wedged write left.
+static RECORD_LOCK: OnceLock<single_instance::InstanceGuard> = OnceLock::new();
+
+/// Release the records' lock at the end of a graceful stop. See [`RECORD_LOCK`].
+fn release_record_lock() {
+    if let Some(guard) = RECORD_LOCK.get() {
+        guard.release();
+    }
+}
+
+/// Claim the hand-back records in `dir` (DEC-502): `Some` when this process now
+/// owns them and may write them, `None` — logged once, here — when it keeps
+/// none. Without a record the daemon still hands back everything on every stop
+/// it survives; only the crash backstop is lost.
+///
+/// Called after the single-instance lock and the socket bind, so a start refused
+/// as another instance has written nothing to the runtime directory (DEC-487).
+fn claim_hand_back_records(dir: &Path) -> Option<single_instance::InstanceGuard> {
+    if !dir.is_dir() {
+        log::warn!(
+            "no runtime directory at {} — no hand-back record is kept, so after a crash \
+             ExecStopPost cannot give back the headers or reset the GPU fan curves this \
+             daemon takes",
+            dir.display()
+        );
+        return None;
+    }
+    match handback::claim_records(dir) {
+        Ok(guard) => Some(guard),
+        Err(single_instance::AcquireError::AlreadyRunning { path }) => {
+            log::warn!(
+                "another ventulusd holds {} and owns the hand-back records beside it — \
+                 this daemon keeps none, so after a crash ExecStopPost cannot give back \
+                 what it takes. Two daemons are writing these fans: stop one of them.",
+                path.display()
+            );
+            None
+        }
+        Err(e @ single_instance::AcquireError::Unavailable { .. }) => {
+            log::warn!(
+                "{e} — no hand-back record is kept, so after a crash ExecStopPost cannot \
+                 give back what this daemon takes"
+            );
+            None
+        }
     }
 }
 
@@ -1621,17 +1721,10 @@ fn reset_driven_gpu_fans(ledger: &PmfwHandBack, write_timeout: Duration) -> bool
 
 /// Keep the PMFW hand-back record in the unit's runtime directory (DEC-435),
 /// where `ventulus-restore-auto` — `ExecStopPost` — replays it after a crash.
-/// The same directory and the same fallback as [`keep_handback_record`].
-fn keep_pmfw_record(ledger: &PmfwHandBack) {
-    let dir = handback::runtime_dir();
-    if dir.is_dir() {
+/// The same directory and the same rule as [`keep_handback_record`].
+fn keep_pmfw_record(ledger: &PmfwHandBack, owned_dir: Option<&Path>) {
+    if let Some(dir) = owned_dir {
         ledger.set_record_path(dir.join(PMFW_RECORD_FILE_NAME));
-    } else {
-        log::warn!(
-            "no runtime directory at {} — the PMFW hand-back record is not kept, so \
-             after a crash ExecStopPost cannot reset the GPU fan curves the daemon drove",
-            dir.display()
-        );
     }
 }
 
@@ -1755,19 +1848,13 @@ fn restore_panic_targets(targets: &'static PanicRestoreTargets, timeout: Duratio
 /// `ventulus-restore-auto` — `ExecStopPost` — replays it after a crash.
 ///
 /// `$RUNTIME_DIRECTORY` is what systemd sets for `RuntimeDirectory=ventulus`;
-/// the literal is the same directory for a daemon run by hand. Without one the
-/// daemon still gives headers back itself on every exit it survives — only the
-/// crash backstop is lost, and the log says so once, here.
-fn keep_handback_record(ledger: &Arc<HandBackLedger>) {
-    let dir = handback::runtime_dir();
-    if dir.is_dir() {
+/// the literal is the same directory for a daemon run by hand. Kept only in a
+/// directory whose records this process owns (`owned_dir`, DEC-502). Without
+/// one the daemon still gives headers back itself on every exit it survives —
+/// only the crash backstop is lost, and [`claim_hand_back_records`] says so once.
+fn keep_handback_record(ledger: &Arc<HandBackLedger>, owned_dir: Option<&Path>) {
+    if let Some(dir) = owned_dir {
         ledger.set_record_path(dir.join(handback::RECORD_FILE_NAME));
-    } else {
-        log::warn!(
-            "no runtime directory at {} — the hwmon hand-back record is not kept, so \
-             after a crash ExecStopPost cannot give back the headers the daemon holds",
-            dir.display()
-        );
     }
 }
 
@@ -2109,6 +2196,7 @@ fn join_with(
 #[allow(clippy::too_many_arguments)]
 async fn finish_shutdown<F>(
     notifier: Option<&ventulusd::sd_notify::Notifier>,
+    cache: &StateCache,
     poll_shutdown_tx: &tokio::sync::watch::Sender<bool>,
     server_shutdown_tx: tokio::sync::oneshot::Sender<()>,
     server_handle: tokio::task::JoinHandle<()>,
@@ -2119,7 +2207,14 @@ async fn finish_shutdown<F>(
 ) where
     F: FnOnce(),
 {
-    // [SAFETY] DEC-387: FIRST, before the engine is told to stop. systemd re-arms
+    // [SAFETY] DEC-502: the very first step. A GPU fan test waiting out its
+    // settle is woken and restores the card now, inside the server drain below,
+    // and from here on no GPU write but a hand-back is made — so nothing in this
+    // process puts a curve back on a card after the restore resets it. A lock
+    // and an atomic store: it cannot delay what follows.
+    cache.begin_shutdown();
+
+    // [SAFETY] DEC-387: before the engine is told to stop. systemd re-arms
     // its watchdog on any keep-alive whatever the unit's state, and the engine
     // completes ticks until `shutdown_sequence` stops it — so without this, one
     // late tick would arm a fresh `WatchdogSec` timer over the hardware restore
@@ -2163,6 +2258,10 @@ async fn finish_shutdown<F>(
     )
     .await;
 
+    // DEC-502: this process's own hand-back has run, so the records are no
+    // longer its to guard. ExecStopPost may now replay whatever a wedged write
+    // left on them. See `RECORD_LOCK`.
+    release_record_lock();
     // DEC-467: every writer has stopped and the hardware is handed back, so a
     // restarted daemon may start now, even if a leaked blocking thread keeps this
     // process alive. See `INSTANCE_LOCK`.
@@ -2378,6 +2477,17 @@ async fn async_main(cli: CliOptions) {
     // another daemon serves on the socket or binds it first (LIFE-a).
     let listener = preflight_socket(&config);
 
+    // DEC-502: the hand-back records are this process's from here — or none
+    // are kept, when another daemon holds them. After the bind, the last step
+    // that can refuse a start as another instance.
+    let record_dir = {
+        let dir = handback::runtime_dir();
+        claim_hand_back_records(&dir).map(|guard| {
+            let _ = RECORD_LOCK.set(guard);
+            dir
+        })
+    };
+
     // Configurable startup delay — wait for hardware to appear after boot
     let startup_delay = effective_startup_delay(config.startup.delay_secs);
     if startup_delay > 0 {
@@ -2408,6 +2518,10 @@ async fn async_main(cli: CliOptions) {
     let cache = Arc::new(StateCache::new());
     if let Some(n) = &notifier {
         cache.attach_notifier(Arc::clone(n));
+    }
+    // DEC-502: for the legacy GPU verify, which writes its record by path.
+    if let Some(dir) = &record_dir {
+        cache.set_hand_back_record_dir(dir.clone());
     }
     // DEC-388: the exit floor in force until an API write or a SIGHUP changes it.
     cache.set_exit_floor_pct(config.shutdown.exit_floor_pct);
@@ -2595,7 +2709,7 @@ async fn async_main(cli: CliOptions) {
                 Box::new(RealSysfsWriter),
                 cache.clone(),
             );
-            keep_handback_record(ctrl.handback());
+            keep_handback_record(ctrl.handback(), record_dir.as_deref());
             hwmon_handback = Some(ctrl.handback().clone());
             Some(ventulusd::api::hwmon_handle::HwmonHandle::new(ctrl))
         }
@@ -2727,7 +2841,7 @@ async fn async_main(cli: CliOptions) {
         }
     }
     if amd_gpus.iter().any(|g| g.fan_curve_path.is_some()) {
-        keep_pmfw_record(cache.gpu_handback());
+        keep_pmfw_record(cache.gpu_handback(), record_dir.as_deref());
     }
 
     // Detect Intel discrete GPUs (DEC-121). Read-only monitoring — temps +
@@ -2996,6 +3110,14 @@ async fn async_main(cli: CliOptions) {
     // which a panic-unwind triggers just as a normal return does — and the main
     // loop turns that into the same restore-to-automatic shutdown a SIGTERM
     // would, then exits non-zero so systemd restarts us with a live engine.
+    //
+    // [SAFETY] DEC-502: the stop signals are registered FIRST. The engine is the
+    // only fan writer, so from its first tick a SIGTERM or SIGINT must reach the
+    // ordinary stop; one that arrives before `wait_for_stop` polls is queued and
+    // handled there. Not earlier: until here nothing has written a fan, and a
+    // stop during discovery or the startup delay should still end the process
+    // at once.
+    let stop_signals = StopSignals::register();
     let (engine_handle, engine_dead_rx) = {
         let engine_cache = cache.clone();
         let engine_profile = active_profile.clone();
@@ -3234,11 +3356,10 @@ async fn async_main(cli: CliOptions) {
     // SIGTERM is what systemd sends on `systemctl stop` by default. Without
     // a handler the kernel terminates the process before the in-process
     // graceful path below (`shutdown_tx.send`, GPU reset, hwmon restore,
-    // server join) can run; external safety still works via the
-    // ExecStopPost restore script, but the in-line cleanup is silently
-    // skipped. SIGHUP and SIGTERM registrations are both fail-soft: if the
-    // kernel refuses (rare — typically only happens under unusual sandbox
-    // policies), the daemon still terminates cleanly on SIGINT.
+    // server join) can run. The handlers were registered before the engine
+    // was spawned (`stop_signals`, DEC-502), each fail-soft: if the kernel
+    // refuses one (rare — typically only under unusual sandbox policies), the
+    // daemon still stops cleanly on the other.
     // DEC-266/267: set when the loop breaks because a task the daemon cannot
     // function without ended — the profile engine (sole PWM writer) or the hwmon
     // poll loop (sole writer of the sensor map the thermal-emergency rule reads). Drives a
@@ -3246,26 +3367,6 @@ async fn async_main(cli: CliOptions) {
     // `TS-bf`: every SIGHUP reload still running, drained by the stop below.
     let mut pending_reloads: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let stop = {
-        use tokio::signal::unix::SignalKind;
-
-        let sighup = match tokio::signal::unix::signal(SignalKind::hangup()) {
-            Ok(stream) => Some(stream),
-            Err(e) => {
-                log::warn!("Failed to register SIGHUP handler, config reload unavailable: {e}");
-                None
-            }
-        };
-        let sigterm = match tokio::signal::unix::signal(SignalKind::terminate()) {
-            Ok(stream) => Some(stream),
-            Err(e) => {
-                log::warn!(
-                    "Failed to register SIGTERM handler, only SIGINT will trigger graceful \
-                     shutdown: {e}"
-                );
-                None
-            }
-        };
-
         // TS-ao (DEC-396): the sleep hook's signals, before READY=1 so an active
         // unit always answers them. Only under systemd — the hook reaches the
         // daemon through the unit's MainPID and runtime directory.
@@ -3283,8 +3384,7 @@ async fn async_main(cli: CliOptions) {
         }
 
         wait_for_stop(
-            sighup,
-            sigterm,
+            stop_signals,
             ipc_dead_rx,
             engine_dead_rx,
             hwmon_dead_rx,
@@ -3373,6 +3473,7 @@ async fn async_main(cli: CliOptions) {
 
     finish_shutdown(
         notifier.as_deref(),
+        &app_state.cache,
         &poll_shutdown_tx,
         shutdown_tx,
         server_handle,
@@ -3503,7 +3604,7 @@ mod tests {
         let ((_ipc_tx, ipc_rx), (engine_tx, engine_rx), (_hw_tx, hw_rx)) = stop_channels();
         engine_tx.send(()).unwrap();
 
-        let out = wait_for_stop(None, None, ipc_rx, engine_rx, hw_rx, || {}).await;
+        let out = wait_for_stop(StopSignals::default(), ipc_rx, engine_rx, hw_rx, || {}).await;
 
         assert_eq!(out.reason, StopReason::EngineDead);
         assert!(out.must_restart, "a dead engine must force a restart");
@@ -3516,7 +3617,7 @@ mod tests {
         let ((_ipc_tx, ipc_rx), (_engine_tx, engine_rx), (hw_tx, hw_rx)) = stop_channels();
         hw_tx.send(()).unwrap();
 
-        let out = wait_for_stop(None, None, ipc_rx, engine_rx, hw_rx, || {}).await;
+        let out = wait_for_stop(StopSignals::default(), ipc_rx, engine_rx, hw_rx, || {}).await;
 
         assert_eq!(out.reason, StopReason::HwmonDead);
         assert!(out.must_restart, "a dead poll loop must force a restart");
@@ -3529,7 +3630,7 @@ mod tests {
         let ((ipc_tx, ipc_rx), (_engine_tx, engine_rx), (_hw_tx, hw_rx)) = stop_channels();
         ipc_tx.send("socket closed".into()).unwrap();
 
-        let out = wait_for_stop(None, None, ipc_rx, engine_rx, hw_rx, || {}).await;
+        let out = wait_for_stop(StopSignals::default(), ipc_rx, engine_rx, hw_rx, || {}).await;
 
         assert_eq!(out.reason, StopReason::IpcDead);
         assert!(
@@ -3555,7 +3656,7 @@ mod tests {
             ipc_tx.send("socket closed".into()).unwrap();
             engine_tx.send(()).unwrap();
 
-            let out = wait_for_stop(None, None, ipc_rx, engine_rx, hw_rx, || {}).await;
+            let out = wait_for_stop(StopSignals::default(), ipc_rx, engine_rx, hw_rx, || {}).await;
 
             assert!(
                 out.must_restart,
@@ -3577,9 +3678,18 @@ mod tests {
         let reloads = Arc::new(AtomicUsize::new(0));
         let counter = reloads.clone();
         let task = tokio::spawn(async move {
-            wait_for_stop(Some(sighup), None, ipc_rx, engine_rx, hw_rx, move || {
-                counter.fetch_add(1, Ordering::SeqCst);
-            })
+            wait_for_stop(
+                StopSignals {
+                    hup: Some(sighup),
+                    ..StopSignals::default()
+                },
+                ipc_rx,
+                engine_rx,
+                hw_rx,
+                move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                },
+            )
             .await
         });
 
@@ -4905,6 +5015,226 @@ mod tests {
         );
     }
 
+    // ── DEC-502: the stop the daemon handles needs nothing from ExecStopPost ──
+
+    /// [SAFETY] G4: the stop signals are live before the profile engine — the
+    /// only fan writer — is spawned, and are the ones the loop waits on. A stop
+    /// registered after the spawn left a window in which SIGTERM killed the
+    /// process with no hand-back; SIGINT had a handler only once the loop first
+    /// polled (`ctrl_c()`), and no code line may bring that back.
+    #[test]
+    fn the_stop_signals_are_live_before_the_engine_writes_a_fan() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+        let body = &src[src
+            .find("async fn async_main(cli: CliOptions) {")
+            .expect("async_main")..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("async_main no longer contains `{needle}`"))
+        };
+        assert_eq!(
+            src.matches("StopSignals::register()").count(),
+            1,
+            "registered in exactly one place"
+        );
+        let registered = at("let stop_signals = StopSignals::register();");
+        assert!(
+            registered < at("profile_engine::profile_engine_loop("),
+            "the signals must be registered before the engine is spawned"
+        );
+        assert!(registered < at("wait_for_stop(\n            stop_signals,"));
+        // Not before the first hardware discovery either: a stop during the
+        // startup delay or a slow probe must still end the process at once.
+        assert!(at("discover_pwm_headers(") < registered);
+        let code_calls_ctrl_c = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .any(|l| l.contains("ctrl_c("));
+        assert!(!code_calls_ctrl_c, "SIGINT must be a registered stream");
+        assert!(
+            !body.contains("signal(SignalKind::"),
+            "no other stop-signal registration in async_main"
+        );
+    }
+
+    /// Env var naming the signal the early-signal probe child raises.
+    const EARLY_SIGNAL_PROBE: &str = "VENTULUS_EARLY_SIGNAL_PROBE";
+
+    /// [SAFETY] G4, the mechanism: a stop signal that arrives after
+    /// `StopSignals::register` and before `wait_for_stop` first polls — the
+    /// window between the engine's spawn and the loop — is queued and ends the
+    /// loop as an ordinary stop. Run in a re-executed child, so a signal that
+    /// reached its default action kills only the child: exit code `None`. For
+    /// SIGINT that is what `ctrl_c()`, registered only on the first poll, did.
+    #[test]
+    fn a_stop_signal_sent_before_the_loop_waits_takes_the_ordinary_stop() {
+        if let Ok(which) = std::env::var(EARLY_SIGNAL_PROBE) {
+            let (signo, name) = match which.as_str() {
+                "SIGINT" => (libc::SIGINT, "SIGINT"),
+                _ => (libc::SIGTERM, "SIGTERM"),
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("child runtime");
+            let outcome = runtime.block_on(async move {
+                let signals = StopSignals::register();
+                // SAFETY: `raise` is async-signal-safe; the handler is installed.
+                unsafe { libc::raise(signo) };
+                let ((_ipc_tx, ipc_rx), (_engine_tx, engine_rx), (_hw_tx, hw_rx)) = stop_channels();
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    wait_for_stop(signals, ipc_rx, engine_rx, hw_rx, || {}),
+                )
+                .await
+            });
+            let ordinary =
+                outcome.is_ok_and(|o| o.reason == StopReason::Signal(name) && !o.must_restart);
+            std::process::exit(if ordinary { 0 } else { 98 });
+        }
+
+        for which in ["SIGINT", "SIGTERM"] {
+            // `run_probe_child` passes its path argument as the env value.
+            let status = run_probe_child(
+                "tests::a_stop_signal_sent_before_the_loop_waits_takes_the_ordinary_stop",
+                EARLY_SIGNAL_PROBE,
+                std::path::Path::new(which),
+            );
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "{which}: {status:?} — no exit code means the signal killed the process \
+                 before any hand-back; 98 means the loop did not see it as a stop"
+            );
+        }
+    }
+
+    /// [SAFETY] G1/G2: the stop flag is the stop's FIRST step, ahead of the
+    /// server drain. The server here is an in-flight GPU fan test in its settle:
+    /// it ends only when the flag wakes it, which must happen inside the drain's
+    /// bound — and so before the restore — not after the drain has timed out.
+    #[tokio::test]
+    async fn the_stop_flag_wakes_a_fan_test_before_the_server_drain_times_out() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cache = Arc::new(StateCache::new());
+        let (poll_tx, _poll_rx) = tokio::sync::watch::channel(false);
+        let (server_tx, server_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_done = Arc::new(AtomicBool::new(false));
+        let (settling, done) = (cache.clone(), server_done.clone());
+        let server_handle = tokio::spawn(async move {
+            let _hold = server_rx;
+            // Self-releasing: a run with the flag set late still ends in 10 s.
+            let woken = tokio::task::spawn_blocking(move || {
+                !settling.sleep_unless_shutdown(Duration::from_secs(10))
+            })
+            .await
+            .unwrap();
+            done.store(woken, Ordering::SeqCst);
+        });
+        let finished_first = Arc::new(AtomicBool::new(false));
+        let (seen, done) = (finished_first.clone(), server_done.clone());
+        let started = Instant::now();
+        finish_shutdown(
+            None,
+            &cache,
+            &poll_tx,
+            server_tx,
+            server_handle,
+            vec![],
+            Duration::from_secs(3),
+            false,
+            move || seen.store(done.load(Ordering::SeqCst), Ordering::SeqCst),
+        )
+        .await;
+
+        assert!(cache.shutdown_begun());
+        assert!(
+            finished_first.load(Ordering::SeqCst),
+            "the fan test must be woken and done before the restore runs"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the drain waited out its bound: the flag came after it"
+        );
+    }
+
+    /// [SAFETY] G3, the daemon's half: the records are claimed only when nobody
+    /// else holds them, and a daemon that cannot claim them keeps none. A
+    /// missing runtime directory keeps none either.
+    #[test]
+    fn the_hand_back_records_are_claimed_only_when_free() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(claim_hand_back_records(&dir.path().join("missing")).is_none());
+        let first = claim_hand_back_records(dir.path()).expect("free");
+        assert!(
+            claim_hand_back_records(dir.path()).is_none(),
+            "another owner holds them"
+        );
+        first.release();
+        assert!(claim_hand_back_records(dir.path()).is_some(), "free again");
+
+        // Without a claim, no record is written.
+        let ledger = Arc::new(HandBackLedger::new(&[]));
+        keep_handback_record(&ledger, None);
+        let pmfw = PmfwHandBack::default();
+        keep_pmfw_record(&pmfw, None);
+        assert!(!dir.path().join(handback::RECORD_FILE_NAME).exists());
+        assert!(!dir.path().join(PMFW_RECORD_FILE_NAME).exists());
+        // The opposite branch: with one, both are written at once.
+        keep_handback_record(&ledger, Some(dir.path()));
+        keep_pmfw_record(&pmfw, Some(dir.path()));
+        assert!(dir.path().join(handback::RECORD_FILE_NAME).exists());
+        assert!(dir.path().join(PMFW_RECORD_FILE_NAME).exists());
+    }
+
+    /// [SAFETY] G3, the wiring: claimed after the socket bind (a start refused as
+    /// another instance writes nothing to the runtime directory, DEC-487) and
+    /// before any record can be written; every record keeper is handed the
+    /// claimed directory, never `runtime_dir()` itself; and the lock is released
+    /// only after the stop's own hand-back, beside the instance lock.
+    #[test]
+    fn the_records_are_claimed_before_they_are_written_and_released_after_the_hand_back() {
+        let whole = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+        let src = whole
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .expect("main.rs has a #[cfg(test)] module");
+        let body = &src[src
+            .find("async fn async_main(cli: CliOptions) {")
+            .expect("async_main")..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("async_main no longer contains `{needle}`"))
+        };
+        let claim = at("claim_hand_back_records(&dir)");
+        assert!(at("let listener = preflight_socket(&config);") < claim);
+        for later in [
+            "cache.set_hand_back_record_dir(",
+            "keep_handback_record(ctrl.handback(), record_dir.as_deref());",
+            "keep_pmfw_record(cache.gpu_handback(), record_dir.as_deref());",
+            "profile_engine::profile_engine_loop(",
+            "server::serve(",
+        ] {
+            assert!(claim < at(later), "the claim must precede `{later}`");
+        }
+        let finish = &src[src.find("async fn finish_shutdown<F>(").unwrap()..];
+        let finish = &finish[..finish.find("\n}\n").unwrap()];
+        let pos = |needle: &str| {
+            finish
+                .find(needle)
+                .unwrap_or_else(|| panic!("finish_shutdown no longer contains `{needle}`"))
+        };
+        assert!(pos("cache.begin_shutdown();") < pos("shutdown_sequence("));
+        assert!(pos("shutdown_sequence(") < pos("release_record_lock();"));
+        assert!(pos("release_record_lock();") < pos("if must_restart {"));
+        assert_eq!(src.matches("release_record_lock();").count(), 1);
+        assert_eq!(src.matches("cache.begin_shutdown();").count(), 1);
+    }
+
     /// A search dir holding `good.json` (loads), `bad.json` (does not), and a
     /// saved state pointing at `saved.json` (loads).
     fn startup_fixture() -> (tempfile::TempDir, daemon_state::DaemonState) {
@@ -5192,8 +5522,11 @@ mod tests {
             let outcome = tokio::time::timeout(
                 Duration::from_secs(5),
                 wait_for_stop(
-                    Some(sighup),
-                    Some(sigterm),
+                    StopSignals {
+                        hup: Some(sighup),
+                        term: Some(sigterm),
+                        int: None,
+                    },
                     ipc_rx,
                     engine_rx,
                     hw_rx,
@@ -5294,6 +5627,7 @@ mod tests {
         let seen = at_restore.clone();
         finish_shutdown(
             Some(&notifier),
+            &StateCache::new(),
             &poll_tx,
             server_tx,
             server_handle,
@@ -5395,6 +5729,7 @@ mod tests {
         let reader = read_in_the_drain_phase(poll_rx, Arc::clone(&rx), Arc::clone(&in_drains));
         finish_shutdown(
             Some(&notifier),
+            &StateCache::new(),
             &poll_tx,
             server_tx,
             server_handle,
@@ -5440,6 +5775,7 @@ mod tests {
         let seen = at_restore.clone();
         finish_shutdown(
             Some(&notifier),
+            &StateCache::new(),
             &poll_tx,
             server_tx,
             server_handle,
@@ -5572,7 +5908,7 @@ mod tests {
         for before in [
             "profile_engine::profile_engine_loop(",
             "server::serve(",
-            "SignalKind::terminate()",
+            "let stop_signals = StopSignals::register();",
             "start_sleep_watch(n);",
         ] {
             assert!(
@@ -5582,7 +5918,7 @@ mod tests {
             );
         }
         assert!(
-            ready < at("wait_for_stop(\n            sighup,"),
+            ready < at("wait_for_stop(\n            stop_signals,"),
             "READY=1 must be sent before the main loop starts waiting"
         );
 
@@ -5682,6 +6018,7 @@ mod tests {
             });
             finish_shutdown(
                 None,
+                &StateCache::new(),
                 &poll_tx,
                 server_tx,
                 server_handle,

@@ -238,6 +238,36 @@ pub struct StateCache {
     /// Its own lock, apart from `inner`. Lock order: taken under the hwmon
     /// controller's mutex, never held while taking it.
     abandoned_by_diagnostic: parking_lot::Mutex<std::collections::BTreeSet<String>>,
+    /// [SAFETY] DEC-502: the stop has begun. See [`ShutdownFlag`].
+    shutdown: ShutdownFlag,
+    /// [SAFETY] DEC-502: the runtime directory whose hand-back records this
+    /// process owns — set by `main` once it holds the records' lock, and never
+    /// otherwise. Unset, this daemon writes no record: another daemon owns them,
+    /// or there is no runtime directory. Read by the legacy GPU verify, which
+    /// writes its record by path; the hwmon and PMFW lists are handed theirs by
+    /// `main` directly.
+    hand_back_record_dir: std::sync::OnceLock<std::path::PathBuf>,
+}
+
+/// [SAFETY] DEC-502: set once, as the stop's first step, and never cleared.
+///
+/// Two things read it. A GPU fan test waits on it ([`StateCache::
+/// sleep_unless_shutdown`]), so a stop wakes it and it restores the card at
+/// once, inside the server drain, rather than finishing its settle after the
+/// stop's GPU reset has run. And every GPU write that is not a hand-back checks
+/// it under the GPU write lock and is refused once it is set — an engine curve,
+/// a test speed, a fan test's restore to a fixed speed — so nothing in this
+/// process puts a curve back on a card after the stop has reset it. The hwmon
+/// headers have had the same rule since DEC-420 (`PTR-s`), keyed on the ledger.
+///
+/// An atomic for the lock-free reads, and a mutex and condition variable only so
+/// a waiter cannot miss the wake-up: the setter stores the flag while holding
+/// the mutex, and a waiter checks it under the same mutex before it waits.
+#[derive(Default)]
+struct ShutdownFlag {
+    begun: AtomicBool,
+    lock: parking_lot::Mutex<()>,
+    wake: parking_lot::Condvar,
 }
 
 impl StateCache {
@@ -262,7 +292,60 @@ impl StateCache {
                 crate::constants::DEFAULT_COOLANT_LIMIT_C,
             ),
             abandoned_by_diagnostic: parking_lot::Mutex::default(),
+            shutdown: ShutdownFlag::default(),
+            hand_back_record_dir: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Record that this process owns the hand-back records in `dir` (DEC-502).
+    /// Called once, by `main`; returns `false` if already set, a wiring bug.
+    pub fn set_hand_back_record_dir(&self, dir: std::path::PathBuf) -> bool {
+        self.hand_back_record_dir.set(dir).is_ok()
+    }
+
+    /// The runtime directory whose hand-back records this process owns, if any.
+    pub fn hand_back_record_dir(&self) -> Option<&std::path::Path> {
+        self.hand_back_record_dir
+            .get()
+            .map(std::path::PathBuf::as_path)
+    }
+
+    /// [SAFETY] DEC-502: mark the stop as begun and wake every
+    /// [`Self::sleep_unless_shutdown`]. Called once, as the stop's first step;
+    /// there is no way back.
+    pub fn begin_shutdown(&self) {
+        let _held = self.shutdown.lock.lock();
+        self.shutdown.begun.store(true, Ordering::SeqCst);
+        self.shutdown.wake.notify_all();
+    }
+
+    /// True once the stop has begun. From then on no GPU write but a hand-back
+    /// may run (DEC-502).
+    pub fn shutdown_begun(&self) -> bool {
+        self.shutdown.begun.load(Ordering::SeqCst)
+    }
+
+    /// Block this thread for `span`, or until the stop begins, whichever comes
+    /// first. Returns `true` when the whole span elapsed, `false` when the stop
+    /// cut it short — including a stop that had begun before the call.
+    ///
+    /// For the GPU fan test's settle, which runs inside `spawn_blocking`: an
+    /// async sleep there would reintroduce the cancellation point DEC-297
+    /// removed, and `thread::sleep` could not be woken (DEC-502).
+    pub fn sleep_unless_shutdown(&self, span: std::time::Duration) -> bool {
+        let deadline = Instant::now() + span;
+        let mut held = self.shutdown.lock.lock();
+        while !self.shutdown.begun.load(Ordering::SeqCst) {
+            if self
+                .shutdown
+                .wake
+                .wait_until(&mut held, deadline)
+                .timed_out()
+            {
+                return !self.shutdown.begun.load(Ordering::SeqCst);
+            }
+        }
+        false
     }
 
     /// Record that a diagnostic wrote `header_id` and ended without its restore
@@ -1879,6 +1962,53 @@ mod tests {
             1,
             "the next failure starts a new run"
         );
+    }
+
+    // ── DEC-502: the stop's flag, and the settle it wakes ──
+
+    /// The opposite branch first: with no stop, the settle runs its whole span.
+    #[test]
+    fn with_no_stop_the_settle_runs_its_whole_span() {
+        let cache = StateCache::new();
+        let span = std::time::Duration::from_millis(120);
+        let started = Instant::now();
+        assert!(cache.sleep_unless_shutdown(span), "nothing cut it short");
+        assert!(started.elapsed() >= span);
+        assert!(!cache.shutdown_begun());
+    }
+
+    /// [SAFETY] A stop that begins mid-settle wakes it at once. The span is far
+    /// longer than the bound, so a settle that slept it out reds here.
+    #[test]
+    fn a_stop_wakes_a_settle_at_once() {
+        let cache = Arc::new(StateCache::new());
+        let sleeper = {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let whole = cache.sleep_unless_shutdown(std::time::Duration::from_secs(30));
+                (whole, started.elapsed())
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cache.begin_shutdown();
+        let (whole, slept) = sleeper.join().unwrap();
+        assert!(!whole, "the stop cut the settle short");
+        assert!(
+            slept < std::time::Duration::from_secs(5),
+            "the settle slept {slept:?} after the stop began"
+        );
+        assert!(cache.shutdown_begun());
+    }
+
+    /// A stop that began before the settle is called does not wait at all.
+    #[test]
+    fn a_settle_after_the_stop_does_not_wait() {
+        let cache = StateCache::new();
+        cache.begin_shutdown();
+        let started = Instant::now();
+        assert!(!cache.sleep_unless_shutdown(std::time::Duration::from_secs(30)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     // ── DEC-255 / release review 2026-08-10: bounded GPU-write acquisition ──

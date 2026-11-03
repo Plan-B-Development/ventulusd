@@ -148,14 +148,24 @@ _/run/ventulus/hwmon-handback_, _gpu-handback_, _gpu-pmfw-handback_
 	fan curve on. Written before the first write that needs it, and
 	replayed, then removed, by *ventulus-restore-auto* after every stop.
 
+_/run/ventulus/handback.lock_
+	Which daemon owns the records above. The daemon that writes them holds
+	an *flock*(2) on this file from before its first record until its own
+	hand-back at the stop has run; the kernel releases it however else the
+	daemon ends. A daemon that cannot take it keeps no records. The file
+	itself is never removed.
+
 _/run/ventulus/sleep-hook.pid_, _sleep-hook.ack_
 	The handshake between the daemon and its system-sleep hook.
 
 _/usr/bin/ventulus-restore-auto_
 	Run by the unit's *ExecStopPost=* after every stop, crash or kill: gives
-	each header and GPU in the records above back to what it had. It does
-	nothing after a start refused with status 75, whose records belong to
-	the daemon that is running.
+	each header and GPU in the records above back to what it had. A stop the
+	daemon received has already done that in-process; this covers a crash,
+	*SIGKILL* or an OOM kill. It does nothing after a start refused with
+	status 75, or while another process holds _handback.lock_: the records
+	then belong to the daemon that is running. Without *flock*(1) it
+	replays them regardless.
 
 _/usr/lib/systemd/system-sleep/ventulusd_
 	The system-sleep hook (see *SIGUSR1*, *SIGUSR2*).
@@ -196,7 +206,9 @@ _/usr/lib/modprobe.d/ventulus-superio.conf_, _/usr/lib/ventulus/ventulus-superio
 	Stop. The daemon leaves every fan it cannot give back to firmware (an
 	OpenFAN channel, or a header with no mode switch) at its last speed or
 	the exit floor, whichever is higher, then gives every other header and
-	GPU fan back to what it had before the daemon took it. *systemctl stop*
+	GPU fan back to what it had before the daemon took it. A GPU fan test
+	still running is cut short first and gives its card back. Both are
+	handled from before the daemon's first fan write. *systemctl stop*
 	sends *SIGTERM*.
 
 *SIGHUP*

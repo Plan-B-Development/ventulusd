@@ -6,6 +6,14 @@
 # crash, SIGKILL, an OOM kill or a panic: systemd.service(5) runs ExecStopPost=
 # when the service "exited unexpectedly" as well.
 #
+# Defence in depth (DEC-502). Every stop the daemon itself handles -- SIGTERM,
+# SIGINT, a watchdog timeout before its abort window runs out, a supervised task
+# dying -- hands everything back in-process first. What is left for this script
+# is an exit where no daemon code ran (SIGKILL, an OOM kill, an abort, a watchdog
+# stop cut off by TimeoutAbortSec) or a write wedged in a driver that landed
+# after the daemon's own hand-back. Replaying a record the daemon already
+# honoured is harmless.
+#
 # DEC-382: hwmon headers are given back EXACTLY as the daemon found them. Before
 # it switches a header to manual mode, the daemon adds it to a record in its
 # runtime directory, and this script replays that record: each header gets its
@@ -52,6 +60,29 @@ runtime_dir="${RUNTIME_DIRECTORY:-/run/ventulus}"
 # ended as EXIT_CODE and EXIT_STATUS (systemd.exec(5)).
 if [ "${EXIT_CODE:-}" = exited ] && [ "${EXIT_STATUS:-}" = 75 ]; then
     exit 0
+fi
+
+# DEC-502: the records belong to whichever daemon holds handback.lock in this
+# directory. It takes the lock before it writes its first record and releases
+# it once its own hand-back at the stop has run; the kernel releases it however
+# else it ends, SIGKILL included. So a lock someone else still holds means a
+# daemon is running and drives what the records name -- a daemon started by hand
+# while this unit's start failed before its single-instance lock (a broken
+# config exits 1, not 75) -- and replaying them would hand its hardware back
+# underneath it. Held on fd 9 for the rest of this script -- keep it in this
+# shell, not a subshell -- so a daemon starting meanwhile keeps no records
+# rather than having them replayed and removed. No lock file (a
+# daemon older than DEC-502), no flock(1), or an error other than a conflict:
+# replay, as before.
+records_lock="${runtime_dir%%:*}/handback.lock"
+if [ -e "$records_lock" ] && command -v flock >/dev/null 2>&1 \
+    && exec 9<"$records_lock"; then
+    flock -n -E 75 9
+    if [ $? = 75 ]; then
+        echo "ventulus-restore-auto: a running ventulusd holds $records_lock;" \
+            "its hand-back records are left to it" >&2
+        exit 0
+    fi
 fi
 
 records=("${runtime_dir%%:*}/hwmon-handback" "${runtime_dir%%:*}/gpu-handback")

@@ -5,6 +5,34 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A stop no longer leaves a GPU fan test's card at its test speed.** A GPU fan test waits six
+  seconds before it restores the card, but a stop waits only three for requests to finish. A
+  stop during the test gave the card back first, and then the test put its own setting back on
+  top. A pre-RDNA3 card stayed in manual mode at 75 or 100 %; an RDNA3 or newer card got a fixed
+  curve with zero-RPM idle off. Only the unit's `ExecStopPost` corrected it, and a daemon run by
+  hand has none. The test now wakes when the stop begins and gives the card back at once, and
+  from then on the daemon writes no GPU fan curve but a reset. A test started during a stop is
+  refused with a retryable `503`.
+- **A stop signal that arrives as the daemon finishes starting takes the normal stop.** The
+  `SIGTERM` handler was installed just after the fan control loop started, and the `SIGINT` one
+  only once the daemon began waiting for a stop. A signal in between killed the process without
+  its hand-back. Both are now installed before the first fan write.
+- **`ventulus-restore-auto` no longer hands back fans a running daemon controls.** A service
+  start that fails before it checks for another daemon, for example with a broken
+  `/etc/ventulus/daemon.toml`, exits with an ordinary error. `ExecStopPost` then replayed the
+  hand-back records in `/run/ventulus`, which belonged to a daemon started by hand that was
+  still running, and gave its headers back underneath it. The daemon that writes the records
+  now holds a lock on `/run/ventulus/handback.lock` until its own hand-back has run, and the
+  script leaves the records alone while anyone else holds it. A second daemon that cannot take
+  the lock keeps no records rather than overwriting the first one's. Without `flock` (util-linux)
+  the script replays the records as before.
+
+The script stays as the backstop for exits no daemon code survives: a crash, `SIGKILL`, an OOM
+kill, and a watchdog stop cut off after 10 s. No configuration or unit change and no new package
+dependency; the `ExecStopPost` script gains the lock check above.
+
 ## [5.4.0] — 2026-10-26
 
 Pairs with `ventulus` >= v2.23.0; ventulus 5.5.0 is the first GUI that shows the two new

@@ -587,3 +587,169 @@ fn the_legacy_gpu_record_is_consumed_too() {
         "the legacy GPU record must be removed once replayed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DEC-502 — the records' owner. A start that fails BEFORE the single-instance
+// lock (a broken config, an unwritable state directory) exits 1, not 75, so the
+// status check above cannot see that a daemon started by hand is running and
+// owns the records. The lock beside them can: that daemon holds it for as long
+// as it can write them, and the kernel drops it however it ends.
+// ---------------------------------------------------------------------------
+
+/// [SAFETY] A running daemon holds the records' lock: an ending the status
+/// check lets through — the config failure's 1, or nothing set — writes nothing
+/// and removes nothing. With the lock check removed the header reads `5`, the
+/// card's curve `c`, and both records are gone.
+#[test]
+fn a_running_daemons_records_are_left_to_it_whatever_the_ending() {
+    for ended in [Some(("exited", "1")), Some(("killed", "KILL")), None] {
+        let r = a_running_daemons_records();
+        let _owner = ventulusd::hwmon::handback::claim_records(&r.t.run)
+            .expect("the running daemon owns the records");
+
+        let out = r.t.run_script_after(ended);
+
+        assert!(out.status.success(), "{ended:?}: {out:?}");
+        assert_eq!(
+            read(&r.enable),
+            "1",
+            "{ended:?}: the running daemon's header must not be handed back"
+        );
+        assert_eq!(
+            read(&r.curve),
+            "untouched",
+            "{ended:?}: nor its card's curve reset"
+        );
+        for record in &r.records {
+            assert!(
+                record.exists(),
+                "{ended:?}: {} must be left for the running daemon",
+                record.display()
+            );
+        }
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("holds"),
+            "{ended:?}: the skip says why: {out:?}"
+        );
+    }
+}
+
+/// [SAFETY] The other half: a lock FILE with no holder is a daemon that has
+/// gone — it released the lock after its own hand-back, or the kernel did when
+/// it died — so the records are replayed and consumed. A check keyed on the
+/// file's existence rather than on the lock reddens here.
+#[test]
+fn a_lock_nobody_holds_is_a_daemon_that_has_gone() {
+    let r = a_running_daemons_records();
+    let owner = ventulusd::hwmon::handback::claim_records(&r.t.run).expect("claimed");
+    owner.release();
+    drop(owner);
+    assert!(
+        r.t.run
+            .join(ventulusd::hwmon::handback::RECORD_LOCK_FILE_NAME)
+            .exists(),
+        "precondition: the lock file stays"
+    );
+
+    let out = r.t.run_script_after(Some(("killed", "KILL")));
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&r.enable), "5", "the header is handed back");
+    assert_eq!(read(&r.curve), "c", "the card's curve is reset");
+    for record in &r.records {
+        assert!(!record.exists(), "{} consumed", record.display());
+    }
+}
+
+/// Without `flock(1)` the script cannot tell, and replays as it did before
+/// DEC-502 — the documented fallback, toward handing back rather than away.
+#[test]
+fn without_flock_the_records_are_replayed_as_before() {
+    let r = a_running_daemons_records();
+    let _owner = ventulusd::hwmon::handback::claim_records(&r.t.run).expect("claimed");
+    // A PATH with the two external commands the script needs and no flock.
+    let bin = r.t.run.with_file_name("noflock-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for tool in ["cat", "rm"] {
+        let real = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .map(|d| d.join(tool))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("{tool} must be on PATH"));
+        std::os::unix::fs::symlink(real, bin.join(tool)).unwrap();
+    }
+
+    // `Command` looks the program up on the CHILD's PATH, so name bash by path.
+    let bash = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join("bash"))
+        .find(|p| p.is_file())
+        .expect("bash must be on PATH");
+    let out = Command::new(bash)
+        .arg(script())
+        .env("RUNTIME_DIRECTORY", &r.t.run)
+        .env("VENTULUS_SYSFS_ROOT", &r.t.sys)
+        .env("PATH", &bin)
+        .env_remove("EXIT_CODE")
+        .env_remove("EXIT_STATUS")
+        .output()
+        .expect("bash must be available to run the ExecStopPost script");
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&r.enable), "5", "replayed: no flock to ask");
+    assert_eq!(read(&r.curve), "c");
+}
+
+/// The script keeps the lock it took for the whole replay, so a daemon starting
+/// meanwhile cannot claim the records it is about to remove. A `cat` shim — the
+/// script reads every header back through `cat` mid-replay — probes the lock
+/// from outside at that moment. Presence first: the shim ran, and the replay
+/// happened. Close fd 9 early, or take the lock in a subshell, and it reads free.
+#[test]
+fn the_script_holds_the_lock_for_its_whole_replay() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = a_running_daemons_records();
+    let lock =
+        r.t.run
+            .join(ventulusd::hwmon::handback::RECORD_LOCK_FILE_NAME);
+    ventulusd::hwmon::handback::claim_records(&r.t.run)
+        .expect("claimed")
+        .release(); // a daemon that has gone: the file stays, nobody holds it
+    let probes = r.t.run.with_file_name("probes");
+    let bin = r.t.run.with_file_name("probe-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let shim = bin.join("cat");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/bash\nif flock -n '{lock}' true; then echo free; else echo held; fi >> '{probes}'\n\
+             PATH='{path}' exec cat \"$@\"\n",
+            lock = lock.display(),
+            probes = probes.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = Command::new("bash")
+        .arg(script())
+        .env("RUNTIME_DIRECTORY", &r.t.run)
+        .env("VENTULUS_SYSFS_ROOT", &r.t.sys)
+        .env("PATH", format!("{}:{path}", bin.display()))
+        .env_remove("EXIT_CODE")
+        .env_remove("EXIT_STATUS")
+        .output()
+        .expect("bash must be available to run the ExecStopPost script");
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&r.enable), "5", "precondition: the replay ran");
+    let seen = std::fs::read_to_string(&probes).expect("precondition: the shim ran");
+    assert!(!seen.trim().is_empty(), "precondition: at least one probe");
+    assert!(
+        seen.lines().all(|l| l == "held"),
+        "the lock was free during the replay: {seen:?}"
+    );
+}

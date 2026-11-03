@@ -67,6 +67,30 @@ pub fn runtime_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/run/ventulus"))
 }
 
+/// The lock that says which process owns the records in the runtime directory
+/// (DEC-502): a `flock(2)` on this file, held by the daemon that keeps them from
+/// before its first record write until its own hand-back at the stop has run.
+///
+/// `ventulus-restore-auto` replays the records only when it can take this lock
+/// itself, so it never hands back hardware a running daemon drives — one started
+/// by hand, while a service start fails before the single-instance lock (a
+/// broken config). The kernel releases it however the owner ends, SIGKILL
+/// included, so no PID or `/proc` lookup is needed; the unit's sandbox
+/// (`ProtectProc=invisible`, a reduced capability set) hides a full-root daemon's
+/// `/proc` entry from the helper anyway. A daemon that cannot take it keeps no
+/// record: another daemon's would otherwise be overwritten.
+pub const RECORD_LOCK_FILE_NAME: &str = "handback.lock";
+
+/// Claim the records in `dir` for this process (DEC-502). Released by
+/// [`crate::single_instance::InstanceGuard::release`] once the stop's hand-back
+/// has run, so `ExecStopPost` can still replay what a wedged write left; by the
+/// kernel on any other exit.
+pub fn claim_records(
+    dir: &Path,
+) -> Result<crate::single_instance::InstanceGuard, crate::single_instance::AcquireError> {
+    crate::single_instance::acquire_file(&dir.join(RECORD_LOCK_FILE_NAME))
+}
+
 /// First line of every record. `ventulus-restore-auto` skips `#` lines.
 const RECORD_HEADER: &str = "# ventulus hwmon hand-back record v1: headers the daemon has taken \
      from firmware. Written by ventulusd, replayed by ventulus-restore-auto \
@@ -924,6 +948,27 @@ mod tests {
         ledger.note_handed_back("pwm2");
         ledger.note_take("pwm2", None);
         assert!(ledger.note_hand_back_failed("pwm2"));
+    }
+
+    /// [SAFETY] DEC-502: one owner of the records at a time. A second claim on the
+    /// same directory — a second root daemon with its own state dir and socket —
+    /// is refused as another instance, and a released claim can be taken again,
+    /// which is what lets `ExecStopPost` replay after the stop.
+    #[test]
+    fn the_records_have_one_owner_until_it_lets_go() {
+        use crate::single_instance::AcquireError;
+        let dir = tempfile::tempdir().unwrap();
+        let first = claim_records(dir.path()).expect("the first claim is free");
+        assert!(
+            matches!(
+                claim_records(dir.path()),
+                Err(AcquireError::AlreadyRunning { .. })
+            ),
+            "a second owner must be refused"
+        );
+        first.release();
+        claim_records(dir.path()).expect("released, so free again");
+        assert!(dir.path().join(RECORD_LOCK_FILE_NAME).is_file());
     }
 
     /// The record is the only thing `ExecStopPost` has after a crash, so it is

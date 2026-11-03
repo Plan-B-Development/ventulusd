@@ -258,6 +258,43 @@ enum GpuVerifySequence {
         test_speed: u8,
         restore_failed: bool,
     },
+    /// DEC-502: the stop began first. Either no test write was made, or the
+    /// settle was cut short and the card restored at once — to firmware auto on
+    /// PMFW, to its original on the legacy path — so the result says nothing
+    /// about the card and is not classified.
+    Interrupted { restore_failed: bool },
+}
+
+/// DEC-502: where a fan test's restore sends a PMFW card. Once the stop has
+/// begun only a hand-back may be written, so a restore to the engine's prior
+/// fixed speed becomes firmware auto — what the stop's own reset would leave —
+/// and the card leaves the hand-back list. Read once, at the restore, and passed
+/// to the restore and both bookkeeping steps so they agree.
+fn pmfw_restore_target(
+    cache: &crate::health::cache::StateCache,
+    prior_pct: Option<u8>,
+) -> Option<u8> {
+    if cache.shutdown_begun() {
+        None
+    } else {
+        prior_pct
+    }
+}
+
+/// DEC-502: the 503 a GPU fan test gets once the stop has begun — the same
+/// retryable answer the header writes give (DEC-420).
+fn gpu_test_stopping(restore_failed: bool) -> (StatusCode, Json<serde_json::Value>) {
+    let message = if restore_failed {
+        "the daemon is shutting down — the GPU fan test was cut short, and the fan \
+         could not be restored; it may be left at its test speed"
+    } else {
+        "the daemon is shutting down — no GPU fan test was run, or it was cut short \
+         and the fan given back"
+    };
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &ErrorEnvelope::hardware_unavailable(message),
+    )
 }
 
 /// POST /gpu/{gpu_id}/fan/verify — behavioural test of GPU fan-control
@@ -270,6 +307,12 @@ pub async fn gpu_verify_handler(
     State(state): State<Arc<AppState>>,
     Path(gpu_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // [SAFETY] DEC-502: no new GPU fan test once the stop has begun. The
+    // sequence checks again under the GPU write lock, for a request that got
+    // past here first.
+    if state.cache.shutdown_begun() {
+        return gpu_test_stopping(false);
+    }
     // Phase 6 (DEC-201): refuse to start a verify while the system is hot — the
     // verify pauses the engine (incl. the thermal force_all_with_floor) for its window.
     if let Some(resp) = super::verify_thermal_guard(&state.cache) {
@@ -368,12 +411,14 @@ pub async fn gpu_verify_handler(
                     )
                 },
                 || {
-                    // Blocking sleep, deliberately: this task is the uncancellable unit,
+                    // A blocking wait, deliberately: this task is the uncancellable unit,
                     // and an async sleep would reintroduce the cancellation point the
-                    // restructure exists to remove.
-                    std::thread::sleep(std::time::Duration::from_secs(
+                    // restructure exists to remove. Woken by the stop (DEC-502), so a
+                    // verify caught by one restores at once instead of after its
+                    // settle, which would land after the stop's GPU reset.
+                    task_cache.sleep_unless_shutdown(std::time::Duration::from_secs(
                         constants::VERIFY_WAIT_SECONDS as u64,
-                    ))
+                    ));
                 },
                 || {
                     // DEC-296 liveness: prove we are still alive and keep the pause for
@@ -389,9 +434,12 @@ pub async fn gpu_verify_handler(
         // ── Legacy hwmon pwm1 path (pre-RDNA3) ────────────────────────
         let hwmon_path = gpu.hwmon_path.clone();
         // DEC-414 (`TS-aa`): where `ventulus-restore-auto` looks for the crash
-        // backstop — the same runtime directory as the hwmon hand-back record.
-        let record =
-            crate::hwmon::handback::runtime_dir().join(crate::hwmon::gpu_fan::GPU_RECORD_FILE_NAME);
+        // backstop — the same runtime directory as the hwmon hand-back record,
+        // and only when this daemon owns the records there (DEC-502).
+        let record = state
+            .cache
+            .hand_back_record_dir()
+            .map(|dir| dir.join(crate::hwmon::gpu_fan::GPU_RECORD_FILE_NAME));
         tokio::task::spawn_blocking(move || {
             let verify_guard = verify_guard;
             let _gpu_write_guard = gpu_write_guard;
@@ -399,11 +447,12 @@ pub async fn gpu_verify_handler(
                 &hwmon_path,
                 &task_cache,
                 &task_fan_id,
-                &record,
+                record.as_deref(),
                 || {
-                    std::thread::sleep(std::time::Duration::from_secs(
+                    // As on the PMFW path: woken by the stop (DEC-502).
+                    task_cache.sleep_unless_shutdown(std::time::Duration::from_secs(
                         constants::VERIFY_WAIT_SECONDS as u64,
-                    ))
+                    ));
                 },
                 || {
                     let _ = verify_guard.renew(constants::VERIFY_PAUSE_DEADMAN);
@@ -429,6 +478,13 @@ pub async fn gpu_verify_handler(
     };
 
     match sequence {
+        GpuVerifySequence::Interrupted { restore_failed } => {
+            log::info!(
+                "GPU fan test on {fan_id} cut short by the stop (restore {})",
+                if restore_failed { "failed" } else { "done" }
+            );
+            gpu_test_stopping(restore_failed)
+        }
         GpuVerifySequence::WriteFailed {
             initial,
             final_state,
@@ -570,15 +626,25 @@ fn pmfw_verify_sequence(
         od_max,
     );
 
+    // [SAFETY] DEC-502: under the GPU write lock the handler holds for the whole
+    // sequence. A stop that began while this verify waited for the lock gets no
+    // test write: the card is left exactly as it was.
+    if task_cache.shutdown_begun() {
+        return GpuVerifySequence::Interrupted {
+            restore_failed: false,
+        };
+    }
+
     // DEC-435: name the card before the test write, so a crash mid-verify
     // leaves ExecStopPost a card to reset.
     task_cache
         .gpu_handback()
         .note_take(task_fan_id, fan_curve_path, zero_rpm_path);
     if let Err(e) = test_write(test_speed) {
-        let restore_failed = restore_pmfw(prior_pct, fan_curve_path, zero_rpm_path);
-        stamp_restored_pct(task_cache, task_fan_id, prior_pct, restore_failed);
-        note_pmfw_restored(task_cache, task_fan_id, prior_pct, restore_failed);
+        let restore_to = pmfw_restore_target(task_cache, prior_pct);
+        let restore_failed = restore_pmfw(restore_to, fan_curve_path, zero_rpm_path);
+        stamp_restored_pct(task_cache, task_fan_id, restore_to, restore_failed);
+        note_pmfw_restored(task_cache, task_fan_id, restore_to, restore_failed);
         return GpuVerifySequence::WriteFailed {
             initial: initial_state,
             final_state: GpuVerifyState {
@@ -605,6 +671,17 @@ fn pmfw_verify_sequence(
 
     settle();
 
+    // [SAFETY] DEC-502: a stop woke the settle. Restore now — to firmware auto,
+    // the only write the stop allows — so the card is back before the stop's
+    // own GPU reset runs, and nothing this verify writes can land after it.
+    if task_cache.shutdown_begun() {
+        let restore_to = pmfw_restore_target(task_cache, prior_pct);
+        let restore_failed = restore_pmfw(restore_to, fan_curve_path, zero_rpm_path);
+        stamp_restored_pct(task_cache, task_fan_id, restore_to, restore_failed);
+        note_pmfw_restored(task_cache, task_fan_id, restore_to, restore_failed);
+        return GpuVerifySequence::Interrupted { restore_failed };
+    }
+
     let final_curve = crate::hwmon::gpu_fan::read_fan_curve(fan_curve_path).ok();
     let final_state = GpuVerifyState {
         applied_speed_pct: final_curve
@@ -617,9 +694,12 @@ fn pmfw_verify_sequence(
 
     renew();
 
-    let restore_failed = restore_pmfw(prior_pct, fan_curve_path, zero_rpm_path);
-    stamp_restored_pct(task_cache, task_fan_id, prior_pct, restore_failed);
-    note_pmfw_restored(task_cache, task_fan_id, prior_pct, restore_failed);
+    // DEC-502: re-read here too — a stop that begins during the read-back still
+    // turns a restore to a fixed speed into a hand-back.
+    let restore_to = pmfw_restore_target(task_cache, prior_pct);
+    let restore_failed = restore_pmfw(restore_to, fan_curve_path, zero_rpm_path);
+    stamp_restored_pct(task_cache, task_fan_id, restore_to, restore_failed);
+    note_pmfw_restored(task_cache, task_fan_id, restore_to, restore_failed);
     GpuVerifySequence::Completed {
         initial: initial_state,
         final_state,
@@ -644,11 +724,16 @@ fn pmfw_verify_sequence(
 /// 75–100 % (`TS-bi`). The original is what `note_legacy_take` returns: the
 /// record's standing line when an earlier take was never given back, else what
 /// was read here. A restore that lands therefore always gives the card back.
+///
+/// `record` is `None` when this daemon owns no hand-back records (DEC-502:
+/// another daemon holds them, or there is no runtime directory). The verify
+/// then runs without the crash backstop, as it always has when the record
+/// could not be written.
 fn legacy_verify_sequence(
     hwmon_path: &std::path::Path,
     task_cache: &crate::health::cache::StateCache,
     task_fan_id: &str,
-    record: &std::path::Path,
+    record: Option<&std::path::Path>,
     settle: impl FnOnce(),
     renew: impl FnOnce(),
 ) -> GpuVerifySequence {
@@ -678,14 +763,23 @@ fn legacy_verify_sequence(
 
     let test_speed = select_gpu_test_speed(initial_state.applied_speed_pct, 0, 100);
 
+    // [SAFETY] DEC-502: as on the PMFW path — a stop that began while this
+    // verify waited for the GPU write lock gets no manual-mode write.
+    if task_cache.shutdown_begun() {
+        return GpuVerifySequence::Interrupted {
+            restore_failed: false,
+        };
+    }
+
     // DEC-414 (`TS-aa`): recorded BEFORE the manual-mode write, so a crash
     // from here on is given back by ExecStopPost. DEC-447 (`TS-bj`): a card
     // found in manual is recorded with its duty, not as bare `mode 1`.
-    let original = crate::hwmon::gpu_fan::note_legacy_take(
-        record,
-        hwmon_path,
-        crate::hwmon::gpu_fan::LegacyOriginal::from_read(initial_state.pwm_enable, initial_raw),
-    );
+    let read =
+        crate::hwmon::gpu_fan::LegacyOriginal::from_read(initial_state.pwm_enable, initial_raw);
+    let original = match record {
+        Some(record) => crate::hwmon::gpu_fan::note_legacy_take(record, hwmon_path, read),
+        None => read,
+    };
 
     if let Err(e) = crate::hwmon::gpu_fan::set_legacy_pwm(hwmon_path, test_speed) {
         let restore_failed = restore_legacy(original, hwmon_path);
@@ -716,6 +810,24 @@ fn legacy_verify_sequence(
     task_cache.set_gpu_fan_commanded_pct(task_fan_id, test_speed);
 
     settle();
+
+    // [SAFETY] DEC-502: a stop woke the settle. Give the card its original back
+    // now — a hand-back, which the stop allows — so the record line is gone
+    // before the process exits and nothing depends on ExecStopPost. The stop's
+    // own restore does not read this record, so this is the only in-process
+    // hand-back a legacy card gets.
+    if task_cache.shutdown_begun() {
+        let restore_failed = restore_legacy(original, hwmon_path);
+        note_legacy_restored(
+            task_cache,
+            task_fan_id,
+            record,
+            hwmon_path,
+            original,
+            restore_failed,
+        );
+        return GpuVerifySequence::Interrupted { restore_failed };
+    }
 
     let final_state = GpuVerifyState {
         applied_speed_pct: read_raw_pwm(hwmon_path).map(crate::pwm::raw_to_percent),
@@ -770,7 +882,7 @@ fn restore_legacy(
 fn note_legacy_restored(
     task_cache: &crate::health::cache::StateCache,
     task_fan_id: &str,
-    record: &std::path::Path,
+    record: Option<&std::path::Path>,
     hwmon_path: &std::path::Path,
     original: crate::hwmon::gpu_fan::LegacyOriginal,
     restore_failed: bool,
@@ -779,7 +891,9 @@ fn note_legacy_restored(
     if restore_failed {
         return;
     }
-    crate::hwmon::gpu_fan::note_legacy_handed_back(record, hwmon_path);
+    if let Some(record) = record {
+        crate::hwmon::gpu_fan::note_legacy_handed_back(record, hwmon_path);
+    }
     match original {
         LegacyOriginal::Manual(raw) => {
             task_cache.set_gpu_fan_commanded_pct(task_fan_id, crate::pwm::raw_to_percent(raw))
@@ -945,7 +1059,7 @@ mod tests {
             &hwmon,
             &cache,
             "amd_gpu:0000:03:00.0",
-            &record,
+            Some(&record),
             || {
                 *seen_mid_verify.borrow_mut() = Some((
                     std::fs::read_to_string(hwmon.join("pwm1_enable")).unwrap(),
@@ -999,7 +1113,7 @@ mod tests {
             &hwmon,
             &cache,
             fan_id,
-            &record,
+            Some(&record),
             || {
                 std::fs::remove_file(&enable).unwrap();
                 std::fs::create_dir(&enable).unwrap();
@@ -1021,7 +1135,7 @@ mod tests {
             "precondition: the first take's original (2) is still recorded"
         );
 
-        let second = legacy_verify_sequence(&hwmon, &cache, fan_id, &record, || {}, || {});
+        let second = legacy_verify_sequence(&hwmon, &cache, fan_id, Some(&record), || {}, || {});
         assert!(
             matches!(
                 second,
@@ -1064,7 +1178,7 @@ mod tests {
             &hwmon,
             &cache,
             fan_id,
-            &record,
+            Some(&record),
             || {
                 *seen_mid_verify.borrow_mut() = Some((
                     std::fs::read_to_string(hwmon.join("pwm1")).unwrap(),
@@ -1123,7 +1237,7 @@ mod tests {
             &hwmon,
             &cache,
             "amd_gpu:0000:03:00.0",
-            &record,
+            Some(&record),
             || {
                 // The restore's write of `2` to pwm1_enable now fails.
                 std::fs::remove_file(&enable).unwrap();
@@ -1556,6 +1670,205 @@ mod tests {
             cache.gpu_handback().is_taken(fan_id),
             "the verify must put the card on the stop list before its test write"
         );
+    }
+
+    // ── DEC-502: a GPU fan test caught by the stop ──────────────────────
+
+    /// How long after the stop begins a woken fan test may take to answer. Far
+    /// under `VERIFY_WAIT_SECONDS`, so a settle that slept its span out reds.
+    const WOKEN_WITHIN: std::time::Duration = std::time::Duration::from_secs(2);
+    const _: () = assert!(WOKEN_WITHIN.as_secs() * 2 < constants::VERIFY_WAIT_SECONDS as u64);
+
+    /// Poll `cond` until it holds, failing loudly after a deadline.
+    async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// [SAFETY] G1/G2 on the PMFW path. A stop that begins mid-settle wakes the
+    /// test, which restores at once — inside the stop's 3 s server drain, so
+    /// before its GPU reset — and restores to firmware AUTO, not to the
+    /// engine's prior 40 %: once the stop has begun no curve may reach a card.
+    /// Each half reds on its own: with `thread::sleep` back the answer takes the
+    /// whole settle; with the restore target ignored the card keeps 40 % and
+    /// stays on the stop list.
+    #[tokio::test]
+    async fn a_stop_cuts_a_pmfw_fan_test_short_and_hands_the_card_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let curve = dir.path().join("fan_curve");
+        std::fs::write(&curve, "0: 0C 40%\n").unwrap();
+        let state = pmfw_verify_state(curve);
+        let cache = state.cache.clone();
+        let fan_id = "amd_gpu:0000:03:00.0";
+        cache.set_gpu_fan_commanded_pct(fan_id, 40);
+        let test_speed = select_gpu_test_speed(Some(40), 15, 100);
+        assert_ne!(test_speed, 40, "fixture check: the two duties differ");
+        let commanded = || {
+            cache
+                .snapshot()
+                .gpu_fans
+                .get(fan_id)
+                .and_then(|f| f.last_commanded_pct)
+        };
+
+        let verify = tokio::spawn(gpu_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("0000:03:00.0".to_string()),
+        ));
+        wait_until("the test write", || commanded() == Some(test_speed)).await;
+        let stop = std::time::Instant::now();
+        cache.begin_shutdown();
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(15), verify)
+            .await
+            .expect("the verify answers")
+            .expect("the verify did not panic");
+        let took = stop.elapsed();
+
+        assert!(
+            took < WOKEN_WITHIN,
+            "the test answered {took:?} after the stop began — it slept out its settle, \
+             so its restore would land after the stop's GPU reset"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(body.0["error"]["code"], "hardware_unavailable");
+        assert_eq!(body.0["error"]["retryable"], true);
+        assert_eq!(
+            commanded(),
+            None,
+            "restored to firmware auto; Some(40) is a curve written after the stop began"
+        );
+        assert!(
+            !cache.gpu_handback().is_taken(fan_id),
+            "back on auto, so off the stop list"
+        );
+        assert!(!cache.verify_active(), "the pause is released");
+    }
+
+    /// [SAFETY] G1 on the legacy path: the card in manual mode at its test speed
+    /// gets its ORIGINAL mode back at once, and its crash-record line goes, so
+    /// nothing is left for `ExecStopPost` — the one hand-back a daemon run by
+    /// hand never gets.
+    #[tokio::test]
+    async fn a_stop_cuts_a_legacy_fan_test_short_and_gives_the_card_back() {
+        let (tmp, hwmon, record) = legacy_card();
+        let state = legacy_reset_state(hwmon.clone());
+        let cache = state.cache.clone();
+        assert!(cache.set_hand_back_record_dir(tmp.path().to_path_buf()));
+        let enable = hwmon.join("pwm1_enable");
+
+        let verify = tokio::spawn(gpu_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("0000:03:00.0".to_string()),
+        ));
+        wait_until("manual mode", || {
+            std::fs::read_to_string(&enable).is_ok_and(|v| v.trim() == "1")
+        })
+        .await;
+        assert!(record.exists(), "precondition: the take is on the record");
+        let stop = std::time::Instant::now();
+        cache.begin_shutdown();
+        let (status, body) = tokio::time::timeout(std::time::Duration::from_secs(15), verify)
+            .await
+            .expect("the verify answers")
+            .expect("the verify did not panic");
+        let took = stop.elapsed();
+
+        assert!(
+            took < WOKEN_WITHIN,
+            "answered {took:?} after the stop began"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(
+            std::fs::read_to_string(&enable).unwrap().trim(),
+            "2",
+            "the card's original mode is back"
+        );
+        assert!(!record.exists(), "a restored card's line is dropped");
+    }
+
+    /// [SAFETY] No fan test starts once the stop has begun: nothing is written,
+    /// the card is not put on the stop list, and the pause is not taken.
+    #[tokio::test]
+    async fn no_gpu_fan_test_starts_once_the_stop_has_begun() {
+        let dir = tempfile::tempdir().unwrap();
+        let curve = dir.path().join("fan_curve");
+        std::fs::write(&curve, "0: 0C 40%\n").unwrap();
+        let state = pmfw_verify_state(curve.clone());
+        state.cache.begin_shutdown();
+
+        let (status, body) = gpu_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("0000:03:00.0".to_string()),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+        assert_eq!(std::fs::read_to_string(&curve).unwrap(), "0: 0C 40%\n");
+        assert!(!state.cache.gpu_handback().is_taken("amd_gpu:0000:03:00.0"));
+        assert!(!state.cache.verify_active());
+    }
+
+    /// [SAFETY] The check under the GPU write lock, for a test that passed the
+    /// handler's own check and then waited for the lock while the stop began:
+    /// no test write, and the card is not put on the stop list. Both sequences.
+    #[test]
+    fn a_stop_that_began_while_the_test_waited_for_the_lock_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let curve = dir.path().join("fan_curve");
+        std::fs::write(&curve, "0: 0C 40%\n").unwrap();
+        let cache = crate::health::cache::StateCache::new();
+        cache.begin_shutdown();
+        let fan_id = "amd_gpu:0000:03:00.0";
+
+        let pmfw = pmfw_verify_sequence(
+            &curve,
+            None,
+            dir.path(),
+            Some(40),
+            &cache,
+            fan_id,
+            |_| panic!("no test write once the stop has begun"),
+            || panic!("no settle"),
+            || panic!("no renew"),
+        );
+        assert!(matches!(
+            pmfw,
+            GpuVerifySequence::Interrupted {
+                restore_failed: false
+            }
+        ));
+        assert!(!cache.gpu_handback().is_taken(fan_id));
+        assert_eq!(std::fs::read_to_string(&curve).unwrap(), "0: 0C 40%\n");
+
+        let (_tmp, hwmon, record) = legacy_card();
+        let legacy = legacy_verify_sequence(
+            &hwmon,
+            &cache,
+            fan_id,
+            Some(&record),
+            || panic!("no settle"),
+            || panic!("no renew"),
+        );
+        assert!(matches!(
+            legacy,
+            GpuVerifySequence::Interrupted {
+                restore_failed: false
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(hwmon.join("pwm1_enable"))
+                .unwrap()
+                .trim(),
+            "2",
+            "never put in manual mode"
+        );
+        assert!(!record.exists(), "nothing taken, nothing recorded");
     }
 
     fn st(

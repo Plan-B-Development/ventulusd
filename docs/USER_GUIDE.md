@@ -68,7 +68,8 @@ systemd stop, so the daemon's hand-back (§ Safety) runs on each.
 
 Do not install by copying the binary and unit file in by hand. The unit runs
 `/usr/bin/ventulusd` and, after every stop, `/usr/bin/ventulus-restore-auto`,
-which gives each fan header back to what it was doing before the daemon took it.
+which, after a crash or a kill, gives each fan header back to what it was doing
+before the daemon took it.
 The package also installs the sleep hook, the Super-I/O guard and
 `/etc/modules-load.d/ventulus.conf`; a hand-copied binary gets none of these.
 To build the package yourself or run your own build, see
@@ -475,11 +476,14 @@ quietly stop. The unit file's own comments
   releases (Debian 12 ships 252) ignore `RestartSteps=` and `RestartMaxDelaySec=`
   with a warning, and restart every 3 s.
 - **Stop.** A stop is allowed 40 s (`TimeoutStopSec=40`); the daemon bounds each
-  hardware step itself so that it can always exit. After every stop, whatever
-  ended it, `ExecStopPost` runs `ventulus-restore-auto`, which gives back each
-  header and GPU fan the daemon's records name (§ Safety). The one exception is a
-  start refused because another daemon is running: those records belong to the
-  daemon that is running.
+  hardware step itself so that it can always exit. Any stop the daemon receives
+  hands everything back in-process first. After every stop, whatever ended it,
+  `ExecStopPost` runs `ventulus-restore-auto`, the backstop, which gives back each
+  header and GPU fan the daemon's records still name (§ Safety). It does nothing
+  when another daemon is running, because the records are then that daemon's:
+  after a start refused because another daemon is running, and whenever another
+  daemon holds `/run/ventulus/handback.lock`, for example one you started by hand
+  while the service failed to start.
 - **Reload.** `systemctl reload` sends `SIGHUP`, which applies the profile search
   directories, the exit minimum and the coolant limit (§ Configuration).
 - **Sleep.** The package installs a system-sleep hook,
@@ -1383,12 +1387,17 @@ None can be turned off; the only setting is the coolant limit.
   by the tray or at boot. While the daemon holds the switch, a fan no profile
   controls has nothing driving it. When the daemon gives the switch back, the BIOS
   takes every fan, including any a profile still controls. Two mechanisms cover the
-  hand-back: the daemon does it **in-process** as it shuts down, and `ExecStopPost`
-  in the systemd unit repeats it once the daemon has exited, whatever ended it: a
-  normal stop, a crash, a SIGKILL the daemon could not respond to, or the watchdog
-  restarting a daemon that stopped responding. The in-process one is bounded, so a
-  restore that hangs cannot keep the daemon from exiting, and `ExecStopPost` from
-  running.
+  hand-back. The daemon does it **in-process** on every stop it receives: `SIGTERM`
+  (`systemctl stop` or `restart`, a reboot), `SIGINT` (Ctrl-C when run in a
+  terminal), the watchdog's `SIGTERM`, and its own exit when a task it cannot run
+  without has died. That needs nothing from the unit. A GPU fan test that is
+  running when the stop arrives is cut short and gives the card back before the
+  daemon's own GPU reset. Then `ExecStopPost` in the systemd unit repeats the
+  hand-back once the daemon has exited. That repeat is what covers the exits no
+  daemon code survives: a crash, a SIGKILL or OOM kill, and a watchdog stop still
+  unfinished after 10 s. Repeating a hand-back that already happened changes
+  nothing. The in-process one is bounded, so a restore that hangs cannot keep the
+  daemon from exiting, and `ExecStopPost` from running.
 - **OpenFAN fans, and motherboard headers with no mode switch, are left at a
   minimum on stop.** These have no firmware behaviour to go back to (an OpenFAN
   channel holds whatever it was last told, indefinitely), so on a clean stop
@@ -1405,4 +1414,8 @@ None can be turned off; the only setting is the coolant limit.
 - **Neither guarantees the hardware actually came back.** Each restore step gives
   up after a few seconds so the daemon can always exit. If a chip or card has
   stopped accepting writes, nothing can restore it, and those fans hold their last
-  speed until something takes them over again.
+  speed until something takes them over again. A kernel panic or a power cut runs
+  neither mechanism; the board's firmware takes the fans back at the next boot.
+  A daemon you run by hand, outside systemd, has no `ExecStopPost`: if it is
+  killed with `SIGKILL`, its headers stay as it left them until a reboot, or
+  until you run `sudo ventulus-restore-auto`, which replays its records.

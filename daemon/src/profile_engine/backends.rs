@@ -1754,6 +1754,16 @@ fn gpu_blocking_write(
     if cache.is_gpu_fan_relinquished(fan_id) {
         return None;
     }
+    // [SAFETY] DEC-502: once the stop has begun, a curve is not a hand-back, so
+    // it is not written. Checked here, under the GPU write lock the batch holds
+    // and at the last moment before the write, so a batch that outlived the
+    // engine drain cannot put a curve back on a card after the stop's GPU reset
+    // — the GPU half of the rule DEC-420 gave the hwmon headers. A write already
+    // past this check and wedged in the driver is the residual, as it is there.
+    // `gpu_give_back` below has no such check: a reset is a hand-back.
+    if cache.shutdown_begun() {
+        return None;
+    }
     // DEC-435: name the card BEFORE the write, so a stop — even a crash — resets
     // it, and a card no profile has written is never reset.
     cache
@@ -7392,6 +7402,59 @@ mod tests {
             "un-relinquished → write proceeds"
         );
         assert!(!std::fs::read_to_string(&curve_path).unwrap().is_empty());
+    }
+
+    /// [SAFETY] DEC-502: once the stop has begun the engine writes no curve —
+    /// a batch that outlived the engine drain would otherwise land after the
+    /// stop's GPU reset — while the hand-back reset still runs. Presence first:
+    /// the same write lands before the stop.
+    #[test]
+    fn after_the_stop_begins_the_engine_writes_no_curve_but_still_hands_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gpu, curve_path) = fake_gpu(&dir);
+        let cache = StateCache::new();
+        let fan_id = "amd_gpu:0000:03:00.0";
+        let write = |pct| {
+            gpu_blocking_write(
+                &cache,
+                gpu.fan_curve_path.as_deref().unwrap(),
+                gpu.fan_zero_rpm_path.as_deref(),
+                pct,
+                true,
+                fan_id,
+            )
+        };
+
+        assert!(matches!(write(70), Some(Ok(()))), "precondition: it writes");
+        assert!(!std::fs::read_to_string(&curve_path).unwrap().is_empty());
+        assert_eq!(
+            cache
+                .gpu_fans_snapshot()
+                .get(fan_id)
+                .and_then(|f| f.last_commanded_pct),
+            Some(70)
+        );
+
+        std::fs::write(&curve_path, "").unwrap();
+        cache.begin_shutdown();
+        assert!(write(40).is_none(), "after the stop: skipped, no outcome");
+        assert!(
+            std::fs::read_to_string(&curve_path).unwrap().is_empty(),
+            "no curve may reach the card once the stop has begun"
+        );
+        assert_eq!(
+            cache
+                .gpu_fans_snapshot()
+                .get(fan_id)
+                .and_then(|f| f.last_commanded_pct),
+            Some(70),
+            "a refused write records no new duty"
+        );
+
+        // The opposite branch: the hand-back reset is not a curve, and runs.
+        assert!(matches!(gpu_give_back(&cache, fan_id), Some(Ok(()))));
+        assert_eq!(std::fs::read_to_string(&curve_path).unwrap(), "c\n");
+        assert!(!cache.gpu_handback().is_taken(fan_id));
     }
 
     #[test]

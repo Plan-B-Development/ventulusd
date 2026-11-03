@@ -122,7 +122,16 @@ pub fn lock_path(state_dir: &Path) -> PathBuf {
 /// `O_NOFOLLOW`, so a symlink planted at that name is refused rather than
 /// followed. Its contents are never read or written.
 pub fn acquire(state_dir: &Path) -> Result<InstanceGuard, AcquireError> {
-    let path = lock_path(state_dir);
+    acquire_file(&lock_path(state_dir))
+}
+
+/// Claim an `flock(2)` on the file at `path`, on the same terms as [`acquire`]:
+/// created `0600` if absent, never removed, opened with `O_NOFOLLOW`, and
+/// [`AcquireError::AlreadyRunning`] only when another process holds it. Also
+/// the hand-back records' lock in the runtime directory (DEC-502,
+/// `handback::claim_records`).
+pub fn acquire_file(path: &Path) -> Result<InstanceGuard, AcquireError> {
+    let path = path.to_path_buf();
     let file = OpenOptions::new()
         .create(true)
         .write(true)
