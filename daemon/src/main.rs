@@ -2354,6 +2354,20 @@ async fn async_main(cli: CliOptions) {
 
     log::info!("ventulusd v{VERSION} starting");
 
+    // [SAFETY] DEC-504: every hwmon write opens a descriptor, the thermal
+    // emergency's included. Raise the soft open-file limit before anything
+    // opens one; with the API's connection cap, the writes always find one free.
+    match ventulusd::rlimit::raise_nofile_soft_limit() {
+        Ok((before, after)) if after > before => {
+            log::info!("Open-file limit raised from {before} to {after}");
+        }
+        Ok((before, _)) => log::debug!("Open-file limit is already {before}"),
+        Err(e) => log::warn!(
+            "Could not raise the open-file limit ({e}); the API's connection cap \
+             still bounds its share of the current limit"
+        ),
+    }
+
     // DEC-387 (`TS-d`): systemd's notification channel — `None` when not run by
     // a unit that asked for one, which makes every use of it below a no-op.
     let notifier = ventulusd::sd_notify::Notifier::from_env().map(Arc::new);

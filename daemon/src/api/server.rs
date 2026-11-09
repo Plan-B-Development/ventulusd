@@ -1,19 +1,114 @@
 //! Unix socket HTTP server lifecycle.
+//!
+//! The daemon runs its own accept loop rather than `axum::serve` (DEC-504).
+//! The socket is `0666` (DEC-049), so any local user can connect, and
+//! `axum::serve` accepts without limit and, having no timer, keeps an idle
+//! connection open for ever. Every connection holds a file descriptor, and the
+//! thermal force opens a fresh one for each hwmon write
+//! (`RealSysfsWriter::write_file`). A user holding enough idle connections could
+//! therefore make the emergency's writes fail with `EMFILE`. Here a connection is
+//! accepted only while one of [`MAX_CONNECTIONS`] slots is free. A client beyond
+//! that waits in the kernel's listen queue, where it costs the daemon no
+//! descriptor. A connection that sends no complete request head within
+//! [`HEADER_READ_TIMEOUT`], first or next, is closed.
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::connect_info::Connected;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
+use axum::handler::Handler;
+use axum::middleware::Next;
+use axum::response::Response;
 use axum::routing::{delete, get, post, put};
-use axum::serve::IncomingStream;
 use axum::Router;
-use tokio::net::UnixListener;
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::server::graceful::GracefulShutdown;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
+use tower::ServiceExt;
 
 use super::handlers::{self, AppState};
 
-/// Error returned by [`serve`] when axum finishes unexpectedly.
+/// Error returned by [`serve`]. The accept loop no longer fails, so nothing
+/// currently produces it; it is kept so `main.rs`'s error arm and the
+/// integration tests' `unwrap` stay meaningful if that changes.
 pub type ServeError = Box<dyn std::error::Error + Send + Sync>;
+
+/// [SAFETY] At most this many client connections at once (DEC-504). This caps
+/// the descriptors the API can hold, so the hwmon writes always find one free
+/// under the raised soft limit (`rlimit::raise_nofile_soft_limit`). Real clients
+/// hold a handful: each of the GUI's few HTTP clients keeps one or two,
+/// `ventulus-diag` one, the tray one at a time. 64 leaves room for all of them.
+pub const MAX_CONNECTIONS: usize = 64;
+
+/// How long a connection may take to send a complete request head (DEC-504).
+/// hyper restarts the deadline when it starts reading each request head, so
+/// this also closes an idle keep-alive connection. It does not run while a
+/// handler works or while a body is read, so a long held-open request (the
+/// deprecated `calibrate`) is unaffected. It is longer than the GUI's httpx
+/// keep-alive expiry (5 s), so the GUI stops reusing an idle connection before
+/// the daemon closes it.
+pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Request-body cap for every route without its own (DEC-504). Every client body
+/// apart from a profile document and a firmware file is a small JSON object.
+pub const DEFAULT_BODY_LIMIT: usize = 64 * 1024;
+
+/// Request-body cap for `POST /profiles` and `PUT /profiles/{id}`. Matches the
+/// file-read cap in `atomic_io`.
+pub const PROFILE_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Uploads of each kind handled at once (DEC-504): one profile upload and,
+/// separately, one firmware upload. A profile body is parsed into a
+/// `serde_json::Value`, which takes many times the raw size, and a firmware file
+/// is parsed into an image; one at a time bounds that memory whatever the number
+/// of connections.
+pub const MAX_CONCURRENT_UPLOADS: usize = 1;
+
+/// How long an upload waits for its slot before it is refused with
+/// `503 internal_error`, retryable, `details.reason: "upload_busy"` (DEC-504).
+/// Shorter than the GUI's 5 s request timeout (`API_TIMEOUT_S`), so an upload
+/// is never applied after the GUI has given up on it and told the user it
+/// failed.
+pub const UPLOAD_SLOT_WAIT: Duration = Duration::from_secs(4);
+
+/// How long an upload holding the slot may take to send its body before it is
+/// refused with `408 validation_error`, `details.reason: "body_timeout"`
+/// (DEC-504). A local 4 MiB upload takes milliseconds; this only stops a client
+/// that stalls from holding the slot.
+pub const UPLOAD_BODY_DEADLINE: Duration = Duration::from_secs(10);
+
+/// `details.reason` of the `503` an upload gets when its slot stays taken.
+pub const UPLOAD_BUSY_REASON: &str = "upload_busy";
+
+/// `details.reason` of the `408` an upload gets when its body does not arrive.
+pub const BODY_TIMEOUT_REASON: &str = "body_timeout";
+
+/// After a failed `accept`, wait this long before the next one rather than
+/// spinning (axum's behaviour too).
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
+
+/// The accept loop's limits. [`serve`] always uses [`ServerLimits::default`];
+/// tests use smaller values.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerLimits {
+    /// Connections served at once.
+    pub max_connections: usize,
+    /// See [`HEADER_READ_TIMEOUT`].
+    pub header_read_timeout: Duration,
+}
+
+impl Default for ServerLimits {
+    fn default() -> Self {
+        Self {
+            max_connections: MAX_CONNECTIONS,
+            header_read_timeout: HEADER_READ_TIMEOUT,
+        }
+    }
+}
 
 /// Peer credentials of a Unix-socket client, captured at connection-accept time
 /// and exposed to handlers as `ConnectInfo<UdsConnectInfo>` (DEC-205).
@@ -34,12 +129,12 @@ pub struct UdsConnectInfo {
     pub pid: Option<i32>,
 }
 
-impl<'a> Connected<IncomingStream<'a, UnixListener>> for UdsConnectInfo {
-    fn connect_info(stream: IncomingStream<'a, UnixListener>) -> Self {
-        // `io()` yields the accepted `UnixStream`; `peer_cred()` reads
-        // SO_PEERCRED. A read failure degrades to `None` (fail-closed for the
-        // caller) rather than dropping the connection.
-        let cred = stream.io().peer_cred().ok();
+impl UdsConnectInfo {
+    /// Read the peer's credentials from an accepted stream. A read failure
+    /// degrades to `None` (fail-closed for the caller) rather than dropping the
+    /// connection.
+    fn of(stream: &UnixStream) -> Self {
+        let cred = stream.peer_cred().ok();
         Self {
             uid: cred.map(|cred| cred.uid()),
             pid: cred.and_then(|cred| cred.pid()),
@@ -47,8 +142,119 @@ impl<'a> Connected<IncomingStream<'a, UnixListener>> for UdsConnectInfo {
     }
 }
 
-/// Build the axum router with all endpoints.
+/// One kind of upload's slot and deadlines (DEC-504). Cloning shares the slot.
+#[derive(Clone, Debug)]
+pub struct UploadGate {
+    slots: Arc<Semaphore>,
+    max_body: usize,
+    slot_wait: Duration,
+    body_deadline: Duration,
+}
+
+impl UploadGate {
+    /// A gate with [`MAX_CONCURRENT_UPLOADS`] slots for bodies of at most
+    /// `max_body` bytes.
+    #[must_use]
+    pub fn new(max_body: usize, slot_wait: Duration, body_deadline: Duration) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS)),
+            max_body,
+            slot_wait,
+            body_deadline,
+        }
+    }
+
+    /// The profile uploads' gate: `POST /profiles` and `PUT /profiles/{id}`.
+    #[must_use]
+    pub fn profiles() -> Self {
+        Self::new(PROFILE_BODY_LIMIT, UPLOAD_SLOT_WAIT, UPLOAD_BODY_DEADLINE)
+    }
+
+    /// The firmware upload's gate: `PUT /fans/openfan/firmware`.
+    #[must_use]
+    pub fn firmware() -> Self {
+        Self::new(
+            crate::serial::uf2::MAX_FILE_BYTES,
+            UPLOAD_SLOT_WAIT,
+            UPLOAD_BODY_DEADLINE,
+        )
+    }
+
+    /// The semaphore behind the slot, so a test can hold it.
+    #[must_use]
+    pub fn slots(&self) -> Arc<Semaphore> {
+        self.slots.clone()
+    }
+}
+
+/// Middleware for the upload routes (DEC-504). It takes the gate's slot before
+/// the body is read, refusing with `503` if the slot stays taken for
+/// `slot_wait`; then reads the whole body within `body_deadline` (else `408`)
+/// and at most `max_body` bytes (else `413`); and holds the slot until the
+/// handler has answered. While it waits for the slot, nothing reads the
+/// request's socket, so a client that gave up is not noticed; the wait is kept
+/// shorter than the GUI's request timeout for that reason.
+async fn upload_gate(State(gate): State<UploadGate>, request: Request, next: Next) -> Response {
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+
+    let Ok(slot) = tokio::time::timeout(gate.slot_wait, gate.slots.clone().acquire_owned()).await
+    else {
+        let mut envelope = super::responses::ErrorEnvelope::internal(
+            "another upload of this kind is in progress; try again",
+        );
+        envelope.error.details = Some(serde_json::json!({ "reason": UPLOAD_BUSY_REASON }));
+        return handlers::error_response(axum::http::StatusCode::SERVICE_UNAVAILABLE, &envelope)
+            .into_response();
+    };
+    let _slot = slot.expect("upload slots are never closed");
+
+    let (parts, body) = request.into_parts();
+    let limited = http_body_util::Limited::new(body, gate.max_body);
+    let bytes = match tokio::time::timeout(gate.body_deadline, limited.collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(e)) if e.is::<http_body_util::LengthLimitError>() => {
+            // The framework's own 413 is plain text; this matches it.
+            return (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "length limit exceeded",
+            )
+                .into_response();
+        }
+        Ok(Err(_)) => {
+            return handlers::error_response(
+                axum::http::StatusCode::BAD_REQUEST,
+                &super::responses::ErrorEnvelope::validation("the request body could not be read"),
+            )
+            .into_response();
+        }
+        Err(_) => {
+            let mut envelope = super::responses::ErrorEnvelope::validation(format!(
+                "the request body did not arrive within {} s",
+                gate.body_deadline.as_secs()
+            ));
+            envelope.error.details = Some(serde_json::json!({ "reason": BODY_TIMEOUT_REASON }));
+            return handlers::error_response(axum::http::StatusCode::REQUEST_TIMEOUT, &envelope)
+                .into_response();
+        }
+    };
+    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
+}
+
+/// Build the axum router with all endpoints and the production upload gates.
 pub fn build_router(state: Arc<AppState>) -> Router {
+    build_router_with_uploads(state, UploadGate::profiles(), UploadGate::firmware())
+}
+
+/// [`build_router`] with the upload gates given, so a test can hold a slot or
+/// shorten a deadline. Each router gets its own gates, so each test server has
+/// its own slots.
+pub fn build_router_with_uploads(
+    state: Arc<AppState>,
+    profile_uploads: UploadGate,
+    firmware_uploads: UploadGate,
+) -> Router {
     Router::new()
         // Read endpoints
         .route("/status", get(handlers::status_handler))
@@ -189,8 +395,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // DEC-483: a firmware file for the daemon to write, at most 1 MiB.
         .route(
             "/fans/openfan/firmware",
-            put(handlers::openfan_firmware_stage_handler)
-                .layer(DefaultBodyLimit::max(crate::serial::uf2::MAX_FILE_BYTES)),
+            put(handlers::openfan_firmware_stage_handler.layer(
+                axum::middleware::from_fn_with_state(firmware_uploads, upload_gate),
+            ))
+            .layer(DefaultBodyLimit::max(crate::serial::uf2::MAX_FILE_BYTES)),
         )
         .route(
             "/fans/openfan/maintenance",
@@ -265,14 +473,33 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         // Profile CRUD (DEC-160) — daemon-owned profile store. axum 0.8 needs
         // method-chaining on a single route per path (duplicate paths panic).
+        //
+        // DEC-504: the two upload routes take a profile-sized body, one upload
+        // at a time, through `upload_gate` (slot before the body, both bounded
+        // in time). The layers sit on the handler, not the route, so a list,
+        // get or delete never waits.
         .route(
             "/profiles",
-            get(handlers::list_profiles_handler).post(handlers::create_profile_handler),
+            get(handlers::list_profiles_handler).post(
+                handlers::create_profile_handler
+                    .layer(DefaultBodyLimit::max(PROFILE_BODY_LIMIT))
+                    .layer(axum::middleware::from_fn_with_state(
+                        profile_uploads.clone(),
+                        upload_gate,
+                    )),
+            ),
         )
         .route(
             "/profiles/{id}",
             get(handlers::get_profile_handler)
-                .put(handlers::update_profile_handler)
+                .put(
+                    handlers::update_profile_handler
+                        .layer(DefaultBodyLimit::max(PROFILE_BODY_LIMIT))
+                        .layer(axum::middleware::from_fn_with_state(
+                            profile_uploads,
+                            upload_gate,
+                        )),
+                )
                 .delete(handlers::delete_profile_handler),
         )
         // Config management. GET /config is the read side (DEC-243) — before it
@@ -360,9 +587,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn(
             super::diagnostic_log::log_diagnostic_requests,
         ))
-        // Explicit 4 MiB request-body cap (S1): profile POSTs are the only
-        // large ingress; matches the file-read cap in `atomic_io`.
-        .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        // DEC-504: 64 KiB for every route that sets no cap of its own (the
+        // profile uploads and the firmware file above do). A layer set closer
+        // to the handler wins over this one.
+        .layer(DefaultBodyLimit::max(DEFAULT_BODY_LIMIT))
         .with_state(state)
 }
 
@@ -384,21 +612,16 @@ pub async fn serve(
 ) -> Result<(), ServeError> {
     log::info!("IPC server listening on {socket_path}");
 
-    let app = build_router(state);
-
-    // `into_make_service_with_connect_info` threads per-connection peer
-    // credentials (SO_PEERCRED) to handlers via `ConnectInfo<UdsConnectInfo>`
-    // (DEC-205). The stock `UnixListener` already implements axum's `Listener`,
-    // so no custom listener is needed — only the connect-info make-service.
-    axum::serve(
+    serve_router(
         listener,
-        app.into_make_service_with_connect_info::<UdsConnectInfo>(),
+        build_router(state),
+        ServerLimits::default(),
+        async {
+            let _ = shutdown.await;
+            log::info!("IPC server shutting down");
+        },
     )
-    .with_graceful_shutdown(async {
-        let _ = shutdown.await;
-        log::info!("IPC server shutting down");
-    })
-    .await?;
+    .await;
 
     // Clean up socket file on clean shutdown.
     let path = Path::new(&socket_path);
@@ -407,6 +630,100 @@ pub async fn serve(
     }
 
     Ok(())
+}
+
+/// Serve `router` on `listener` within `limits` until `shutdown` resolves
+/// (DEC-504).
+///
+/// A connection slot is taken **before** `accept`, so at the cap the loop stops
+/// accepting and further clients wait in the kernel's listen queue, holding no
+/// descriptor of the daemon's. The slot is released when the connection ends.
+/// Each connection is HTTP/1 only (as under `axum::serve` with axum's `http1`
+/// feature alone), with a timer so `header_read_timeout` takes effect. The
+/// caller's credentials go into every request as `ConnectInfo<UdsConnectInfo>`
+/// (DEC-205), which is what handlers extract.
+///
+/// On `shutdown` it stops accepting, closes idle connections and waits for
+/// in-flight requests to finish, as `axum::serve`'s graceful shutdown did.
+/// `main::shutdown_sequence` bounds that wait.
+pub async fn serve_router<F>(
+    listener: UnixListener,
+    router: Router,
+    limits: ServerLimits,
+    shutdown: F,
+) where
+    F: Future<Output = ()>,
+{
+    let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let graceful = GracefulShutdown::new();
+    let mut at_cap_logged = false;
+    tokio::pin!(shutdown);
+
+    loop {
+        // Log the first time the cap is reached, not on every connection after.
+        if slots.available_permits() == 0 {
+            if !at_cap_logged {
+                log::warn!(
+                    "IPC server: {} connections open, the most it serves at once; \
+                     new clients wait until one closes",
+                    limits.max_connections
+                );
+                at_cap_logged = true;
+            }
+        } else {
+            at_cap_logged = false;
+        }
+
+        let slot = tokio::select! {
+            slot = slots.clone().acquire_owned() => {
+                slot.expect("connection slots are never closed")
+            }
+            () = &mut shutdown => break,
+        };
+
+        let stream = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _addr)) => stream,
+                Err(e) => {
+                    // EMFILE, ENFILE, ENOMEM and the like: wait rather than spin,
+                    // but stay responsive to shutdown.
+                    log::warn!(
+                        "IPC server: accept failed: {e}; retrying in {} s",
+                        ACCEPT_ERROR_BACKOFF.as_secs()
+                    );
+                    drop(slot);
+                    tokio::select! {
+                        () = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => continue,
+                        () = &mut shutdown => break,
+                    }
+                }
+            },
+            () = &mut shutdown => break,
+        };
+
+        let info = UdsConnectInfo::of(&stream);
+        let router = router.clone();
+        let service = hyper::service::service_fn(move |mut request: hyper::Request<Incoming>| {
+            request.extensions_mut().insert(ConnectInfo(info.clone()));
+            router.clone().oneshot(request)
+        });
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder
+            .timer(TokioTimer::new())
+            .header_read_timeout(limits.header_read_timeout);
+        let connection = graceful.watch(builder.serve_connection(TokioIo::new(stream), service));
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                // A header timeout, a client that hung up mid-request, a
+                // malformed request: the client's problem, not the daemon's.
+                log::debug!("IPC connection ended: {e}");
+            }
+            drop(slot);
+        });
+    }
+
+    drop(listener);
+    graceful.shutdown().await;
 }
 
 #[cfg(test)]
@@ -519,7 +836,9 @@ mod tests {
     /// test's table and any comment naming a route are not read as routes.
     fn served_routes() -> Vec<(String, String)> {
         let src = include_str!("server.rs");
-        let start = src.find("pub fn build_router").expect("build_router");
+        let start = src
+            .find("pub fn build_router_with_uploads")
+            .expect("build_router_with_uploads");
         let open = start + src[start..].find('{').expect("body");
         let mut depth = 0usize;
         let mut end = open;
@@ -560,7 +879,12 @@ mod tests {
                     _ => {}
                 }
             }
-            let args = &body[args_start..args_end];
+            // Whitespace dropped, so a handler rustfmt moved onto its own line
+            // (`.post(\n handlers::…`) still reads as `post(handlers::…`.
+            let args: String = body[args_start..args_end]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
             let path = args.split('"').nth(1).expect("a route's path literal");
             for method in ["get", "post", "put", "delete", "patch"] {
                 let call = format!("{method}(handlers::");
@@ -629,5 +953,241 @@ mod tests {
             .filter(|(m, p)| !served.iter().any(|(sm, sp)| sm == m && sp == p))
             .collect();
         assert!(stale.is_empty(), "listed but not served: {stale:?}");
+    }
+}
+
+/// The accept loop's limits (DEC-504), over a real Unix socket with a small
+/// router of its own.
+#[cfg(test)]
+mod accept_loop_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Every wait in these tests is bounded by this.
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    struct TestServer {
+        path: PathBuf,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<()>,
+        /// Notified when a `/slow` handler starts.
+        slow_started: Arc<tokio::sync::Notify>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn router(slow_started: Arc<tokio::sync::Notify>) -> Router {
+        Router::new()
+            .route("/ping", get(|| async { "pong" }))
+            .route(
+                "/slow",
+                get(move || async move {
+                    slow_started.notify_one();
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    "done"
+                }),
+            )
+            .route(
+                "/whoami",
+                get(
+                    |ConnectInfo(info): ConnectInfo<UdsConnectInfo>| async move {
+                        format!("{:?}", info.uid)
+                    },
+                ),
+            )
+    }
+
+    async fn start(max_connections: usize, header_read_timeout: Duration) -> TestServer {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let limits = ServerLimits {
+            max_connections,
+            header_read_timeout,
+        };
+        let slow_started = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(serve_router(
+            listener,
+            router(slow_started.clone()),
+            limits,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        TestServer {
+            path,
+            stop: Some(stop),
+            task,
+            slow_started,
+            _dir: dir,
+        }
+    }
+
+    /// Send a keep-alive `GET` on `stream` and return the response body.
+    async fn get_on(stream: &mut UnixStream, path: &str) -> String {
+        let request = format!("GET {path} HTTP/1.1\r\nhost: t\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "the server closed the connection mid-response");
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).to_string();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_string)
+                    })
+                    .and_then(|v| v.trim().parse().ok())
+                    .expect("a content-length");
+                if body.len() >= length {
+                    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+                    return body[..length].to_string();
+                }
+            }
+        }
+    }
+
+    /// Wait for the server to close `stream`; returns how long that took.
+    async fn closed_within(stream: &mut UnixStream, limit: Duration) -> Duration {
+        let started = Instant::now();
+        let mut chunk = [0u8; 64];
+        let n = tokio::time::timeout(limit, stream.read(&mut chunk))
+            .await
+            .expect("the server did not close the connection in time")
+            .unwrap_or(0);
+        assert_eq!(n, 0, "expected the server to close the connection");
+        started.elapsed()
+    }
+
+    /// At the cap the server stops accepting. A client beyond it is connected
+    /// (the kernel queues it) but not served; it is served as soon as a slot
+    /// frees.
+    #[tokio::test]
+    async fn at_the_cap_a_new_client_waits_and_is_served_when_a_slot_frees() {
+        let server = start(2, Duration::from_secs(30)).await;
+        let mut a = UnixStream::connect(&server.path).await.unwrap();
+        let mut b = UnixStream::connect(&server.path).await.unwrap();
+        // Both are served, so both hold a slot (keep-alive keeps them open).
+        assert_eq!(get_on(&mut a, "/ping").await, "pong");
+        assert_eq!(get_on(&mut b, "/ping").await, "pong");
+
+        let path = server.path.clone();
+        let mut waiting = tokio::spawn(async move {
+            let mut c = UnixStream::connect(&path).await.unwrap();
+            get_on(&mut c, "/ping").await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut waiting)
+                .await
+                .is_err(),
+            "a third client was served while two of two slots were held"
+        );
+
+        drop(a);
+        let body = tokio::time::timeout(DEADLINE, waiting)
+            .await
+            .expect("the waiting client is served once a slot frees")
+            .unwrap();
+        assert_eq!(body, "pong");
+        drop(b);
+    }
+
+    /// A client that connects and never sends a request is closed after the
+    /// header timeout, and its slot goes to the next client.
+    #[tokio::test]
+    async fn a_client_that_sends_nothing_is_closed_and_frees_its_slot() {
+        let timeout = Duration::from_millis(300);
+        let server = start(1, timeout).await;
+        let mut silent = UnixStream::connect(&server.path).await.unwrap();
+        // Queued behind the silent client, which holds the only slot.
+        let path = server.path.clone();
+        let next = tokio::spawn(async move {
+            let mut c = UnixStream::connect(&path).await.unwrap();
+            get_on(&mut c, "/ping").await
+        });
+
+        let took = closed_within(&mut silent, DEADLINE).await;
+        assert!(
+            took >= timeout / 2,
+            "closed after {took:?}, before the header timeout could have run"
+        );
+        let body = tokio::time::timeout(DEADLINE, next)
+            .await
+            .expect("the next client is served once the silent one is closed")
+            .unwrap();
+        assert_eq!(body, "pong");
+    }
+
+    /// A keep-alive connection left idle after a response is closed too.
+    #[tokio::test]
+    async fn an_idle_keep_alive_connection_is_closed() {
+        let server = start(4, Duration::from_millis(300)).await;
+        let mut c = UnixStream::connect(&server.path).await.unwrap();
+        assert_eq!(get_on(&mut c, "/ping").await, "pong");
+        closed_within(&mut c, DEADLINE).await;
+    }
+
+    /// The timeout covers reading a request head, not a handler's work.
+    #[tokio::test]
+    async fn a_handler_slower_than_the_timeout_still_answers() {
+        let server = start(4, Duration::from_millis(200)).await;
+        let mut c = UnixStream::connect(&server.path).await.unwrap();
+        let body = tokio::time::timeout(DEADLINE, get_on(&mut c, "/slow"))
+            .await
+            .expect("bounded");
+        assert_eq!(body, "done");
+    }
+
+    /// Handlers still get the caller's uid (DEC-205), now inserted per request.
+    #[tokio::test]
+    async fn handlers_get_the_callers_uid() {
+        let server = start(4, Duration::from_secs(30)).await;
+        let mut c = UnixStream::connect(&server.path).await.unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(get_on(&mut c, "/whoami").await, format!("{:?}", Some(uid)));
+    }
+
+    /// On shutdown an in-flight request still finishes, an idle connection is
+    /// closed at once (not after the header timeout), the loop returns, and no
+    /// new client is accepted.
+    #[tokio::test]
+    async fn shutdown_finishes_in_flight_requests_and_closes_idle_ones() {
+        let mut server = start(4, Duration::from_secs(30)).await;
+        let mut idle = UnixStream::connect(&server.path).await.unwrap();
+        assert_eq!(get_on(&mut idle, "/ping").await, "pong");
+
+        let path = server.path.clone();
+        let in_flight = tokio::spawn(async move {
+            let mut c = UnixStream::connect(&path).await.unwrap();
+            get_on(&mut c, "/slow").await
+        });
+        // Stop only once the request is being handled.
+        tokio::time::timeout(DEADLINE, server.slow_started.notified())
+            .await
+            .expect("the /slow handler started");
+        let _ = server.stop.take().unwrap().send(());
+
+        closed_within(&mut idle, DEADLINE).await;
+        let body = tokio::time::timeout(DEADLINE, in_flight)
+            .await
+            .expect("bounded")
+            .unwrap();
+        assert_eq!(body, "done", "the in-flight request finished");
+        tokio::time::timeout(DEADLINE, &mut server.task)
+            .await
+            .expect("the accept loop returns once its connections have closed")
+            .unwrap();
+        assert!(
+            UnixStream::connect(&server.path).await.is_err(),
+            "nothing accepts after shutdown"
+        );
     }
 }

@@ -410,6 +410,23 @@ fn the_unit_waits_for_readiness_and_watches_the_engine() {
     );
 }
 
+/// [SAFETY] DEC-504. The OOM killer must prefer anything else on the machine to
+/// the daemon, whose death leaves the fans at their last duty with no thermal
+/// ladder. Negative, but never -1000: a daemon that leaked memory itself must
+/// stay killable.
+#[test]
+fn the_oom_killer_prefers_anything_else_but_can_still_kill_the_daemon() {
+    let unit = daemon_unit();
+    let adjust: i32 = unit_value(&unit, "OOMScoreAdjust")
+        .expect("the unit must set OOMScoreAdjust")
+        .parse()
+        .expect("OOMScoreAdjust must be an integer");
+    assert!(
+        (-999..=-500).contains(&adjust),
+        "OOMScoreAdjust={adjust}: strongly protected, but not exempt"
+    );
+}
+
 /// [SAFETY] DEC-388 (`TS-al`). A watchdog timeout asks for the graceful stop,
 /// because only the in-process stop can apply the exit floor to OpenFan
 /// channels — `ExecStopPost` cannot reach serial. Measured on systemd 261: the

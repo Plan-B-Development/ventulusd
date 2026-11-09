@@ -96,6 +96,14 @@ TimeoutAbortSec=10
 # other failure.
 TimeoutStartSec=120
 ExecStart=/usr/bin/ventulusd
+# [SAFETY] DEC-504: protect the daemon from the kernel's OOM killer, short of
+# exempting it. Killing it leaves every fan at its last duty until
+# ExecStopPost and the restart run, and nothing evaluates the thermal ladder in
+# between. Not -1000: a daemon that leaked memory itself must still be
+# killable. The daemon bounds its own large allocations (one profile upload and
+# one firmware upload at a time, 64 KiB bodies elsewhere), so this guards
+# against everything else on the machine.
+OOMScoreAdjust=-900
 ExecStopPost=/usr/bin/ventulus-restore-auto
 ExecReload=/bin/kill -HUP $MAINPID
 RuntimeDirectory=ventulus

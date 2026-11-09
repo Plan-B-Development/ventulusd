@@ -5,6 +5,20 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+### Fixed
+
+- **No local user can stop the thermal emergency by tying up the daemon's socket.** The socket is
+  open to every local user, and the daemon used to accept connections without limit and keep idle
+  ones open for ever. About a thousand idle connections used up its open-file limit, after which
+  every motherboard fan write failed, the thermal emergency's included. The daemon now serves at
+  most 64 connections at once (a further client waits until one closes), closes a connection that
+  sends no complete request head within 10 s, and raises its own open-file limit to 65536 at start.
+  Request bodies are limited to 64 KiB, except profile uploads (4 MiB) and firmware files (1 MiB).
+  Each kind of upload is handled one at a time: another waits up to 4 s and then answers `503`
+  (retryable), and a body that has not arrived 10 s after its turn answers `408`. The unit sets
+  `OOMScoreAdjust=-900`. A client can still make the API slow; it can no longer use up the file
+  handles the fan writes need.
+
 ## [5.5.0] — 2026-11-03
 
 Pairs with `ventulus` >= v2.23.0; ventulus 6.0.0 is the matching GUI release, and its

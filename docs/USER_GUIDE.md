@@ -341,6 +341,13 @@ quietly stop. The unit file's own comments
   while the service failed to start.
 - **Reload.** `systemctl reload` sends `SIGHUP`, which applies the profile search
   directories, the exit minimum and the coolant limit (§ Configuration).
+- **Resources.** At start the daemon raises its own soft open-file limit to
+  65536 (or the hard limit, if lower), so every fan write can open its file
+  however many clients are connected; the journal shows
+  `Open-file limit raised from 1024 to 65536`. It does this itself rather than
+  through the unit, so a daemon you run by hand gets it too. The unit sets
+  `OOMScoreAdjust=-900`, so the kernel's out-of-memory killer picks almost
+  anything else first, but can still kill a daemon that leaked memory itself.
 - **Sleep.** The package installs a system-sleep hook,
   `/usr/lib/systemd/system-sleep/ventulusd`, because the watchdog keeps counting
   while user space is frozen for a suspend and resume. Before a sleep it sends
@@ -907,6 +914,15 @@ is the reference for every endpoint, payload and error code. Errors share one
 envelope, `{"error": {"code", "message", "retryable", "source", "details"}}`. A
 client should decide what to offer from the feature flags in `GET /capabilities`,
 not from the daemon's version number.
+
+The daemon serves at most 64 connections at once; a client beyond that connects
+but waits until another closes. It closes a connection that sends no complete
+request head within 10 s, including a kept-alive one left idle, so a long-lived
+client should be ready to reconnect. Request bodies are limited to 64 KiB, except a
+profile upload (4 MiB) and a firmware file (1 MiB); a larger body answers `413`.
+Profile uploads are handled one at a time, and so are firmware uploads: another
+waits up to 4 s, then answers `503` (retryable, `details.reason: "upload_busy"`),
+and an upload whose body has not arrived 10 s after its turn came answers `408`.
 
 | To | Use |
 |---|---|

@@ -562,7 +562,7 @@ pub async fn get_profile_handler(
 /// (409 on a store-scoped duplicate). On `validate_only`, nothing is persisted.
 async fn validate_and_store(
     state: &AppState,
-    body: &serde_json::Value,
+    mut body: serde_json::Value,
     expected_id: &str,
     allow_overwrite: bool,
     validate_only: bool,
@@ -597,13 +597,13 @@ async fn validate_and_store(
 
     // DEC-442: canonicalise hwmon ids before validating and storing, so a
     // member or sensor carrying the it87 v2.0 suffixed chip spelling is stored
-    // under the id discovery publishes. Every other field is untouched.
-    let mut body = body.clone();
+    // under the id discovery publishes. Every other field is untouched. In
+    // place, and the model below is parsed from a reference: a parsed profile
+    // body is many times its raw size, so no copy of it is made (DEC-504).
     crate::profile::canonicalize_profile_document(&mut body);
-    let body = &body;
 
     // Parse into the model to validate (storage keeps the raw document).
-    let profile: crate::profile::DaemonProfile = match serde_json::from_value(body.clone()) {
+    let profile = match <crate::profile::DaemonProfile as serde::Deserialize>::deserialize(&body) {
         Ok(p) => p,
         Err(e) => {
             return error_response(
@@ -649,7 +649,7 @@ async fn validate_and_store(
     // size, and re-serialising expands numbers (`1e9` is stored as
     // `1000000000.0`), so a body the 4 MiB request limit accepted could be
     // stored as a file the daemon then refused to read, list or activate.
-    let bytes = match serde_json::to_vec(body) {
+    let bytes = match serde_json::to_vec(&body) {
         Ok(b) => b,
         Err(e) => {
             return error_response(
@@ -754,7 +754,7 @@ pub async fn create_profile_handler(
     };
     validate_and_store(
         &state,
-        &body,
+        body,
         &id,
         false,
         is_validate_only(&params),
@@ -774,7 +774,7 @@ pub async fn update_profile_handler(
 ) -> (StatusCode, Json<serde_json::Value>) {
     validate_and_store(
         &state,
-        &body,
+        body,
         &id,
         true,
         is_validate_only(&params),

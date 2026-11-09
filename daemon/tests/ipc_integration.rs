@@ -10108,3 +10108,243 @@ async fn a_diagnostic_start_request_is_logged_with_its_caller_and_answer() {
     let _ = shutdown.send(());
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// DEC-504 — request bodies and profile uploads (`IPC-a`).
+// ---------------------------------------------------------------------------
+
+/// Every route without a cap of its own takes at most 64 KiB; a profile upload
+/// still takes a document far larger than that.
+#[tokio::test]
+async fn small_routes_refuse_a_body_over_64_kib_and_profile_uploads_do_not() {
+    let (state, _store) = state_with_temp_store();
+    let (sock, _tx, _d) = start_test_server(state).await;
+    let limit = server::DEFAULT_BODY_LIMIT;
+
+    // At the cap the body reaches the handler, which refuses it as JSON (400).
+    // One byte over, the cap refuses it first (413).
+    let (st, _) = uds_post_json_bytes(&sock, "/config/startup-delay", vec![b' '; limit]).await;
+    assert_eq!(st, 400, "a body at the cap reaches the handler");
+    let (st, _) = uds_post_json_bytes(&sock, "/config/startup-delay", vec![b' '; limit + 1]).await;
+    assert_eq!(st, 413, "one byte over the default cap is refused");
+
+    // A valid profile padded to twice the default cap: accepted on both routes.
+    let mut big = valid_profile("big");
+    big["description"] = serde_json::Value::String("x".repeat(2 * limit));
+    let bytes = serde_json::to_vec(&big).unwrap();
+    assert!(bytes.len() > limit, "precondition: over the default cap");
+    let (st, body) = uds_post_json_bytes(&sock, "/profiles?validate_only=true", bytes).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["valid"], true);
+    let (st, body) = uds_send(&sock, "PUT", "/profiles/big?validate_only=true", Some(&big)).await;
+    assert_eq!(st, 200, "{body}");
+}
+
+/// Start a server on `router` with the production accept-loop limits.
+async fn start_test_server_with_router(
+    router: axum::Router,
+) -> (String, tokio::sync::oneshot::Sender<()>, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_path = tmp.path().join("test.sock").to_str().unwrap().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    tokio::spawn(server::serve_router(
+        listener,
+        router,
+        server::ServerLimits::default(),
+        async {
+            let _ = rx.await;
+        },
+    ));
+    (socket_path, tx, tmp)
+}
+
+/// Upload gates with short deadlines, so a test does not wait for the real ones.
+fn short_gates(
+    slot_wait_ms: u64,
+    body_deadline_ms: u64,
+) -> (server::UploadGate, server::UploadGate) {
+    let wait = std::time::Duration::from_millis(slot_wait_ms);
+    let body = std::time::Duration::from_millis(body_deadline_ms);
+    (
+        server::UploadGate::new(server::PROFILE_BODY_LIMIT, wait, body),
+        server::UploadGate::new(1024 * 1024, wait, body),
+    )
+}
+
+/// One profile upload at a time: while the slot is taken a second upload waits
+/// (on either upload route), a read does not, and the waiting upload is served
+/// as soon as the slot frees.
+#[tokio::test]
+async fn a_profile_upload_waits_for_the_slot_and_reads_do_not() {
+    let (state, _store) = state_with_temp_store();
+    let (profiles, firmware) = short_gates(5_000, 5_000);
+    let held = profiles
+        .slots()
+        .try_acquire_owned()
+        .expect("the slot is free");
+    let router = server::build_router_with_uploads(state, profiles, firmware);
+    let (sock, _tx, _d) = start_test_server_with_router(router).await;
+
+    let (st, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        uds_get(&sock, "/profiles"),
+    )
+    .await
+    .expect("GET /profiles does not wait for an upload slot");
+    assert_eq!(st, 200);
+
+    let waiting = tokio::spawn({
+        let sock = sock.clone();
+        async move {
+            uds_send(
+                &sock,
+                "PUT",
+                "/profiles/second?validate_only=true",
+                Some(&valid_profile("second")),
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !waiting.is_finished(),
+        "an upload waits while the slot is taken"
+    );
+
+    drop(held);
+    let (st, body) = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("served once the slot frees")
+        .unwrap();
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(body["valid"], true);
+}
+
+/// An upload that cannot get the slot in time is refused, retryable, and is
+/// never applied later, even once the slot frees: the GUI that gave up and told
+/// the user it failed is right.
+#[tokio::test]
+async fn an_upload_that_cannot_get_the_slot_in_time_is_refused_and_never_applied() {
+    let (state, store) = state_with_temp_store();
+    let (profiles, firmware) = short_gates(300, 5_000);
+    let held = profiles
+        .slots()
+        .try_acquire_owned()
+        .expect("the slot is free");
+    let router = server::build_router_with_uploads(state, profiles, firmware);
+    let (sock, _tx, _d) = start_test_server_with_router(router).await;
+
+    let started = Instant::now();
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        uds_send(&sock, "POST", "/profiles", Some(&valid_profile("late"))),
+    )
+    .await
+    .expect("refused within its wait, not left waiting");
+    assert_eq!(st, 503, "{body}");
+    assert_eq!(
+        body["error"]["details"]["reason"],
+        server::UPLOAD_BUSY_REASON
+    );
+    assert_eq!(body["error"]["retryable"], true);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(250),
+        "refused only after waiting"
+    );
+
+    drop(held);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !store.path().join("late.json").exists(),
+        "a refused upload is never stored"
+    );
+    // With the slot free, the same upload is accepted.
+    let (st, body) = uds_send(&sock, "POST", "/profiles", Some(&valid_profile("late"))).await;
+    assert_eq!(st, 201, "{body}");
+    assert!(store.path().join("late.json").exists());
+}
+
+/// A client that sends an upload's head and stalls its body is cut off, and the
+/// slot it held goes to the next upload.
+#[tokio::test]
+async fn a_stalled_upload_body_is_cut_off_and_frees_the_slot() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (state, _store) = state_with_temp_store();
+    let (profiles, firmware) = short_gates(5_000, 300);
+    let slots = profiles.slots();
+    let router = server::build_router_with_uploads(state, profiles, firmware);
+    let (sock, _tx, _d) = start_test_server_with_router(router).await;
+
+    let mut stalled = UnixStream::connect(&sock).await.unwrap();
+    stalled
+        .write_all(
+            b"POST /profiles HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+              content-length: 1000\r\n\r\n{\"id\": \"a",
+        )
+        .await
+        .unwrap();
+    let mut response = vec![0u8; 512];
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stalled.read(&mut response),
+    )
+    .await
+    .expect("the stalled upload is answered")
+    .unwrap();
+    let text = String::from_utf8_lossy(&response[..n]);
+    assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+    assert!(text.contains(server::BODY_TIMEOUT_REASON), "{text}");
+    assert_eq!(slots.available_permits(), 1, "the slot is free again");
+
+    let (st, body) = uds_send(
+        &sock,
+        "POST",
+        "/profiles?validate_only=true",
+        Some(&valid_profile("next")),
+    )
+    .await;
+    assert_eq!(st, 200, "{body}");
+}
+
+/// The firmware upload has a slot of its own: held, a firmware upload is
+/// refused after its wait, while a profile upload is unaffected.
+#[tokio::test]
+async fn the_firmware_upload_has_its_own_slot() {
+    let (state, _store) = state_with_temp_store();
+    let (profiles, firmware) = short_gates(300, 5_000);
+    let held = firmware
+        .slots()
+        .try_acquire_owned()
+        .expect("the slot is free");
+    let router = server::build_router_with_uploads(state, profiles, firmware);
+    let (sock, _tx, _d) = start_test_server_with_router(router).await;
+
+    let (st, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        uds_put_bytes(&sock, "/fans/openfan/firmware", b"not firmware".to_vec()),
+    )
+    .await
+    .expect("refused within its wait, not left waiting");
+    assert_eq!(st, 503, "{body}");
+    assert_eq!(
+        body["error"]["details"]["reason"],
+        server::UPLOAD_BUSY_REASON
+    );
+    let (st, body) = uds_send(
+        &sock,
+        "POST",
+        "/profiles?validate_only=true",
+        Some(&valid_profile("p")),
+    )
+    .await;
+    assert_eq!(
+        st, 200,
+        "a profile upload does not wait on the firmware slot: {body}"
+    );
+
+    drop(held);
+    let (st, body) = uds_put_bytes(&sock, "/fans/openfan/firmware", b"not firmware".to_vec()).await;
+    assert_eq!(st, 200, "{body}");
+}
