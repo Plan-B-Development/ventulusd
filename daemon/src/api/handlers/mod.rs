@@ -1117,6 +1117,29 @@ pub(crate) fn hwmon_controller_busy() -> (StatusCode, Json<serde_json::Value>) {
     error_response(StatusCode::SERVICE_UNAVAILABLE, &e)
 }
 
+/// The `details.reason` of a request refused because no request-blocking permit
+/// came free within `HWMON_CONTROLLER_WAIT` (DEC-505): other requests' blocking
+/// work held every one. Not a hardware condition.
+pub const REQUEST_POOL_BUSY_REASON: &str = "request_pool_busy";
+
+/// The answer for a [`ControllerBusy`](crate::api::hwmon_handle::ControllerBusy),
+/// by its cause: a stuck write is [`hwmon_controller_busy`]; a full request pool
+/// (DEC-505) is 503 `internal_error`, retryable,
+/// `details.reason: "request_pool_busy"`.
+pub(crate) fn controller_busy(
+    busy: crate::api::hwmon_handle::ControllerBusy,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match busy {
+        crate::api::hwmon_handle::ControllerBusy::Lock => hwmon_controller_busy(),
+        crate::api::hwmon_handle::ControllerBusy::RequestPool => {
+            let mut e =
+                ErrorEnvelope::internal("the daemon is busy with other requests — try again");
+            e.error.details = Some(serde_json::json!({ "reason": REQUEST_POOL_BUSY_REASON }));
+            error_response(StatusCode::SERVICE_UNAVAILABLE, &e)
+        }
+    }
+}
+
 /// The `details.reason` of every refusal caused by a running firmware update.
 pub const OPENFAN_MAINTENANCE_REASON: &str = "openfan_maintenance";
 
@@ -1251,7 +1274,7 @@ where
     F: FnOnce() -> Result<T, String> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    match crate::api::blocking::run(f).await {
         Ok(result) => result,
         // The closure panicked or the runtime is shutting down. Report it as a
         // persistence failure rather than unwrapping — a panicking write must

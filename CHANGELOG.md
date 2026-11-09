@@ -18,6 +18,17 @@ rename. Version numbers carry on from Control-OFC.
   (retryable), and a body that has not arrived 10 s after its turn answers `408`. The unit sets
   `OOMScoreAdjust=-900`. A client can still make the API slow; it can no longer use up the file
   handles the fan writes need.
+- **A flood of requests can no longer hold up the daemon's fan writes.** The daemon's fan writes and
+  its sensor reads run on the same pool of background threads as the work API requests start, and
+  a client that sends a request and hangs up leaves that work running. A local client repeating
+  that on a route that scans the hardware queued work faster than it drained; a fan write, the
+  thermal emergency's included, then waited behind the queue indefinitely. Request work now uses
+  at most 64 of those threads at once, so the fan writes and sensor reads always find one free.
+  - A request that cannot get one of those 64 within 2 s while starting a motherboard fan
+    diagnostic is refused with `503`, `details.reason: "request_pool_busy"` (retryable).
+  - `/diagnostics/hardware` no longer hangs while a motherboard fan write has not returned. It
+    answers after 2 s without the BIOS reclaim counts, and says so with
+    `enable_revert_counts_unavailable`.
 
 ## [5.5.0] — 2026-11-03
 

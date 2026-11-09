@@ -135,11 +135,11 @@ pub async fn stall_probe_handler(
         return super::verify_slot_refusal(&state.cache);
     };
 
-    let Ok((verify_lease, verify_guard)) =
-        super::hwmon_ctl::take_verify_lease(controller, verify_guard).await
-    else {
-        return super::hwmon_controller_busy();
-    };
+    let (verify_lease, verify_guard) =
+        match super::hwmon_ctl::take_verify_lease(controller, verify_guard).await {
+            Ok(taken) => taken,
+            Err(busy) => return super::controller_busy(busy),
+        };
     let verify_lease_id = verify_lease.lease_id.clone();
     let lease_for_renew = verify_lease_id.clone();
 
@@ -181,6 +181,7 @@ pub async fn stall_probe_handler(
         let interval_path = pwm_path.clone();
         let driver_refresh_ms = tokio::time::timeout(
             crate::constants::DIAGNOSTIC_READ_BUDGET,
+            // Not capped (DEC-505): a stall-probe read (single diagnostic slot).
             tokio::task::spawn_blocking(move || {
                 super::discovery::read_update_interval(&interval_path)
             }),
@@ -231,6 +232,7 @@ pub async fn stall_probe_handler(
             let read_fn = move || {
                 let paths = paths.clone();
                 async move {
+                    // Not capped (DEC-505): a stall-probe read (single diagnostic slot).
                     let join = tokio::task::spawn_blocking(move || {
                         super::hwmon_ctl::read_header_state(&paths.0, &paths.1, &paths.2)
                     });

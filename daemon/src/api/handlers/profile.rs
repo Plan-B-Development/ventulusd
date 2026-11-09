@@ -428,11 +428,16 @@ pub(super) async fn release_engine_lease_and_report(
             guard.on_lease_released();
         }
     });
-    if released.await.is_err() {
-        log::warn!(
+    match released.await {
+        Ok(()) => {}
+        Err(crate::api::hwmon_handle::ControllerBusy::Lock) => log::warn!(
             "Profile deactivated, but the hwmon controller stayed busy — the engine's lease \
              was not released"
-        );
+        ),
+        Err(crate::api::hwmon_handle::ControllerBusy::RequestPool) => log::warn!(
+            "Profile deactivated, but other requests kept the daemon busy — the engine's \
+             lease was not released"
+        ),
     }
     deactivation_report(previous)
 }

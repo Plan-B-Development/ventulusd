@@ -33,7 +33,7 @@ use crate::hwmon::HWMON_SYSFS_ROOT;
 pub async fn hwmon_inventory_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match tokio::task::spawn_blocking(move || build_hwmon_inventory(&state)).await {
+    match crate::api::blocking::run(move || build_hwmon_inventory(&state)).await {
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -206,7 +206,7 @@ pub async fn ensure_assessment(
     let cache = state.assessment.clone();
     cache
         .ensure_with(force, ASSESSMENT_TTL, || async move {
-            match tokio::task::spawn_blocking(move || compute_hardware_assessment(&state)).await {
+            match crate::api::blocking::run(move || compute_hardware_assessment(&state)).await {
                 Ok(a) => Some(a),
                 Err(e) => {
                     log::warn!("hardware assessment scan task failed: {e}");
@@ -529,7 +529,7 @@ pub async fn superio_probe_handler(
     let base = ensure_assessment(state.clone(), false)
         .await
         .map(|a| a.superio.clone());
-    match tokio::task::spawn_blocking(move || build_superio_probe_response(&state, base)).await {
+    match crate::api::blocking::run(move || build_superio_probe_response(&state, base)).await {
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

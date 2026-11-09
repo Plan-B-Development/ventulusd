@@ -763,6 +763,7 @@ fn rpm_reading(cache: &StateCache, channel: u8) -> Option<(u16, u64)> {
 /// Run a controller write on the blocking pool.
 async fn write_off_runtime(write: &CalWriteFn, channel: u8, pct: u8) -> Result<(), String> {
     let w = Arc::clone(write);
+    // Not capped (DEC-505): an OpenFAN calibration write (single diagnostic slot).
     match tokio::task::spawn_blocking(move || w(channel, pct)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),

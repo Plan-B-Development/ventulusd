@@ -2317,6 +2317,9 @@ fn main() {
     let _ = MAIN_THREAD.set(std::thread::current().id());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        // [SAFETY] DEC-505: pinned so the request-path cap's headroom is checked
+        // against a known size (`constants::REQUEST_BLOCKING_MAX_OUTSTANDING`).
+        .max_blocking_threads(ventulusd::constants::TOKIO_MAX_BLOCKING_THREADS)
         .build()
         .expect("failed to build the tokio runtime");
 

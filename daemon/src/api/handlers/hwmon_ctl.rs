@@ -495,8 +495,9 @@ pub async fn hwmon_verify_handler(
     // Force-take a daemon-owned "verify" lease for our own controlled writes,
     // released by `VerifyLeaseGuard` (defined above the handler) on EVERY exit
     // path — including a cancelled or panicked future.
-    let Ok((verify_lease, verify_guard)) = take_verify_lease(controller, verify_guard).await else {
-        return super::hwmon_controller_busy();
+    let (verify_lease, verify_guard) = match take_verify_lease(controller, verify_guard).await {
+        Ok(taken) => taken,
+        Err(busy) => return super::controller_busy(busy),
     };
     let verify_lease_id = verify_lease.lease_id.clone();
 
@@ -551,6 +552,7 @@ pub async fn hwmon_verify_handler(
         move || watch_state.header_is_pump_protected(&watch_id),
     );
     let bg_lease_id = verify_lease_id.clone();
+    // Not capped (DEC-505): the verify (holds its lease and pause).
     let join = tokio::task::spawn_blocking(move || {
         // Moved, not borrowed: dropped only when this task finishes, so the
         // pause and the lease outlive every write below on every path.
@@ -1144,8 +1146,9 @@ pub async fn hwmon_characterize_handler(
         })
         .unwrap_or_default();
 
-    let Ok((verify_lease, verify_guard)) = take_verify_lease(controller, verify_guard).await else {
-        return super::hwmon_controller_busy();
+    let (verify_lease, verify_guard) = match take_verify_lease(controller, verify_guard).await {
+        Ok(taken) => taken,
+        Err(busy) => return super::controller_busy(busy),
     };
     let verify_lease_id = verify_lease.lease_id.clone();
     let lease_for_renew = verify_lease_id.clone();
@@ -1264,6 +1267,7 @@ pub async fn hwmon_characterize_handler(
             let read_fn = move || {
                 let paths = paths.clone();
                 async move {
+                    // Not capped (DEC-505): a characterisation read (single diagnostic slot).
                     let join = tokio::task::spawn_blocking(move || {
                         read_header_state(&paths.0, &paths.1, &paths.2)
                     });
@@ -1312,6 +1316,7 @@ pub async fn hwmon_characterize_handler(
             let interval_path = pwm_path.clone();
             let driver_interval = tokio::time::timeout(
                 crate::constants::DIAGNOSTIC_READ_BUDGET,
+                // Not capped (DEC-505): a characterisation read (single diagnostic slot).
                 tokio::task::spawn_blocking(move || {
                     super::discovery::read_update_interval(&interval_path)
                 }),

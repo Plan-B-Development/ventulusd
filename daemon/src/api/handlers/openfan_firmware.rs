@@ -211,10 +211,24 @@ fn no_controller_answers(state: &AppState) -> bool {
     state.openfan().is_none() || state.cache.openfan_link() == Some(OpenFanLink::Reconnecting)
 }
 
+/// Which blocking pool [`silent_now`] reads on (DEC-505).
+#[derive(Clone, Copy)]
+enum SilentRead {
+    /// A request's read: capped with the other request work.
+    Request,
+    /// The daemon's own silent-board watch loop: one task, not capped.
+    WatchLoop,
+}
+
 /// The silent boards now (DEC-484): none while a controller answers or an
 /// update runs, or while no probe has left evidence. Reads sysfs off the
 /// runtime; opens nothing.
-async fn silent_now(state: &AppState, sys: &Path, observe: Observe) -> Vec<SilentBoard> {
+async fn silent_now(
+    state: &AppState,
+    sys: &Path,
+    observe: Observe,
+    pool: SilentRead,
+) -> Vec<SilentBoard> {
     if !no_controller_answers(state) || state.cache.openfan_maintenance_running() {
         return Vec::new();
     }
@@ -223,15 +237,19 @@ async fn silent_now(state: &AppState, sys: &Path, observe: Observe) -> Vec<Silen
         return Vec::new();
     }
     let sys = sys.to_path_buf();
-    tokio::task::spawn_blocking(move || silent::silent_boards(&sys, &evidence, |p| observe(p)))
-        .await
-        .unwrap_or_default()
+    let read = move || silent::silent_boards(&sys, &evidence, |p| observe(p));
+    match pool {
+        SilentRead::Request => crate::api::blocking::run(read).await,
+        // Not capped (DEC-505): the daemon's own silent-board watch loop (one task).
+        SilentRead::WatchLoop => tokio::task::spawn_blocking(read).await,
+    }
+    .unwrap_or_default()
 }
 
 /// Whether the daemon may open USB devices, off the runtime.
 async fn usb_access(dev_root: &Path) -> bool {
     let dev = dev_root.to_path_buf();
-    tokio::task::spawn_blocking(move || picoboot::usb_access(&dev))
+    crate::api::blocking::run(move || picoboot::usb_access(&dev))
         .await
         .unwrap_or(false)
 }
@@ -257,7 +275,7 @@ fn daemon_write(access: bool) -> OpenFanDaemonWrite {
 /// runtime. Read-only sysfs; opens nothing.
 async fn read_usb(sys: &Path, port: Option<String>) -> (Option<TtyIdentity>, Vec<UsbDevice>) {
     let sys = sys.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    crate::api::blocking::run(move || {
         (
             port.as_deref().and_then(|p| usb::tty_identity(&sys, p)),
             usb::bootloaders(&sys),
@@ -411,7 +429,7 @@ async fn describe_device(
                 (c.hw_info, c.fw_info)
             } else {
                 let ctrl = ctrl.clone();
-                let read = tokio::task::spawn_blocking(move || {
+                let read = crate::api::blocking::run(move || {
                     let mut c = ctrl.lock();
                     let hw = c.read_info(HW_INFO_OPCODE).ok();
                     let fw = c.read_info(FW_INFO_OPCODE).ok();
@@ -438,7 +456,7 @@ async fn describe_device(
     let refusals = preview_refusals(state, identity.as_ref(), &bootloaders);
     let daemon_write = daemon_write(usb_access(dev).await);
     // DEC-484: the board on USB that does not answer, while no controller does.
-    let silent_board = silent_now(state, sys, observe)
+    let silent_board = silent_now(state, sys, observe, SilentRead::Request)
         .await
         .into_iter()
         .next()
@@ -487,7 +505,7 @@ pub async fn openfan_firmware_stage_handler(
             uf2::MAX_FILE_BYTES
         ));
     }
-    let Ok(assessed) = tokio::task::spawn_blocking(move || firmware::assess(&body)).await else {
+    let Ok(assessed) = crate::api::blocking::run(move || firmware::assess(&body)).await else {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             &ErrorEnvelope::internal("the firmware file could not be read"),
@@ -750,7 +768,7 @@ async fn start_silent(
     if !bootloaders.is_empty() {
         return refused("bootloader_present", bootloader_message(&bootloaders));
     }
-    let silent = silent_now(state, &io.sys_root, io.observe.clone()).await;
+    let silent = silent_now(state, &io.sys_root, io.observe.clone(), SilentRead::Request).await;
     let Some(board) = silent.into_iter().find(|b| b.usb_serial() == serial) else {
         let message = if no_controller_answers(state) {
             format!(
@@ -1059,6 +1077,7 @@ async fn silent_watch_with(
         let evidence = state.cache.openfan_unanswered();
         if !evidence.is_empty() {
             let o = observe.clone();
+            // Not capped (DEC-505): the daemon's own silent-board watch loop (one task).
             let gone = tokio::task::spawn_blocking(move || {
                 evidence
                     .into_iter()
@@ -1073,7 +1092,7 @@ async fn silent_watch_with(
                 });
             }
         }
-        let found = silent_now(&state, &sys, observe.clone()).await;
+        let found = silent_now(&state, &sys, observe.clone(), SilentRead::WatchLoop).await;
         state
             .cache
             .set_openfan_silent_board(found.first().map(SilentBoard::entry));
@@ -1253,6 +1272,7 @@ async fn watch_for_return<A, F>(
             return;
         }
         let (root, p, s) = (sys.clone(), port.clone(), serial.clone());
+        // Not capped (DEC-505): the daemon's own recovery watch loop (one task).
         let back = tokio::task::spawn_blocking(move || board_back(&root, &p, &s, interface))
             .await
             .unwrap_or(false);

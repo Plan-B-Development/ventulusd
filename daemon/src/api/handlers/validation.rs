@@ -201,7 +201,7 @@ pub async fn start_auto_startup_record(state: &Arc<AppState>) -> Option<String> 
     let ctx = recorder_context(state);
     let device_id = device.id.clone();
     let engine = state.validation.clone();
-    let started = tokio::task::spawn_blocking(move || engine.start(session, &ctx))
+    let started = crate::api::blocking::run(move || engine.start(session, &ctx))
         .await
         .ok()?;
     match started {
@@ -254,7 +254,7 @@ pub async fn stop_auto_startup_record(state: &Arc<AppState>, session_id: &str) {
     // incapable of. Found by the concurrency review.
     let engine = state.validation.clone();
     let owned = session_id.to_string();
-    let finished = tokio::task::spawn_blocking(move || engine.stop_if(&owned)).await;
+    let finished = crate::api::blocking::run(move || engine.stop_if(&owned)).await;
     match finished {
         Ok(Some(s)) => log::info!(
             "Startup lifecycle recording {} closed after {} s ({} samples)",
@@ -466,7 +466,7 @@ async fn finalise_off_runtime(
     which: Finalise,
 ) -> Result<Option<crate::validation::session::ValidationSession>, String> {
     let engine = state.validation.clone();
-    match tokio::task::spawn_blocking(move || match which {
+    match crate::api::blocking::run(move || match which {
         Finalise::Stop => engine.stop(),
         Finalise::Cancel => engine.cancel(),
     })
@@ -676,7 +676,7 @@ pub async fn start_session_handler(
     // persisted rollback where it belongs, inside the engine.
     let started = {
         let engine = state.validation.clone();
-        match tokio::task::spawn_blocking(move || engine.start(session, &ctx)).await {
+        match crate::api::blocking::run(move || engine.start(session, &ctx)).await {
             Ok(result) => result,
             // The blocking task panicked or the runtime is shutting down.
             // Reported as a persistence failure rather than unwrapped: a
@@ -1075,7 +1075,7 @@ fn spawn_orchestration(
         if auto_stop && !*shutdown.borrow() {
             let engine = state.validation.clone();
             let owned = session_id.clone();
-            match tokio::task::spawn_blocking(move || engine.stop_if(&owned)).await {
+            match crate::api::blocking::run(move || engine.stop_if(&owned)).await {
                 Ok(Some(s)) => {
                     log::info!(
                         "Validation session {} finalised on diagnostic completion ({} samples, \

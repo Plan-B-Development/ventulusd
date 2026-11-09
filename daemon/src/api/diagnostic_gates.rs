@@ -370,6 +370,7 @@ pub(crate) async fn bounded_hwmon_write(
     lease_id: String,
     pct: u8,
 ) -> Result<(), WriteFailure> {
+    // Not capped (DEC-505): a diagnostic write (single diagnostic slot).
     let join = tokio::task::spawn_blocking(move || {
         controller
             .lock()

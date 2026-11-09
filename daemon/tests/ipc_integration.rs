@@ -10348,3 +10348,138 @@ async fn the_firmware_upload_has_its_own_slot() {
     let (st, body) = uds_put_bytes(&sock, "/fans/openfan/firmware", b"not firmware".to_vec()).await;
     assert_eq!(st, 200, "{body}");
 }
+
+// ---------------------------------------------------------------------------
+// DEC-505 — request work cannot crowd the engine off the blocking pool (`IPC-b`).
+// ---------------------------------------------------------------------------
+
+/// [SAFETY] A local client looping connect, request, hang-up on a route that
+/// does blocking work cannot delay the engine's blocking work past its write
+/// budget. hyper drops each handler when its client hangs up, but the scan it
+/// started runs on; before DEC-505 those queued faster than the pool drained
+/// them, and a no-op `spawn_blocking` (the engine's write, the thermal force's
+/// included, takes the same path) waited 876 ms and then did not run within
+/// five minutes. Now request work holds at most
+/// `REQUEST_BLOCKING_MAX_OUTSTANDING` threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_flood_cannot_delay_the_engines_blocking_work() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    /// The engine joins each write for at most this long (`WRITE_JOIN_BUDGET`).
+    const ENGINE_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+    let stop = Arc::new(AtomicBool::new(false));
+    let sent = Arc::new(AtomicUsize::new(0));
+    let floods: Vec<_> = (0..16)
+        .map(|_| {
+            let (sock, stop, sent) = (sock.clone(), stop.clone(), sent.clone());
+            tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    match UnixStream::connect(&sock).await {
+                        Ok(mut s) => {
+                            let _ = s
+                                .write_all(b"GET /diagnostics/hardware HTTP/1.1\r\nhost: x\r\n\r\n")
+                                .await;
+                            tokio::task::yield_now().await;
+                            drop(s);
+                            sent.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // A full backlog fails the connect at once, without
+                        // yielding: back off, or 16 loops can starve the
+                        // accept task and the timers on a small runner.
+                        Err(_) => tokio::time::sleep(std::time::Duration::from_millis(1)).await,
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let mut worst = std::time::Duration::ZERO;
+    let mut fewest_free = usize::MAX;
+    let until = Instant::now() + std::time::Duration::from_secs(2);
+    while Instant::now() < until {
+        fewest_free = fewest_free.min(ventulusd::api::blocking::request_permits_available());
+        let started = Instant::now();
+        let ran =
+            tokio::time::timeout(2 * ENGINE_WRITE_BUDGET, tokio::task::spawn_blocking(|| ())).await;
+        worst = worst.max(started.elapsed());
+        if ran.is_err() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    stop.store(true, Ordering::Relaxed);
+    for flood in floods {
+        flood.abort();
+    }
+
+    let sent = sent.load(Ordering::Relaxed);
+    eprintln!("request flood: {sent} abandoned requests, worst wait outside the API {worst:?}");
+    assert!(
+        sent > 4 * ventulusd::constants::REQUEST_BLOCKING_MAX_OUTSTANDING,
+        "precondition: the flood outran the cap ({sent} requests)"
+    );
+    assert!(
+        worst < ENGINE_WRITE_BUDGET,
+        "blocking work outside the API waited {worst:?} behind {sent} abandoned requests"
+    );
+    // The flood really reached the pool: request work held every permit at
+    // some point, so the probe ran beside a full cap, not an idle one.
+    assert_eq!(
+        fewest_free, 0,
+        "precondition: the flood never filled the request cap"
+    );
+}
+
+/// DEC-505: `/diagnostics/hardware` runs under a request-blocking permit, and
+/// reads the reclaim counts under the hwmon controller's lock, which a hwmon
+/// write that has not returned keeps held (DEC-455). The read waits a bounded
+/// time and then reports the counts as unavailable. Waiting without a bound kept
+/// the permit for as long as the write hung, and 64 such requests would have
+/// held every permit for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hardware_diagnostics_answer_while_a_hwmon_write_holds_the_lock() {
+    let state = test_app_state_with_hwmon();
+    let (path, shutdown, _dir) = start_test_server(state.clone()).await;
+
+    // A write that has not returned: the controller's lock, held by another
+    // thread until the test lets go (at most 30 s, far past the bounded wait).
+    let controller = state
+        .hwmon_controller
+        .as_ref()
+        .unwrap()
+        .controller()
+        .clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = controller.lock();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+    });
+    locked_rx.recv().unwrap();
+
+    let started = Instant::now();
+    let (status, json) = uds_get(&path, "/diagnostics/hardware").await;
+    let took = started.elapsed();
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    assert_eq!(status, 200, "body was {json}");
+    // The bounded wait plus a cold scan; unbounded, it waits out the holder.
+    assert!(
+        took < ventulusd::constants::HWMON_CONTROLLER_WAIT + std::time::Duration::from_secs(3),
+        "the request waited {took:?} on the held lock"
+    );
+    assert_eq!(json["hwmon"]["enable_revert_counts_unavailable"], true);
+
+    // With the lock free the counts are read again, and the flag is omitted.
+    let (_, json) = uds_get(&path, "/diagnostics/hardware").await;
+    assert!(json["hwmon"]
+        .get("enable_revert_counts_unavailable")
+        .is_none());
+
+    let _ = shutdown.send(());
+    let _ = std::fs::remove_file(&path);
+}

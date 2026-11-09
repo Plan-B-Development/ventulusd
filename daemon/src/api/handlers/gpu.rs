@@ -54,6 +54,7 @@ pub async fn gpu_reset_fan_handler(
         };
         let cache = state.cache.clone();
         let task_fan_id = fan_id.clone();
+        // Not capped (DEC-505): a GPU reset (holds the GPU write lock).
         let result = tokio::task::spawn_blocking(move || {
             let _write_guard = write_guard;
             // DEC-165/DEC-254: relinquish so the engine stops re-asserting the
@@ -137,6 +138,7 @@ pub async fn gpu_reset_fan_handler(
         };
         let cache = state.cache.clone();
         let task_fan_id = fan_id.clone();
+        // Not capped (DEC-505): a GPU reset (holds the GPU write lock).
         let result = tokio::task::spawn_blocking(move || {
             let _write_guard = write_guard;
             let newly_claimed = cache.relinquish_gpu_fan(&task_fan_id);
@@ -391,6 +393,7 @@ pub async fn gpu_verify_handler(
         // ── PMFW fan_curve path (RDNA3+) ──────────────────────────────
         let zero_rpm_path = gpu.fan_zero_rpm_path.clone();
         let hwmon_path = gpu.hwmon_path.clone();
+        // Not capped (DEC-505): the GPU verify (holds its guards).
         tokio::task::spawn_blocking(move || {
             let verify_guard = verify_guard;
             let _gpu_write_guard = gpu_write_guard;
@@ -440,6 +443,7 @@ pub async fn gpu_verify_handler(
             .cache
             .hand_back_record_dir()
             .map(|dir| dir.join(crate::hwmon::gpu_fan::GPU_RECORD_FILE_NAME));
+        // Not capped (DEC-505): the GPU verify (holds its guards).
         tokio::task::spawn_blocking(move || {
             let verify_guard = verify_guard;
             let _gpu_write_guard = gpu_write_guard;

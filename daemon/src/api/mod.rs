@@ -3,6 +3,7 @@
 //! HTTP over Unix domain socket using axum.
 //! All responses come from the in-memory cache — no direct hardware I/O.
 
+pub mod blocking;
 pub mod calibration;
 pub mod characterization;
 pub mod diagnostic_gates;

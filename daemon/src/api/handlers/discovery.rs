@@ -92,7 +92,7 @@ pub async fn preflight_handler(
                 .await;
             match read {
                 Ok(count) => count,
-                Err(_) => return super::hwmon_controller_busy(),
+                Err(busy) => return super::controller_busy(busy),
             }
         }
         None => 0,
@@ -518,11 +518,11 @@ pub(crate) async fn start_control_path_discovery(
     let baseline = disc::resolve_baseline(live.pwm_percent, floor);
     let (perturbed, direction) = disc::perturbation_target(baseline, delta, floor);
 
-    let Ok((verify_lease, verify_guard)) =
-        super::hwmon_ctl::take_verify_lease(controller, verify_guard).await
-    else {
-        return super::hwmon_controller_busy();
-    };
+    let (verify_lease, verify_guard) =
+        match super::hwmon_ctl::take_verify_lease(controller, verify_guard).await {
+            Ok(taken) => taken,
+            Err(busy) => return super::controller_busy(busy),
+        };
     let verify_lease_id = verify_lease.lease_id.clone();
     let lease_for_renew = verify_lease_id.clone();
 
@@ -575,7 +575,13 @@ pub(crate) async fn start_control_path_discovery(
         // documents: `run_discovery` awaits its own `RestoreGuard::restore`
         // before it returns — i.e. BEFORE `pause` and `_lease` below drop,
         // which is the only order in which the restore write can still succeed.
-        {
+        // DEC-505: the block yields the record to persist, and the persist runs
+        // after it, once the pause and the lease have dropped. The persist goes
+        // through the capped request pool, and waiting for a permit while holding
+        // the pause would stop the engine's profile writes for as long as other
+        // requests kept every permit busy. `persist_record` re-merges under the
+        // write lock, so a run that starts in the gap is safe.
+        let persist = {
             let pause = verify_guard;
             let _lease = verify_lease;
 
@@ -729,10 +735,11 @@ pub(crate) async fn start_control_path_discovery(
                     r.summary = Some(summary);
                 }
             }
-            if let Some(record) = persist {
-                persist_record(&state_for_persist, record).await;
-            }
+            persist
         };
+        if let Some(record) = persist {
+            persist_record(&state_for_persist, record).await;
+        }
     });
 
     json_ok(StatusCode::ACCEPTED, run)
@@ -834,6 +841,7 @@ struct SamplePaths {
 async fn sample_off_runtime(paths: std::sync::Arc<SamplePaths>) -> disc::DiscoverySample {
     let channels = paths.tachs.len();
     sample_or_unreadable(
+        // Not capped (DEC-505): a control-path discovery sample (single diagnostic slot).
         tokio::task::spawn_blocking(move || paths.sample()).await,
         channels,
     )
@@ -1020,6 +1028,47 @@ pub fn prune_store_to_live(
 
 #[cfg(test)]
 mod tests {
+    /// DEC-505 wiring guard: the finished run's record is persisted AFTER the
+    /// scope holding the engine's verify pause and the hwmon lease has closed.
+    /// The persist waits for a request-blocking permit, and waiting there while
+    /// holding the pause would stop the engine's profile writes for as long as
+    /// other requests kept every permit busy. A source guard, because a real run
+    /// to completion needs a full discovery against hardware.
+    #[test]
+    fn the_record_is_persisted_after_the_pause_and_lease_drop() {
+        let src = include_str!("discovery.rs");
+        let open = src
+            .find("let persist = {")
+            .expect("the guarded scope yields the record");
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close.expect("the guarded scope closes");
+        let scope = &src[open..close];
+        assert!(scope.contains("let pause = verify_guard;"));
+        assert!(scope.contains("let _lease = verify_lease;"));
+        assert!(
+            !scope.contains(&["persist_", "record("].concat()),
+            "the record is persisted inside the scope that holds the pause"
+        );
+        assert!(
+            src[close..].contains("persist_record(&state_for_persist, record).await"),
+            "the record is no longer persisted after the scope"
+        );
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;

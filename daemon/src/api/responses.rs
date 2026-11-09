@@ -2289,6 +2289,11 @@ pub struct HwmonDiagnostics {
     /// **unknown**, never "just now" — clients must not default it to 0.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub enable_revert_last_seen_ms: HashMap<String, u64>,
+    /// The two maps above could not be read: the controller's lock stayed taken
+    /// by a hwmon write that has not returned (DEC-455, DEC-505). The maps are
+    /// then empty and mean nothing. Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enable_revert_counts_unavailable: bool,
 }
 
 /// Per-chip identification and driver info.
@@ -3651,6 +3656,7 @@ mod tests {
                 writable_headers: 8,
                 enable_revert_counts: HashMap::new(),
                 enable_revert_last_seen_ms: HashMap::new(),
+                enable_revert_counts_unavailable: false,
             },
             gpu: Some(GpuDiagnostics {
                 pci_bdf: "0000:03:00.0".into(),
@@ -4218,6 +4224,7 @@ mod tests {
                     writable_headers: 0,
                     enable_revert_counts: HashMap::new(),
                     enable_revert_last_seen_ms: HashMap::new(),
+                    enable_revert_counts_unavailable: false,
                 },
                 gpu: None,
                 intel_gpu: None,

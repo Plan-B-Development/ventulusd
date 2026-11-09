@@ -1587,6 +1587,28 @@ pub const PROFILE_IO_MAX_OUTSTANDING: usize = MAX_PROFILE_SEARCH_DIRS + 4;
 /// fill it.
 pub const PATH_RESOLVE_MAX_OUTSTANDING: usize = 4;
 
+/// [SAFETY] The daemon runtime's blocking-pool size (DEC-505), set explicitly
+/// in `main.rs` rather than left to tokio's default (also 512) so the budget
+/// below is a checked relationship, not an assumption. The engine's writes
+/// (`BoundedWrite::run`), the sensor and OpenFan polls and every request's
+/// blocking work share this pool; a task beyond it queues behind the others.
+pub const TOKIO_MAX_BLOCKING_THREADS: usize = 512;
+
+/// [SAFETY] How much request-path blocking work may be outstanding at once
+/// (DEC-505, `IPC-b`), through `api::blocking`. hyper drops a handler whose
+/// client hangs up, but `spawn_blocking` work it started runs on, so without
+/// this a connect, request, hang-up loop queued scans faster than the pool
+/// drained them and the engine's next write, the thermal force's included,
+/// waited behind them without limit (measured 2026-11-09: a no-op
+/// `spawn_blocking` probe waited 876 ms, then did not run within five minutes,
+/// against 16 such loops on `/diagnostics/hardware`). The permit moves into
+/// the closure, so it is held until the work really ends. With the profile-read
+/// slots above, request work can occupy at most
+/// `REQUEST_BLOCKING_MAX_OUTSTANDING + PROFILE_IO_MAX_OUTSTANDING +
+/// PATH_RESOLVE_MAX_OUTSTANDING` threads (104 today), leaving the rest of
+/// [`TOKIO_MAX_BLOCKING_THREADS`] free for the daemon's own control work.
+pub const REQUEST_BLOCKING_MAX_OUTSTANDING: usize = 64;
+
 /// [SAFETY] How long one operation may hold a profile directory before a later
 /// reader treats it as hung and skips it rather than parking another thread
 /// behind it (FFA-b, `io_gate`). Under the walk's deadline, so a request that

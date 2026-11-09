@@ -32,10 +32,17 @@ pub struct HwmonHandle {
     headers: Arc<[PwmHeaderDescriptor]>,
 }
 
-/// The controller's lock did not come free within [`HWMON_CONTROLLER_WAIT`]
-/// (or the closure run under it panicked).
+/// Why [`HwmonHandle::with_controller`] ran nothing within
+/// [`HWMON_CONTROLLER_WAIT`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ControllerBusy;
+pub enum ControllerBusy {
+    /// The controller's lock did not come free (a hwmon write that has not
+    /// returned holds it), or the closure run under it panicked.
+    Lock,
+    /// No request-blocking permit came free (DEC-505): other requests' blocking
+    /// work holds every one. Nothing is wrong with the hardware.
+    RequestPool,
+}
 
 impl HwmonHandle {
     /// Wrap a controller nothing else holds yet.
@@ -79,20 +86,104 @@ impl HwmonHandle {
         F: FnOnce(&mut HwmonPwmController) -> T + Send + 'static,
         T: Send + 'static,
     {
+        self.with_controller_in(crate::api::blocking::request_slots(), f)
+            .await
+    }
+
+    /// [`Self::with_controller`] with the request-blocking permits given, so a
+    /// test can hold its own.
+    async fn with_controller_in<T, F>(
+        &self,
+        slots: &'static tokio::sync::Semaphore,
+        f: F,
+    ) -> Result<T, ControllerBusy>
+    where
+        F: FnOnce(&mut HwmonPwmController) -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let controller = self.controller.clone();
-        let ran = tokio::task::spawn_blocking(move || {
-            controller
-                .try_lock_for(HWMON_CONTROLLER_WAIT)
-                .map(|mut guard| f(&mut guard))
-        })
-        .await;
-        match ran {
+        // DEC-505: ONE deadline covers waiting for a request-blocking permit and
+        // then for the lock. `take_verify_lease` calls this holding the engine's
+        // verify pause, so an unbounded permit wait would hold the pause for as
+        // long as request work keeps every permit busy.
+        let deadline = std::time::Instant::now() + HWMON_CONTROLLER_WAIT;
+        let Ok(join) = tokio::time::timeout(
+            HWMON_CONTROLLER_WAIT,
+            crate::api::blocking::spawn_with(slots, move || {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                controller.try_lock_for(left).map(|mut guard| f(&mut guard))
+            }),
+        )
+        .await
+        else {
+            // No permit in time: nothing was started, so `f` never runs.
+            return Err(ControllerBusy::RequestPool);
+        };
+        match join.await {
             Ok(Some(value)) => Ok(value),
-            Ok(None) => Err(ControllerBusy),
+            Ok(None) => Err(ControllerBusy::Lock),
             Err(e) => {
                 log::error!("hwmon controller call failed on the blocking pool: {e}");
-                Err(ControllerBusy)
+                Err(ControllerBusy::Lock)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::health::cache::StateCache;
+    use crate::hwmon::lease::LeaseManager;
+    use crate::hwmon::pwm_control::RealSysfsWriter;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn handle() -> HwmonHandle {
+        HwmonHandle::new(HwmonPwmController::new(
+            Vec::new(),
+            LeaseManager::new(),
+            Box::new(RealSysfsWriter),
+            Arc::new(StateCache::new()),
+        ))
+    }
+
+    /// DEC-505: with every request-blocking permit taken, the call still ends
+    /// within its wait, as busy, and `f` never runs, not even later. The verify
+    /// takes its lease through here while holding the engine's pause, so an
+    /// unbounded permit wait would hold the pause for as long as request work
+    /// kept the permits busy.
+    #[tokio::test]
+    async fn a_busy_request_pool_ends_the_wait_as_busy_and_runs_nothing() {
+        static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        static RAN: AtomicBool = AtomicBool::new(false);
+        let held = SLOTS.acquire().await.unwrap();
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            HWMON_CONTROLLER_WAIT * 3,
+            handle().with_controller_in(&SLOTS, |_| RAN.store(true, Ordering::SeqCst)),
+        )
+        .await
+        .expect("bounded by its own wait, not left waiting");
+        assert_eq!(
+            result.err(),
+            Some(ControllerBusy::RequestPool),
+            "busy for want of a permit"
+        );
+        assert!(
+            started.elapsed() < HWMON_CONTROLLER_WAIT + Duration::from_millis(500),
+            "ended after {:?}",
+            started.elapsed()
+        );
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!RAN.load(Ordering::SeqCst), "f never runs late");
+
+        // With the permit free, the same call runs.
+        assert!(handle()
+            .with_controller_in(&SLOTS, |_| RAN.store(true, Ordering::SeqCst))
+            .await
+            .is_ok());
+        assert!(RAN.load(Ordering::SeqCst));
     }
 }

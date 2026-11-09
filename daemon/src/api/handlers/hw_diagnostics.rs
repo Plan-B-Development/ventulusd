@@ -95,7 +95,7 @@ fn amd_gpu_diagnostics(
 pub async fn hardware_diagnostics_handler(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match tokio::task::spawn_blocking(move || build_hardware_diagnostics(&state)).await {
+    match crate::api::blocking::run(move || build_hardware_diagnostics(&state)).await {
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -297,19 +297,29 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
     let kernel_modules = diagnostics::detect_loaded_modules();
 
     // Revert counts from pwm_enable watchdog
+    // One lock, both maps: taken separately they could straddle a reclaim and
+    // publish a count without the age that dates it. On the blocking pool, not
+    // a worker. DEC-505: bounded, because this runs under a request-blocking
+    // permit, and a hwmon write that has not returned holds the lock (DEC-455);
+    // an unbounded wait would keep the permit for good. When the lock stays
+    // taken the counts are reported as unavailable, never as empty.
+    let mut enable_revert_counts_unavailable = false;
     let (enable_revert_counts, enable_revert_last_seen_ms) = state
         .hwmon_controller
         .as_ref()
-        .map(|c| {
-            // One lock, both maps: taken separately they could straddle a
-            // reclaim and publish a count without the age that dates it. On
-            // the blocking pool (the handler's `spawn_blocking`), not a worker.
-            let ctrl = c.controller().lock();
+        .and_then(|c| {
+            let Some(ctrl) = c
+                .controller()
+                .try_lock_for(crate::constants::HWMON_CONTROLLER_WAIT)
+            else {
+                enable_revert_counts_unavailable = true;
+                return None;
+            };
             let now = std::time::Instant::now();
-            (
+            Some((
                 ctrl.enable_revert_counts().clone(),
                 ctrl.enable_revert_ages_ms(now),
-            )
+            ))
         })
         .unwrap_or_default();
 
@@ -437,6 +447,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
                 writable_headers,
                 enable_revert_counts,
                 enable_revert_last_seen_ms,
+                enable_revert_counts_unavailable,
             },
             gpu: gpu_diag,
             intel_gpu: intel_gpu_diag,

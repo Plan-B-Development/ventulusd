@@ -902,8 +902,9 @@ fn the_session_lifecycle_writes_stay_off_the_async_runtime() {
     let wrapper = &body[at..];
     let end = wrapper.find("\n}\n").unwrap_or(wrapper.len());
     assert!(
-        wrapper[..end].contains("spawn_blocking"),
-        "`finalise_off_runtime` no longer goes off the runtime"
+        wrapper[..end].contains("crate::api::blocking::run("),
+        "`finalise_off_runtime` no longer goes off the runtime through the capped \
+         request pool (`AUD3-n`, DEC-505)"
     );
 
     // The start path wraps the whole engine call, so `start`'s
@@ -916,8 +917,9 @@ fn the_session_lifecycle_writes_stay_off_the_async_runtime() {
         .find("engine.start(session, &ctx)")
         .expect("the start handler must still start a session");
     assert!(
-        handler[..call].contains("spawn_blocking"),
-        "`start` writes the session document inline on the request path (`AUD3-n`)"
+        handler[..call].contains("crate::api::blocking::run("),
+        "`start` writes the session document inline on the request path, or off it \
+         but outside the request cap (`AUD3-n`, DEC-505)"
     );
 
     // The `P8-az` terminal hop finalises too, from a detached task on the same
@@ -935,9 +937,9 @@ fn the_session_lifecycle_writes_stay_off_the_async_runtime() {
     // property is violated is worse than no guard. Found by
     // the concurrency review.
     assert!(
-        orch.contains("spawn_blocking(move || engine.stop_if("),
+        orch.contains("crate::api::blocking::run(move || engine.stop_if("),
         "the orchestrator's terminal hop no longer finalises through \
-         `spawn_blocking(move || engine.stop_if(...))` — it either persists inline \
+         `crate::api::blocking::run(move || engine.stop_if(...))` — it either persists inline \
          on the async runtime (`AUD3-n`) or has lost its id fence (`P8-az`)"
     );
 

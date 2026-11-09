@@ -160,6 +160,7 @@ async fn enumerate_off_executor<E>(configured: Option<String>, enumerate: E) -> 
 where
     E: FnOnce() -> Vec<String> + Send + 'static,
 {
+    // Not capped (DEC-505): the post-boot adoption loop is its only caller (one task).
     match tokio::task::spawn_blocking(move || {
         crate::serial::adoption::serial_port_candidates_enumerated(configured.as_deref(), enumerate)
     })
@@ -643,6 +644,7 @@ fn start_openfan_calibration(
         // duty a reconnect or resume lost is restored as the duty it held
         // before; only one unknown before the loss too is restored at 100 %.
         let reader = ctrl.clone();
+        // Not capped (DEC-505): starting an OpenFAN calibration (single diagnostic slot).
         let original = tokio::task::spawn_blocking(move || reader.lock().last_known_duty(channel))
             .await
             .ok()
@@ -1146,6 +1148,9 @@ where
 
         // Serial probing is blocking and can take seconds across several candidates.
         let evidence = task_state.cache.clone();
+        // Not capped (DEC-505): the rescan probe, past the single-flight flag
+        // above. The daemon's own adoption loop and recovery watch run through it,
+        // and must not wait behind request work.
         let probe = tokio::task::spawn_blocking(move || {
             // The SAME list the cooldown was evaluated against — recomputing it
             // here could probe a set the cooldown never saw, and stamp a set that
