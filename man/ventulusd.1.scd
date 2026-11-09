@@ -182,7 +182,11 @@ _/usr/lib/modprobe.d/ventulus-superio.conf_, _/usr/lib/ventulus/ventulus-superio
 	every Gigabyte board, and on a listed board whose firmware reports no
 	vendor. Their probe can hide a second fan chip until a reboot, and on
 	some boards until the machine is powered down at the wall. Each
-	suppression is logged: *journalctl -b -t ventulus-superio-guard*.
+	suppression is logged: *journalctl -b -t ventulus-superio-guard*, or,
+	where SELinux blocks that at boot, *journalctl -b -u
+	systemd-modules-load*. On other boards, a module that finds no chip
+	or is not installed for the running kernel is reported as success, so
+	that *systemd-modules-load* does not fail.
 	To turn it off, create an empty
 	_/etc/modprobe.d/ventulus-superio.conf_; a file of any other name
 	does not reliably override it.

@@ -7,6 +7,19 @@ rename. Version numbers carry on from Control-OFC.
 
 ### Fixed
 
+- **Installing the daemon no longer leaves most systems "degraded".** On most boards other than
+  Gigabyte's, `nct6775` or `w83627ehf` finds no chip at boot, and some kernels do not include
+  `nct6775` at all (Fedora 45's `kernel-modules-core`). The package's Super-I/O guard, which loads
+  those two, passed either result on as an error, and kmod turns any error from the guard into
+  *Invalid argument*. So `systemd-modules-load.service` failed at every boot, and `systemctl
+  is-system-running` said `degraded`, although every module that had a chip still loaded. The
+  guard now reports a missing chip (*No such device*), or a module the running kernel does not
+  have, as success, which is what systemd does for both without the guard. It still prints
+  modprobe's message, so `sudo modprobe nct6775` still shows the error, and it notes the result in
+  the journal (`journalctl -b -t ventulus-superio-guard`). Any other load error is still reported
+  as a failure. Where SELinux stops the guard writing to the journal at boot, as on Fedora, it no
+  longer loses its lines, including the Gigabyte suppression notice: they appear under
+  `journalctl -b -u systemd-modules-load`.
 - **A fan diagnostic stopped because the CPU temperature was lost no longer leaves a fan low.** When
   the CPU sensor stops reporting, the daemon raises the active profile's fans to 40 %, and a running
   fan test (verify, characterisation, control-path discovery, stall probe or OpenFAN calibration)

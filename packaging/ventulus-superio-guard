@@ -64,6 +64,30 @@
 # VENDOR with a readable, listed board name is not "unexpected": the name alone
 # identifies the board. That is the one case DEC-424 decided the other way, by
 # the user's choice.)
+#
+# NO CHIP, OR NO MODULE, IS NOT A FAILURE (PKG-i)
+# -----------------------------------------------
+# On most boards that are not Gigabyte's, one of the two modules finds no chip:
+# nct6775 on an ITE or Fintek board, and w83627ehf almost everywhere, because it
+# matches only old Winbond parts. The kernel answers ENODEV, and modprobe says
+# "could not insert '<module>': No such device" and exits 1. And some kernels do
+# not ship the module at all (Fedora 45's kernel-modules-core has no nct6775).
+# Without this rule, systemd-modules-load forgives both: ENODEV, and a module
+# that is not installed. With it, they cost something. libkmod reports ANY
+# non-zero exit of an install command as EINVAL, whatever the command meant
+# (kmod's command_do), and the rule makes even an absent module look present.
+# So systemd-modules-load failed at every boot and the system read "degraded".
+# Measured 2026-10-26 on Debian 13 and Fedora 45. An exit code cannot carry
+# ENODEV through libkmod, so the guard settles both here and exits 0: when
+# modprobe reports "No such device", and when modprobe fails and `modinfo` cannot
+# find the module for this kernel. It still passes modprobe's message on
+# unchanged, so a person running `modprobe nct6775` still sees it, and it writes
+# one journal line. Every other failure keeps modprobe's own non-zero status: a
+# bad option, a rejected signature or a resource conflict.
+#
+# Where logger cannot reach /dev/log -- Fedora's SELinux policy denies it to
+# systemd-modules-load -- a journal line goes to stderr instead, which
+# systemd-modules-load passes to the journal under its own unit.
 
 set -u
 
@@ -78,38 +102,100 @@ export PATH
 LC_ALL=C
 export LC_ALL
 
-# Two test seams, neither of which can widen what this script is able to do:
+# Three test seams, none of which can widen what this script is able to do:
 #   VENTULUS_DMI_DIR   -- where to read DMI from (default: the real sysfs)
-#   VENTULUS_GUARD_DRY_RUN -- print the decision instead of exec'ing modprobe
-# Setting either requires already being able to control this root process's
-# environment, and the worst either can produce is the fail-open behaviour that
-# is already the default. They exist so the decision table is actually tested.
+#   VENTULUS_GUARD_DRY_RUN -- print the decision instead of running modprobe
+#   VENTULUS_GUARD_SIM_RC  -- run no modprobe; act as if it had exited with this
+#       status after printing VENTULUS_GUARD_SIM_STDERR, and as if `modinfo` had
+#       exited with VENTULUS_GUARD_SIM_MODINFO_RC (default 0, installed); print
+#       journal lines to stdout instead of logging them
+# Setting any of them requires already being able to control this root
+# process's environment. The first two can at worst produce the fail-open
+# behaviour that is already the default; the third can at worst load nothing,
+# which drives no hardware. They exist so the decision table and the handling
+# of modprobe's result are actually tested.
 DMI_DIR="${VENTULUS_DMI_DIR:-/sys/class/dmi/id}"
 DRY_RUN="${VENTULUS_GUARD_DRY_RUN:-}"
+SIM_RC="${VENTULUS_GUARD_SIM_RC:-}"
+SIM_STDERR="${VENTULUS_GUARD_SIM_STDERR:-}"
+SIM_MODINFO_RC="${VENTULUS_GUARD_SIM_MODINFO_RC:-0}"
 
 MODULE="${1-}"
 
 # No module named: nothing to decide. Fail open by doing nothing rather than
-# exec'ing modprobe with no arguments.
+# running modprobe with no arguments.
 [ -n "$MODULE" ] || exit 0
 
+# journal <priority> <message>
+journal() {
+    if [ -n "$SIM_RC" ]; then
+        printf 'JOURNAL %s %s\n' "$1" "$2"
+        return 0
+    fi
+    if command -v logger >/dev/null 2>&1 &&
+        logger -t ventulus-superio-guard -p "daemon.$1" "$2" 2>/dev/null; then
+        return 0
+    fi
+    printf 'ventulus-superio-guard: %s\n' "$2" >&2
+}
+
+# Is the module installed for the running kernel? `modinfo` answers from the
+# module index, which the install rule does not touch: it reports "not found"
+# for a module the rule names but the kernel lacks. With no modinfo we cannot
+# tell, so answer yes and keep modprobe's failure.
+module_installed() {
+    if [ -n "$SIM_RC" ]; then
+        return "$SIM_MODINFO_RC"
+    fi
+    command -v modinfo >/dev/null 2>&1 || return 0
+    modinfo -n -- "$MODULE" >/dev/null 2>&1
+}
+
 # `--ignore-install` is what stops this rule re-entering itself.
+run_modprobe() {
+    if [ -n "$SIM_RC" ]; then
+        printf '%s\n' "$SIM_STDERR" >&2
+        return "$SIM_RC"
+    fi
+    modprobe --ignore-install "$@"
+}
+
 load_it() {
     if [ -n "$DRY_RUN" ]; then
         printf 'LOAD %s\n' "$MODULE"
         exit 0
     fi
-    exec modprobe --ignore-install "$@"
-    # Only reached if exec ITSELF failed (no modprobe on PATH). That is not
-    # "fail open" -- the module does not get loaded -- so say so rather than
-    # exiting 0 in silence and leaving a Nuvoton board mysteriously without
-    # sensors. Still exit 0: a non-zero exit here would fail the boot-time
-    # modprobe for a condition the user cannot act on mid-boot.
-    if command -v logger >/dev/null 2>&1; then
-        logger -t ventulus-superio-guard -p daemon.err \
-            "could not exec modprobe to load $MODULE; the module has NOT been loaded"
+    if [ -z "$SIM_RC" ] && ! command -v modprobe >/dev/null 2>&1; then
+        # No modprobe on PATH. That is not "fail open" -- the module does not
+        # get loaded -- so say so rather than exiting 0 in silence and leaving
+        # a Nuvoton board mysteriously without sensors. Still exit 0: a non-zero
+        # exit here would fail the boot-time modprobe for a condition the user
+        # cannot act on mid-boot.
+        journal err "could not run modprobe to load $MODULE; the module has NOT been loaded"
+        exit 0
     fi
-    exit 0
+    # modprobe's stdout goes straight through; its stderr is captured, so that
+    # it can be read, and is then passed on unchanged.
+    { err=$(run_modprobe "$@" 2>&1 1>&3 3>&-); rc=$?; } 3>&1
+    [ -z "$err" ] || printf '%s\n' "$err" >&2
+    [ "$rc" -ne 0 ] || exit 0
+    # LC_ALL=C above keeps strerror's text in English. A wording this pattern
+    # misses falls back to the non-zero exit below, as before PKG-i. The text
+    # must END the line: ENXIO reads "No such device or address", a different
+    # failure that keeps its non-zero exit.
+    nl='
+'
+    case "$err" in
+        *"could not insert '"*"': No such device" | \
+        *"could not insert '"*"': No such device$nl"*)
+            journal notice "$MODULE found no chip on this board (No such device), so it is not loaded. That is the expected result on a board without the Super-I/O chip $MODULE drives. The guard reports it as success, so that systemd-modules-load does not fail the boot."
+            exit 0 ;;
+    esac
+    if ! module_installed; then
+        journal notice "$MODULE is not installed for this kernel, so it is not loaded. systemd-modules-load ignores a module that is not installed; the guard reports it as success for the same reason."
+        exit 0
+    fi
+    exit "$rc"
 }
 
 board_name=$(cat "$DMI_DIR/board_name" 2>/dev/null) || board_name=''
@@ -237,8 +323,5 @@ if [ -n "$DRY_RUN" ]; then
     printf 'SUPPRESS %s (%s)\n' "$MODULE" "$why"
     exit 0
 fi
-if command -v logger >/dev/null 2>&1; then
-    logger -t ventulus-superio-guard -p daemon.notice \
-        "not loading $MODULE: $why. A Nuvoton/Winbond probe writes a config-mode unlock to 0x2E/0x4E, which can latch an ITE eSPI-to-LPC bridge and hide a chip's fan headers (recovery: stop the trigger, reboot, then power down at the wall if still missing). Nothing is lost: this module cannot drive ITE silicon. To load it anyway, create an EMPTY /etc/modprobe.d/ventulus-superio.conf (a copy of this package's file would keep the guard)."
-fi
+journal notice "not loading $MODULE: $why. A Nuvoton/Winbond probe writes a config-mode unlock to 0x2E/0x4E, which can latch an ITE eSPI-to-LPC bridge and hide a chip's fan headers (recovery: stop the trigger, reboot, then power down at the wall if still missing). Nothing is lost: this module cannot drive ITE silicon. To load it anyway, create an EMPTY /etc/modprobe.d/ventulus-superio.conf (a copy of this package's file would keep the guard)."
 exit 0

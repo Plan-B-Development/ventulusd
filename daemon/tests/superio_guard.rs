@@ -213,6 +213,158 @@ fn a_suppression_names_its_reason() {
     );
 }
 
+// ── What the guard does with modprobe's result (`PKG-i`) ─────────────────────
+
+const NO_CHIP: &str = "modprobe: ERROR: could not insert 'nct6775': No such device";
+
+/// Run the guard on a board where it loads (not Gigabyte), with modprobe
+/// simulated: it "exits" `rc` after printing `stderr`, and `modinfo` finds the
+/// module. Nothing is loaded and nothing reaches the journal; journal lines
+/// come back on stdout.
+fn load_result(rc: u8, stderr: &str) -> std::process::Output {
+    load_result_modinfo(rc, stderr, 0)
+}
+
+/// [`load_result`], with `modinfo` simulated as exiting `modinfo_rc` (1: the
+/// module is not installed for this kernel).
+fn load_result_modinfo(rc: u8, stderr: &str, modinfo_rc: u8) -> std::process::Output {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "cofc-guard-load-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("create fake DMI dir");
+    std::fs::write(dir.join("board_vendor"), "ASUSTeK COMPUTER INC.").unwrap();
+    std::fs::write(dir.join("board_name"), "PRIME X670-P").unwrap();
+    let out = Command::new("sh")
+        .arg(guard_path())
+        .arg("nct6775")
+        .env("VENTULUS_DMI_DIR", &dir)
+        .env("VENTULUS_GUARD_SIM_RC", rc.to_string())
+        .env("VENTULUS_GUARD_SIM_STDERR", stderr)
+        .env("VENTULUS_GUARD_SIM_MODINFO_RC", modinfo_rc.to_string())
+        .output()
+        .expect("run guard");
+    std::fs::remove_dir_all(&dir).ok();
+    out
+}
+
+/// `PKG-i`: libkmod reports any non-zero exit of an install command as EINVAL,
+/// which systemd-modules-load does not forgive, so a board without the chip
+/// failed the unit at every boot. The guard exits 0 for "No such device" — and
+/// still shows modprobe's message, so an interactive `modprobe` is not silent,
+/// and says so in the journal.
+#[test]
+fn a_board_without_the_chip_exits_zero_and_still_says_so() {
+    let out = load_result(1, NO_CHIP);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "no chip must not fail systemd-modules-load: {out:?}"
+    );
+    assert_eq!(
+        stderr.trim_end(),
+        NO_CHIP,
+        "modprobe's message is passed on unchanged"
+    );
+    assert!(
+        stdout.starts_with("JOURNAL notice nct6775 found no chip on this board"),
+        "the journal says why the module is absent: {stdout:?}"
+    );
+
+    // The no-chip line need not be modprobe's last line of output.
+    let followed = format!("{NO_CHIP}\nmodprobe: a later line");
+    let out = load_result(1, &followed);
+    assert!(out.status.success(), "no chip, then another line: {out:?}");
+}
+
+/// `PKG-i`, measured on Fedora 45, whose kernel-modules-core has no nct6775:
+/// without the install rule systemd-modules-load skips a module that is not
+/// installed, but the rule makes it look present and the guard's failure became
+/// EINVAL. When modprobe fails and `modinfo` cannot find the module, the guard
+/// exits 0, passes the message on and says why in the journal. Measured
+/// wording: libkmod's "could not find module by name", then ENOENT's text.
+#[test]
+fn a_module_not_installed_for_this_kernel_exits_zero() {
+    let missing = "modprobe: ERROR: libkmod/libkmod-module.c:699 kmod_module_insert_module() \
+                   could not find module by name='nct6775'\n\
+                   modprobe: ERROR: could not insert 'nct6775': Unknown symbol in module, \
+                   or unknown parameter (see dmesg)";
+    let out = load_result_modinfo(1, missing, 1);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stderr).trim_end(), missing);
+    assert!(
+        stdout.starts_with("JOURNAL notice nct6775 is not installed for this kernel"),
+        "{stdout:?}"
+    );
+
+    // The same failure with the module installed is a real one (an unknown
+    // symbol), and keeps its status.
+    let out = load_result_modinfo(1, missing, 0);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+}
+
+/// The other half of `PKG-i`: only no chip and no module are settled. A real
+/// failure keeps modprobe's own non-zero status and message, and writes no
+/// journal line that would misdescribe it. `modinfo` finds the module in every
+/// case here.
+#[test]
+fn a_real_load_failure_keeps_its_non_zero_exit() {
+    for (rc, stderr, why) in [
+        (
+            1,
+            "modprobe: FATAL: Module nct6775 not found in directory /lib/modules/6.12.0",
+            "a 'not found' that modinfo contradicts",
+        ),
+        (
+            1,
+            "modprobe: ERROR: could not insert 'nct6775': Key was rejected by service",
+            "a rejected signature",
+        ),
+        (
+            1,
+            "modprobe: ERROR: could not insert 'nct6775': Device or resource busy",
+            "a resource conflict",
+        ),
+        // ENXIO's text begins with ENODEV's: the match must end at the line end.
+        (
+            1,
+            "modprobe: ERROR: could not insert 'nct6775': No such device or address",
+            "ENXIO",
+        ),
+        (3, "", "an unexpected status with no message"),
+    ] {
+        let out = load_result(rc, stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(i32::from(rc)),
+            "{why} must keep modprobe's exit status: {out:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr).trim_end(),
+            stderr,
+            "{why}: modprobe's message is passed on unchanged"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "{why}: no journal line, got {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
+/// A successful load stays quiet: exit 0, nothing added to stderr or the journal.
+#[test]
+fn a_successful_load_adds_nothing() {
+    let out = load_result(0, "");
+    assert!(out.status.success(), "{out:?}");
+    assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{out:?}");
+}
+
 #[test]
 fn superio_guard_board_list_matches_chip_db() {
     // The drift guard. The shell list is a copy of the Rust table; without this
@@ -302,6 +454,16 @@ fn run_install(
     guard: &std::path::Path,
     dmi: Option<&std::path::Path>,
 ) -> (std::process::Output, bool) {
+    run_install_env(cmd, guard, dmi, &[])
+}
+
+/// [`run_install`], with extra environment for the guard.
+fn run_install_env(
+    cmd: &str,
+    guard: &std::path::Path,
+    dmi: Option<&std::path::Path>,
+    env: &[(&str, &str)],
+) -> (std::process::Output, bool) {
     let bin = scratch("bin");
     let marker = bin.join("modprobe-was-called");
     let fake = bin.join("modprobe");
@@ -324,6 +486,7 @@ fn run_install(
         c.env("VENTULUS_DMI_DIR", dmi)
             .env("VENTULUS_GUARD_DRY_RUN", "1");
     }
+    c.envs(env.iter().copied());
     let out = c.output().expect("run the install command");
     let called = marker.exists();
     std::fs::remove_dir_all(&bin).ok();
@@ -401,6 +564,44 @@ fn with_the_guard_the_line_hands_the_decision_to_it() {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+}
+
+/// `PKG-i` through the real install line, run as kmod runs it (`sh -c`, the
+/// guard `exec`'d): what kmod sees is the line's exit status, and a board
+/// without the chip, or a kernel without the module, must give it 0 while a
+/// real failure still gives non-zero.
+#[test]
+fn the_install_line_carries_the_no_chip_exit_to_kmod() {
+    for (module, cmd) in install_lines() {
+        let dmi = scratch("dmi");
+        std::fs::write(dmi.join("board_vendor"), "ASUSTeK COMPUTER INC.").unwrap();
+        std::fs::write(dmi.join("board_name"), "PRIME X670-P").unwrap();
+        let dmi_s = dmi.display().to_string();
+        let no_chip = format!("modprobe: ERROR: could not insert '{module}': No such device");
+        for (stderr, modinfo_rc, want_ok) in [
+            (no_chip.as_str(), "0", true),
+            ("modprobe: FATAL: Module not found", "1", true),
+            ("modprobe: FATAL: Module not found", "0", false),
+        ] {
+            let (out, _) = run_install_env(
+                &cmd,
+                &guard_path(),
+                None,
+                &[
+                    ("VENTULUS_DMI_DIR", &dmi_s),
+                    ("VENTULUS_GUARD_SIM_RC", "1"),
+                    ("VENTULUS_GUARD_SIM_STDERR", stderr),
+                    ("VENTULUS_GUARD_SIM_MODINFO_RC", modinfo_rc),
+                ],
+            );
+            assert_eq!(
+                out.status.success(),
+                want_ok,
+                "{module} with {stderr:?}, modinfo {modinfo_rc}: {out:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dmi).ok();
     }
 }
 
