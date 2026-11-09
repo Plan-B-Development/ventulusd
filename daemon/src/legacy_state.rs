@@ -114,11 +114,28 @@ pub fn import(legacy: &Path, state: &Path) -> ImportOutcome {
 /// import is skipped as [`ImportOutcome::StateInUse`], so the loss of a pump
 /// role's floor is not silent.
 pub fn roles_left_behind(legacy: &Path, state: &Path) -> bool {
-    let has_roles = |dir: &Path| {
-        std::fs::read_to_string(dir.join(RUNTIME_CONFIG_FILE))
-            .is_ok_and(|t| t.lines().any(|l| l.trim() == "[header_roles]"))
-    };
-    has_roles(legacy) && !has_roles(state)
+    has_header_roles(&legacy.join(RUNTIME_CONFIG_FILE))
+        && !has_header_roles(&state.join(RUNTIME_CONFIG_FILE))
+}
+
+/// Whether the `runtime.toml` at `path` assigns at least one header role.
+///
+/// Roles serialise as `[hardware.header_roles]` (`RuntimeHardware`, in 4.x and
+/// 5.x alike). The file is read as plain TOML rather than as `RuntimeConfig`:
+/// `[hardware]` denies unknown keys, so a key one version has and the other
+/// lacks would fail the typed parse and hide the roles this asks about. An
+/// unreadable or malformed file holds no roles.
+fn has_header_roles(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|table| {
+            table
+                .get("hardware")
+                .and_then(|hw| hw.get("header_roles"))
+                .and_then(toml::Value::as_table)
+                .is_some_and(|roles| !roles.is_empty())
+        })
 }
 
 /// Copy every file not already present; returns how many were copied and the
@@ -224,12 +241,17 @@ mod tests {
         std::fs::read_to_string(path).unwrap()
     }
 
+    /// A `runtime.toml` as `control-ofc-daemon` 4.3.0 wrote it after a pump
+    /// role was assigned: `RuntimeHardware` nests the roles under `[hardware]`.
+    const LEGACY_RUNTIME_TOML: &str = "[hardware]\n\
+        preferred_cpu_sensor = \"hwmon:k10temp:0000:00:18.3:Tctl\"\n\
+        \n\
+        [hardware.header_roles]\n\
+        \"hwmon:nct6799:nct6775.656:pwm2:pwm2\" = \"pump\"\n";
+
     /// A 4.x state directory as the old daemon left it, rooted at `legacy`.
     fn legacy_tree(legacy: &Path) {
-        write(
-            &legacy.join("runtime.toml"),
-            "[header_roles]\n\"hwmon:nct6799:pwm2\" = \"pump\"\n",
-        );
+        write(&legacy.join("runtime.toml"), LEGACY_RUNTIME_TOML);
         write(
             &legacy.join("daemon_state.json"),
             &format!(
@@ -404,5 +426,41 @@ mod tests {
             &read(&legacy.join("runtime.toml")),
         );
         assert!(!roles_left_behind(&legacy, &state));
+    }
+
+    /// The fixture is the shape the daemon really writes: a role saved through
+    /// `RuntimeConfig` today is seen, and one in a file that also carries a key
+    /// this version's `[hardware]` would reject is still seen.
+    #[test]
+    fn roles_are_found_in_the_serialised_form() {
+        use crate::runtime_config::{RuntimeConfig, RuntimeHardware};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(RUNTIME_CONFIG_FILE);
+
+        let config = RuntimeConfig {
+            hardware: Some(RuntimeHardware {
+                header_roles: [("hwmon:nct6799:pwm2".to_string(), "pump".to_string())].into(),
+                ..RuntimeHardware::default()
+            }),
+            ..RuntimeConfig::default()
+        };
+        write(&path, &toml::to_string(&config).unwrap());
+        assert!(has_header_roles(&path), "{}", read(&path));
+
+        write(
+            &path,
+            &LEGACY_RUNTIME_TOML.replace("[hardware]\n", "[hardware]\nretired_key = 1\n"),
+        );
+        assert!(has_header_roles(&path));
+
+        for no_roles in [
+            "[hardware]\npreferred_cpu_sensor = \"x\"\n",
+            "[hardware.header_roles]\n",
+            "not toml [",
+        ] {
+            write(&path, no_roles);
+            assert!(!has_header_roles(&path), "{no_roles:?}");
+        }
+        assert!(!has_header_roles(&tmp.path().join("absent.toml")));
     }
 }

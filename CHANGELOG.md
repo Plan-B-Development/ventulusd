@@ -40,6 +40,12 @@ rename. Version numbers carry on from Control-OFC.
   - `/diagnostics/hardware` no longer hangs while a motherboard fan write has not returned. It
     answers after 2 s without the BIOS reclaim counts, and says so with
     `enable_revert_counts_unavailable`.
+- **Upgrading from Control-OFC now warns when its header roles were left behind.** When the
+  Ventulus state directory already held its own settings, the daemon does not import the
+  Control-OFC one, and is meant to log a warning that pump roles assigned under Control-OFC are not
+  in effect. The check looked for the roles in the wrong place in `runtime.toml`, so the warning
+  never appeared and a pump role (and its 30 % floor) could be lost without notice. It now finds
+  them.
 - **Dependency updates.** tokio 1.54.1 fixes RUSTSEC-2026-0386 (unsound `AsyncFd` constructors, a
   part of tokio the daemon and tray do not use), and hyper 1.12.0 drops the unmaintained
   `pin-utils` (RUSTSEC-2026-0441).
