@@ -106,6 +106,41 @@ impl Tree {
     }
 }
 
+impl Tree {
+    /// Run the script with each listed path reading back the given value,
+    /// whatever was written to it, as a driver reports what the chip holds
+    /// rather than what was asked. The script reads through `cat`, so a `cat`
+    /// earlier on `PATH` stands in for the kernel (`run_script_unable_to_read`'s
+    /// pattern). Writes still land in the files, so a test can see what the
+    /// script wrote.
+    fn run_script_reading(&self, reads: &[(&Path, &str)]) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.run.with_file_name("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut arms = String::new();
+        for (p, v) in reads {
+            arms.push_str(&format!("    '{}') echo '{v}'; exit 0 ;;\n", p.display()));
+        }
+        let shim = bin.join("cat");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/bash\ncase \"$1\" in\n{arms}esac\nPATH='{path}' exec cat \"$@\"\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Command::new("bash")
+            .arg(script())
+            .env("RUNTIME_DIRECTORY", &self.run)
+            .env("VENTULUS_SYSFS_ROOT", &self.sys)
+            .env_remove("EXIT_CODE")
+            .env_remove("EXIT_STATUS")
+            .env("PATH", format!("{}:{path}", bin.display()))
+            .output()
+            .expect("bash must be available to run the ExecStopPost script")
+    }
+}
+
 fn line(enable: &Path, pwm: &Path, kind: &str, value: &str) -> String {
     format!("{}\t{}\t{kind}\t{value}", enable.display(), pwm.display())
 }
@@ -752,4 +787,125 @@ fn the_script_holds_the_lock_for_its_whole_replay() {
         seen.lines().all(|l| l == "held"),
         "the lock was free during the replay: {seen:?}"
     );
+}
+
+/// [SAFETY] `TST-a`: `full_speed`'s second branch, the backstop for a header
+/// whose `pwmN_enable` refuses 0. Its enable reads back 1 whatever is written,
+/// so the script must put it in manual at 255 instead. A regular file always
+/// reads back the 0 just written, so no other test reaches this branch.
+#[test]
+fn a_header_that_refuses_mode_0_is_left_in_manual_at_full_speed() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    t.record(&[line(&en1, &pwm1, "full", "0")]);
+
+    let out = t.run_script_reading(&[(&en1, "1")]);
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&en1), "1", "manual, after 0 did not hold");
+    assert_eq!(read(&pwm1), "255");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("could not give"), "{stderr}");
+}
+
+/// The same branch when the chip caps the duty below the script's 190 bar:
+/// the header cannot be put at full speed, and the script says so rather than
+/// reporting a hand-back it did not make.
+#[test]
+fn a_header_capped_below_full_speed_is_reported() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    t.record(&[line(&en1, &pwm1, "full", "0")]);
+
+    let out = t.run_script_reading(&[(&en1, "1"), (&pwm1, "150")]);
+
+    assert!(out.status.success(), "the unit never fails on it: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("could not give {} back", en1.display())),
+        "{stderr}"
+    );
+}
+
+/// [SAFETY] `TST-a`: the `manual` kind's mode-0 alias. A driver that reports
+/// a manual header at full duty as mode 0 has taken the duty, so a recorded
+/// manual 255 is given back as manual 255, not reset to mode 0. A recorded
+/// duty below 254 is not given back by the alias, even when the chip then
+/// reads back full duty in mode 0: the header falls back to full speed (mode 0
+/// here, which this chip accepts).
+#[test]
+fn the_mode_0_alias_counts_only_at_full_duty() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    let (en2, pwm2) = t.header(2);
+    t.record(&[
+        line(&en1, &pwm1, "manual", "255"),
+        line(&en2, &pwm2, "manual", "200"),
+    ]);
+
+    let out = t.run_script_reading(&[(&en1, "0"), (&en2, "0"), (&pwm2, "255")]);
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        (read(&en1), read(&pwm1)),
+        ("1".to_string(), "255".to_string()),
+        "the alias accepted manual 255 as given back"
+    );
+    assert_eq!(
+        read(&en2),
+        "0",
+        "manual 200 read back as mode 0 at full duty is not the duty given back: \
+         full speed instead"
+    );
+}
+
+/// `TST-a`: the alias's third condition. A recorded manual 255 read back as
+/// mode 0 counts as given back only if the duty reads back at full too: at 253
+/// it falls back to full speed (mode 0).
+#[test]
+fn the_mode_0_alias_needs_the_duty_read_back_at_full() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    let (en2, pwm2) = t.header(2);
+    t.record(&[
+        line(&en1, &pwm1, "manual", "255"),
+        line(&en2, &pwm2, "manual", "255"),
+    ]);
+
+    let out = t.run_script_reading(&[(&en1, "0"), (&pwm1, "254"), (&en2, "0"), (&pwm2, "253")]);
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&en1), "1", "254 read back is full duty: given back");
+    assert_eq!(read(&en2), "0", "253 read back is not: full speed");
+}
+
+/// `TST-a`: the bars, at their edges. The recorded duty the alias accepts
+/// starts at 254, and `full_speed`'s manual fallback counts a duty of 190 or
+/// more as full speed.
+#[test]
+fn the_alias_and_full_speed_bars_sit_at_254_and_190() {
+    let t = Tree::new();
+    let (en1, pwm1) = t.header(1);
+    let (en2, pwm2) = t.header(2);
+    t.record(&[
+        line(&en1, &pwm1, "manual", "254"),
+        line(&en2, &pwm2, "manual", "253"),
+    ]);
+    let out = t.run_script_reading(&[(&en1, "0"), (&pwm1, "255"), (&en2, "0"), (&pwm2, "255")]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(read(&en1), "1", "a recorded 254 is full duty");
+    assert_eq!(read(&en2), "0", "a recorded 253 is not");
+
+    for (readback, reported) in [("190", false), ("189", true)] {
+        let t = Tree::new();
+        let (en1, pwm1) = t.header(1);
+        t.record(&[line(&en1, &pwm1, "full", "0")]);
+        let out = t.run_script_reading(&[(&en1, "1"), (&pwm1, readback)]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stderr.contains("could not give"),
+            reported,
+            "a duty read back at {readback}: {stderr}"
+        );
+    }
 }

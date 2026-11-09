@@ -704,10 +704,18 @@ impl HwmonPwmController {
     /// `Ok(None)` when neither the engine nor an abandoned diagnostic holds it,
     /// or while a diagnostic holds the engine write-pause
     /// ([`Self::releasable_no_mode`]).
+    ///
+    /// [SAFETY] `DGN-a`: `min_pct` raises the floor for this release: the
+    /// no-sensor floor's duty when its own give-back releases the header, 0
+    /// otherwise. Released while the CPU cannot be seen, a header the floor does
+    /// not reach goes no lower than the floor's duty, whatever the exit floor
+    /// is. It can only raise: a header with no mode switch has no firmware curve
+    /// that could be running it faster.
     pub fn release_no_mode(
         &mut self,
         header_id: &str,
         lease_id: &str,
+        min_pct: u8,
     ) -> Result<Option<NoModeRelease>, HwmonControlError> {
         self.lease_manager
             .validate_lease(lease_id)
@@ -716,7 +724,7 @@ impl HwmonPwmController {
             return Ok(None);
         }
         let was = self.exit_record.get(header_id).copied().flatten();
-        let floor = self.cache.exit_floor_pct();
+        let floor = self.cache.exit_floor_pct().max(min_pct);
         let target = (floor > 0)
             .then(|| crate::pwm::exit_duty(was, floor))
             .filter(|to| Some(*to) != was);
@@ -4722,7 +4730,7 @@ mod tests {
         assert_eq!(rig.cache.lock()[1], 0, "precondition: a chosen 0 is kept");
 
         assert_eq!(
-            rig.ctrl.release_no_mode(&arctic_id(2), &lease).unwrap(),
+            rig.ctrl.release_no_mode(&arctic_id(2), &lease, 0).unwrap(),
             Some(NoModeRelease::Kept { at: Some(0) }),
             "the floor is off, so the release writes nothing"
         );
@@ -4749,7 +4757,7 @@ mod tests {
         rig.ctrl.set_pwm(&arctic_id(1), 30, &verify).unwrap();
         assert!(rig.ctrl.engine_held_no_mode().is_empty());
         assert_eq!(
-            rig.ctrl.release_no_mode(&arctic_id(1), &verify).unwrap(),
+            rig.ctrl.release_no_mode(&arctic_id(1), &verify, 0).unwrap(),
             None
         );
 
@@ -4787,7 +4795,7 @@ mod tests {
             "the pause holds it"
         );
         assert_eq!(
-            rig.ctrl.release_no_mode(&arctic_id(1), &verify).unwrap(),
+            rig.ctrl.release_no_mode(&arctic_id(1), &verify, 0).unwrap(),
             None
         );
         assert_eq!(rig.cache.lock()[0], percent_to_raw(15));
@@ -4800,7 +4808,7 @@ mod tests {
             .lease_id;
         assert_eq!(rig.ctrl.releasable_no_mode(), vec![arctic_id(1)]);
         assert_eq!(
-            rig.ctrl.release_no_mode(&arctic_id(1), &engine).unwrap(),
+            rig.ctrl.release_no_mode(&arctic_id(1), &engine, 0).unwrap(),
             Some(NoModeRelease::Raised {
                 was: Some(15),
                 to: 50
@@ -4810,7 +4818,7 @@ mod tests {
         assert!(cache.abandoned_by_diagnostic().is_empty());
         assert!(rig.ctrl.releasable_no_mode().is_empty());
         assert_eq!(
-            rig.ctrl.release_no_mode(&arctic_id(1), &engine).unwrap(),
+            rig.ctrl.release_no_mode(&arctic_id(1), &engine, 0).unwrap(),
             None,
             "released once"
         );
@@ -4835,7 +4843,7 @@ mod tests {
             .lease_id;
 
         assert!(ctrl.releasable_no_mode().is_empty());
-        assert_eq!(ctrl.release_no_mode(&header.id, &engine).unwrap(), None);
+        assert_eq!(ctrl.release_no_mode(&header.id, &engine, 0).unwrap(), None);
         assert_eq!(ctrl.handback().taken_ids(), vec![header.id.clone()]);
     }
 

@@ -7,6 +7,17 @@ rename. Version numbers carry on from Control-OFC.
 
 ### Fixed
 
+- **A fan diagnostic stopped because the CPU temperature was lost no longer leaves a fan low.** When
+  the CPU sensor stops reporting, the daemon raises the active profile's fans to 40 %, and a running
+  fan test (verify, characterisation, control-path discovery, stall probe or OpenFAN calibration)
+  stops. The test then skipped putting its fan back, assuming the daemon was driving it, which was
+  true only for a fan in the active profile; and when the daemon had taken the fan over, putting it
+  back failed. A fan outside the profile was left at whatever duty the test had reached, possibly a
+  stop, until the daemon exited. Now a motherboard fan with no automatic mode is raised once the test
+  ends: to the exit floor, and to no less than 40 % while the CPU still cannot be seen, and an OpenFAN channel is put back no
+  lower than 40 % (restarted first if the test stopped it). A fan in the profile, a motherboard fan
+  with an automatic mode, and every fan during a temperature emergency are left to the daemon as
+  before.
 - **No local user can stop the thermal emergency by tying up the daemon's socket.** The socket is
   open to every local user, and the daemon used to accept connections without limit and keep idle
   ones open for ever. About a thousand idle connections used up its open-file limit, after which

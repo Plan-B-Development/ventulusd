@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use backends::{
     ForceLogAction, ForceLogThrottle, ForceReach, GpuBackend, GpuMembers, HeldMembers,
-    HwmonBackend, OpenFanBackend, ProfileMembers,
+    HwmonBackend, OpenFanBackend,
 };
 
 use crate::constants;
@@ -33,6 +33,9 @@ pub mod skipped;
 mod tuning;
 
 pub use crate::health::state::ControlOutput;
+/// The engine's member set, for a diagnostic that must judge the force's
+/// reach by the same definition (`DGN-a`).
+pub(crate) use backends::ProfileMembers;
 pub(crate) use curve_eval::*;
 pub(crate) use safety_tick::*;
 pub use skipped::{
@@ -4626,6 +4629,41 @@ mod tests {
 
         assert_eq!(decision.forced_pct, Some(constants::NO_SENSOR_SAFE_PCT));
         assert_eq!(decision.thermal_state, "no_sensor_fallback");
+    }
+
+    /// [SAFETY] `TST-a`: the stale-and-hot row's edge, at the rule's own
+    /// `release_temp_c()` and the next value below it. The two tests above sit
+    /// at 104 °C and 45 °C, so a threshold that drifted anywhere between them
+    /// passed both; drifting low brings back the DEC-269 round-2 cut to the
+    /// no-sensor floor for a CPU last seen hot.
+    #[test]
+    fn the_stale_reading_edge_is_the_release_temperature() {
+        let blind = |t: f64| {
+            let mut safety = crate::safety::ThermalSafetyRule::new();
+            let mut cycles = 0u32;
+            let mut decision = SafetyDecision {
+                thermal_state: "unset",
+                forced_pct: None,
+            };
+            for _ in 0..(constants::NO_SENSOR_CYCLE_THRESHOLD + 1) {
+                decision = evaluate_safety_tick(CpuReading::Stale(t), &mut cycles, &mut safety);
+            }
+            decision
+        };
+        let release = crate::safety::ThermalSafetyRule::new().release_temp_c();
+
+        let at = blind(release);
+        assert_eq!(
+            (at.thermal_state, at.forced_pct),
+            ("normal", None),
+            "last seen at release ({release} °C): curves keep running on it"
+        );
+        let below = blind(release.next_down());
+        assert_eq!(
+            (below.thermal_state, below.forced_pct),
+            ("no_sensor_fallback", Some(constants::NO_SENSOR_SAFE_PCT)),
+            "last seen just below release: the no-sensor floor"
+        );
     }
 
     #[test]

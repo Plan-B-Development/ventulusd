@@ -491,6 +491,49 @@ pub fn thermal_force_state(cache: &StateCache) -> Option<String> {
     }
 }
 
+/// [SAFETY] `DGN-a`. The duty a forcing `state` holds the active profile's
+/// members at, when that is ALL it reaches; `None` when it reaches every output.
+///
+/// The engine decides reach by the duty (`ForceReach::for_duty`, DEC-382): the
+/// 100 % emergency drives every OpenFan channel and writable hwmon header, and
+/// the no-sensor floor, the one rung below 100 % since DEC-386, drives only the
+/// active profile's members. An output the profile does not name is then driven
+/// by nothing, so a diagnostic that skips its restore "because the force holds
+/// it" strands it at the last duty the run wrote. Any other state counts as
+/// reaching everything, as every non-`normal` state did before this. Pinned
+/// against the ladder's own decisions in `safety_tick`'s tests.
+pub(crate) fn members_only_force_pct(state: &str) -> Option<u8> {
+    match state {
+        "no_sensor_fallback" => Some(constants::NO_SENSOR_SAFE_PCT),
+        _ => None,
+    }
+}
+
+/// [SAFETY] `DGN-a`. What the thermal force does to one output now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ForceOver {
+    /// Nothing is forcing.
+    NotForcing,
+    /// The force drives this output: write nothing that would fight it.
+    Holds(String),
+    /// A force is active but does not reach this output (the no-sensor floor
+    /// on an output the active profile does not name). Nothing else drives it,
+    /// so it is put back, floored at this duty: the CPU cannot be seen.
+    Floors(u8),
+}
+
+/// [`ForceOver`] for one output. `in_profile` says whether the active profile
+/// names it; it is consulted only under a force that reaches members alone.
+pub(crate) fn force_over(cache: &StateCache, in_profile: impl FnOnce() -> bool) -> ForceOver {
+    let Some(state) = thermal_force_state(cache) else {
+        return ForceOver::NotForcing;
+    };
+    match members_only_force_pct(&state) {
+        Some(pct) if !in_profile() => ForceOver::Floors(pct),
+        _ => ForceOver::Holds(state),
+    }
+}
+
 /// [SAFETY] How fresh the temperature telemetry the thermal gates read actually
 /// is (DEC-336, register row `P8-p`).
 ///
@@ -709,6 +752,10 @@ pub struct CalProgress {
 /// (the DEC-146 P3-8 rule the engine's OpenFan writes follow).
 pub type CalWriteFn = Arc<dyn Fn(u8, u8) -> Result<(), CalibrationError> + Send + Sync>;
 
+/// Whether the active profile names the channel being calibrated, read live
+/// (`DGN-a`): under the no-sensor floor the force reaches profile members only.
+pub type InProfileFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Why the walk stopped early.
 #[derive(Debug, Clone, PartialEq)]
 enum Stop {
@@ -782,6 +829,8 @@ struct Walk<'a, S, K, A, P> {
     keepalive: K,
     /// Re-reads the pump-protection union for this channel (`ROLE-f`).
     pump_protected: A,
+    /// Whether the active profile names this channel (`DGN-a`).
+    in_profile: InProfileFn,
     publish: P,
     start_cpu_c: f64,
     p: CalProgress,
@@ -1095,16 +1144,31 @@ where
         } else {
             crate::pwm::exit_duty(self.p.original_pct, 0)
         };
-        if let Some(state) = thermal_force_state(self.cache) {
-            log::warn!(
-                "OpenFan ch{} left at the thermal-safety forced duty instead of restoring \
-                 {target}% — thermal safety is active ({state}) and outranks calibration",
-                self.channel
-            );
-            self.p.restore_outcome = RestoreOutcome::SkippedThermalForce.token();
-            self.p.restore_failed = true;
-            return;
-        }
+        // [SAFETY] `DGN-a`: skipped only when the force drives this channel.
+        // Under the no-sensor floor a channel the profile does not name is
+        // driven by nothing, and an OpenFan channel holds whatever it was last
+        // sent, so it is restored, floored at the force's duty.
+        let target = match force_over(self.cache, || (self.in_profile)()) {
+            ForceOver::Holds(state) => {
+                log::warn!(
+                    "OpenFan ch{} left at the thermal-safety forced duty instead of restoring \
+                     {target}% — thermal safety is active ({state}) and outranks calibration",
+                    self.channel
+                );
+                self.p.restore_outcome = RestoreOutcome::SkippedThermalForce.token();
+                self.p.restore_failed = true;
+                return;
+            }
+            ForceOver::Floors(pct) => {
+                log::warn!(
+                    "OpenFan ch{}: thermal safety is forcing the active profile's channels to \
+                     {pct}% and this one is not among them, so it is restored no lower than that",
+                    self.channel
+                );
+                target.max(pct)
+            }
+            ForceOver::NotForcing => target,
+        };
         if self.restore_full_speed {
             log::warn!(
                 "OpenFan ch{}: a recovery kick was owed and could not run — leaving it at \
@@ -1162,18 +1226,24 @@ struct RestoreBackstop<'a> {
     target: u8,
     write: CalWriteFn,
     cache: &'a StateCache,
+    in_profile: InProfileFn,
 }
 
 impl Drop for RestoreBackstop<'_> {
     fn drop(&mut self) {
-        if !self.armed || thermal_force_state(self.cache).is_some() {
+        if !self.armed {
             return;
         }
-        if let Err(e) = (self.write)(self.channel, self.target) {
+        // [SAFETY] `DGN-a`: as `Walk::restore`.
+        let target = match force_over(self.cache, || (self.in_profile)()) {
+            ForceOver::Holds(_) => return,
+            ForceOver::Floors(pct) => self.target.max(pct),
+            ForceOver::NotForcing => self.target,
+        };
+        if let Err(e) = (self.write)(self.channel, target) {
             log::warn!(
-                "OpenFan ch{}: backstop restore of {}% failed: {e}",
-                self.channel,
-                self.target
+                "OpenFan ch{}: backstop restore of {target}% failed: {e}",
+                self.channel
             );
         }
     }
@@ -1199,6 +1269,7 @@ pub async fn run_calibration<S, K, A, P>(
     shutting_down: S,
     keepalive: K,
     pump_protected: A,
+    in_profile: InProfileFn,
     publish: P,
 ) -> CalProgress
 where
@@ -1216,6 +1287,7 @@ where
         shutting_down,
         keepalive,
         pump_protected,
+        in_profile: Arc::clone(&in_profile),
         publish,
         start_cpu_c,
         p: CalProgress {
@@ -1245,6 +1317,7 @@ where
             target: crate::pwm::exit_duty(original, 0),
             write,
             cache,
+            in_profile,
         },
     };
 
@@ -1276,14 +1349,16 @@ where
     }
 
     // [SAFETY] The recovery kick, when an early stop may have left the fan
-    // stopped — never while forcing (the force already holds 100 %). A kick
+    // stopped — never while the force drives the channel (`DGN-a`: the 100 %
+    // emergency, or a profile member under the no-sensor floor; a channel the
+    // floor does not reach is driven by nothing, so it is kicked). A kick
     // that cannot run to its end — shutting down, or it stopped early — leaves
     // the channel at 100 % instead of the original duty (module docs).
-    // `&&` short-circuits, so the kick runs only when owed, not forcing and
+    // `&&` short-circuits, so the kick runs only when owed, not forced and
     // not already shutting down.
     if ended.is_err()
         && w.kick_owed()
-        && thermal_force_state(cache).is_none()
+        && !matches!(force_over(cache, || (w.in_profile)()), ForceOver::Holds(_))
         && ((w.shutting_down)() || w.kick().await.is_err())
     {
         w.restore_full_speed = true;
@@ -1405,6 +1480,17 @@ mod tests {
         original: Option<u8>,
         cancel: &AtomicBool,
     ) -> CalProgress {
+        run_in(cache, write, original, cancel, false).await
+    }
+
+    /// [`run`], with the active profile naming the channel or not.
+    async fn run_in(
+        cache: &Arc<StateCache>,
+        write: CalWriteFn,
+        original: Option<u8>,
+        cancel: &AtomicBool,
+        in_profile: bool,
+    ) -> CalProgress {
         run_calibration(
             cache,
             0,
@@ -1416,6 +1502,7 @@ mod tests {
             || false,
             || true,
             || false,
+            Arc::new(move || in_profile),
             |_| {},
         )
         .await
@@ -1638,6 +1725,7 @@ mod tests {
                 || false,
                 || true,
                 || false,
+                Arc::new(|| false),
                 |_| {},
             )
             .await
@@ -1717,6 +1805,7 @@ mod tests {
             || false,
             || true,
             move || pump.load(Ordering::SeqCst),
+            Arc::new(|| false),
             |_| {},
         )
         .await;
@@ -1772,6 +1861,7 @@ mod tests {
             || false,
             || true,
             move || pump.load(Ordering::SeqCst),
+            Arc::new(|| false),
             |_| {},
         )
         .await;
@@ -1807,6 +1897,7 @@ mod tests {
             || false,
             || true,
             || true,
+            Arc::new(|| false),
             |_| {},
         )
         .await;
@@ -1830,6 +1921,119 @@ mod tests {
         let p = run(&cache, write, Some(50), &AtomicBool::new(false)).await;
         assert_eq!(p.abort_reason, Some(ABORT_THERMAL_RISE));
         assert_eq!(p.max_cpu_temp_c, Some(hot));
+    }
+
+    /// The no-sensor floor starts with the walk's write number `after + 1`
+    /// counted from its first write at or below `at` (`after` 0: that write
+    /// itself); `in_profile` says whether the active profile names the channel.
+    async fn blind_at(
+        at: u8,
+        after: usize,
+        stall: u8,
+        restart: u8,
+        original: Option<u8>,
+        in_profile: bool,
+    ) -> (CalProgress, Vec<u8>) {
+        let cache = make_cache(50.0);
+        let c2 = cache.clone();
+        let seen = std::sync::atomic::AtomicUsize::new(0);
+        let (write, log) = fan(&cache, stall, restart, move |pct| {
+            let n = seen.load(Ordering::SeqCst);
+            if n > 0 || pct <= at {
+                seen.store(n + 1, Ordering::SeqCst);
+                if n >= after {
+                    c2.record_engine_tick(
+                        "no_sensor_fallback",
+                        constants::THERMAL_EMERGENCY_TRIGGER_C,
+                    );
+                }
+            }
+        });
+        let p = run_calibration(
+            &cache,
+            0,
+            hold(&cache),
+            original,
+            50.0,
+            write,
+            &AtomicBool::new(false),
+            || false,
+            || true,
+            || false,
+            Arc::new(move || in_profile),
+            |_| {},
+        )
+        .await;
+        let w = log.lock().unwrap().clone();
+        (p, w)
+    }
+
+    /// [SAFETY] `DGN-a`: the no-sensor floor reaches the active profile's
+    /// channels only. One the profile does not name is driven by nothing, and an
+    /// OpenFan channel holds what it was last sent, so it is restored — floored
+    /// at the force's duty, since the CPU cannot be seen. Before, it was left at
+    /// the walk's last step.
+    #[tokio::test(start_paused = true)]
+    async fn the_no_sensor_floor_restores_a_channel_the_profile_does_not_name() {
+        let (p, w) = blind_at(20, 0, 10, 16, Some(30), false).await;
+        assert_eq!(p.abort_reason, Some("thermal_force"));
+        assert!(w.contains(&20), "precondition: the walk reached 20%: {w:?}");
+        assert_eq!(
+            w.last(),
+            Some(&constants::NO_SENSOR_SAFE_PCT),
+            "restored to 30%, floored at the force's duty: {w:?}"
+        );
+        assert_eq!(p.restore_outcome, "restored");
+        assert!(p.restore_failed, "not back at its own 30%");
+    }
+
+    /// The other side: a channel the profile names is the force's to drive, so
+    /// the restore is skipped, as under the emergency.
+    #[tokio::test(start_paused = true)]
+    async fn the_no_sensor_floor_leaves_a_profile_channel_to_the_force() {
+        let (p, w) = blind_at(20, 0, 10, 16, Some(30), true).await;
+        assert_eq!(p.abort_reason, Some("thermal_force"));
+        assert_eq!(p.restore_outcome, "skipped_thermal_force");
+        assert_eq!(w.last(), Some(&20), "{w:?}");
+    }
+
+    /// [SAFETY] `DGN-a`: a channel the walk stopped, when the no-sensor floor
+    /// does not reach it, gets the recovery kick: nothing else will restart
+    /// it. A profile channel does not: the force drives it.
+    #[tokio::test(start_paused = true)]
+    async fn the_no_sensor_floor_kicks_a_stopped_channel_only_when_it_does_not_reach_it() {
+        // Stalls at or below 30 and needs 60 to restart. The floor starts with
+        // the write after the one that stopped the fan, once the walk has seen
+        // it stopped.
+        let (p, w) = blind_at(30, 1, 30, 60, Some(50), false).await;
+        assert_eq!(
+            p.stall_duty_pct,
+            Some(30),
+            "precondition: the walk saw it stop"
+        );
+        let first_stop = w
+            .iter()
+            .position(|&d| d <= 30)
+            .expect("the walk stopped it");
+        assert!(
+            w[first_stop..].contains(&100),
+            "a stopped channel outside the profile is kicked: {w:?}"
+        );
+        // Floored, not replaced: its own 50 % is above the force's duty.
+        assert_eq!(w.last(), Some(&50), "{w:?}");
+        assert_eq!(p.restore_outcome, "restored", "{w:?}");
+        assert!(!p.restore_failed, "back at its own duty");
+
+        let (p, w) = blind_at(30, 1, 30, 60, Some(50), true).await;
+        let first_stop = w
+            .iter()
+            .position(|&d| d <= 30)
+            .expect("the walk stopped it");
+        assert!(
+            !w[first_stop..].contains(&100),
+            "a profile channel is the force's: {w:?}"
+        );
+        assert_eq!(p.restore_outcome, "skipped_thermal_force");
     }
 
     /// [SAFETY] DEC-295: once thermal safety is forcing, calibration writes
@@ -1876,6 +2080,7 @@ mod tests {
                 || false,
                 || true,
                 || false,
+                Arc::new(|| false),
                 |_| {},
             )
             .await
@@ -1927,6 +2132,7 @@ mod tests {
             move || down.load(Ordering::SeqCst),
             || true,
             || false,
+            Arc::new(|| false),
             |_| {},
         )
         .await;
@@ -2035,6 +2241,7 @@ mod tests {
             || false,
             || true,
             || false,
+            Arc::new(|| false),
             |_| {},
         )
         .await;
@@ -2134,6 +2341,41 @@ mod tests {
         );
     }
 
+    /// [SAFETY] `DGN-a`, the drop backstop: a run dropped while the no-sensor
+    /// floor is forcing restores a channel the profile does not name, floored
+    /// at the force's duty, and leaves one it names to the force.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_dropped_under_the_no_sensor_floor_restores_only_what_the_floor_misses() {
+        for (in_profile, expect) in [(false, Some(constants::NO_SENSOR_SAFE_PCT)), (true, None)] {
+            let cache = make_cache(50.0);
+            let (write, log) = fan(&cache, 10, 16, |_| {});
+            let written_before;
+            {
+                let cancel = AtomicBool::new(false);
+                let fut = run_in(&cache, write, Some(30), &cancel, in_profile);
+                tokio::pin!(fut);
+                tokio::select! {
+                    _ = &mut fut => panic!("the walk completed too fast to model a drop"),
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
+                written_before = log.lock().unwrap().len();
+                assert!(written_before >= 2, "precondition: the walk wrote");
+                // The floor starts after the last gate the walk will run.
+                cache.record_engine_tick(
+                    "no_sensor_fallback",
+                    constants::THERMAL_EMERGENCY_TRIGGER_C,
+                );
+            }
+            let w = log.lock().unwrap();
+            assert_eq!(
+                w.get(written_before).copied(),
+                expect,
+                "in_profile {in_profile}: {w:?}"
+            );
+            assert_eq!(w.len(), written_before + usize::from(expect.is_some()));
+        }
+    }
+
     /// The keepalive is the last gate; a failed one ends the run as superseded.
     #[tokio::test(start_paused = true)]
     async fn a_lost_engine_pause_is_superseded() {
@@ -2151,6 +2393,7 @@ mod tests {
             || false,
             || calls.fetch_add(1, Ordering::SeqCst) < 6,
             || false,
+            Arc::new(|| false),
             |_| {},
         )
         .await;

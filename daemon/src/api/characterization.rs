@@ -1500,10 +1500,23 @@ where
             return;
         }
         if let Some(state) = thermal_force_state(self.cache) {
+            // [SAFETY] `DGN-a`: the force reaches this header only at 100 %, or
+            // as a profile member under the no-sensor floor (DEC-382). Recorded
+            // as abandoned (`PTR-ae`) so the engine settles the rest by its own
+            // member set, once this run's pause ends: a header with no mode
+            // switch the profile does not name is released to the exit floor by
+            // the force's give-back (DEC-451), a member stays the force's, and
+            // the record is ignored for a header with a mode switch, which the
+            // give-back hands back as found. Without it, the no-sensor floor
+            // left a non-member with no mode switch at the run's last duty,
+            // with no writer, while the CPU could not be seen.
+            if moved {
+                self.cache.note_abandoned_by_diagnostic(self.header_id);
+            }
             log::warn!(
-                "characterize: {} left at the thermal-safety forced duty instead of \
-                 restoring its pre-sweep duty — thermal safety is active ({state}) \
-                 and outranks a diagnostic.",
+                "characterize: restore of {} skipped — thermal safety is active ({state}) \
+                 and outranks a diagnostic; the engine drives the header if the force \
+                 reaches it, and otherwise gives it back or raises it",
                 self.header_id
             );
             self.report
@@ -1601,6 +1614,11 @@ where
                 self.report.set(RestoreOutcome::SkippedUnresponsive);
             }
             Err(WriteFailure::Error(e)) => {
+                // [SAFETY] `DGN-a`: most often the force took the lease. Left to
+                // the engine as on the thermal skip; its release only raises.
+                if moved {
+                    self.cache.note_abandoned_by_diagnostic(self.header_id);
+                }
                 log::warn!(
                     "characterize: restore of {} to {restore}% failed; it is left at the \
                      last swept duty: {e}",
@@ -3474,6 +3492,8 @@ mod tests {
         // The skip-is-reported direction needs a sweep that actually moved the
         // header first — `a_thermal_force_after_a_write_reports_the_skip` below.
         assert_eq!(rig.restore(), (false, "restored"));
+        // `DGN-a`: nothing was moved, so nothing is left for the engine to release.
+        assert!(cache.abandoned_by_diagnostic().is_empty());
     }
 
     /// `AUD2-c`: the ladder starts forcing AFTER the sweep has moved the header,
@@ -3517,6 +3537,59 @@ mod tests {
             "precondition: the header WAS moved, and no restore write followed it"
         );
         assert_eq!(rig_free_restore(&report), (true, "skipped_thermal_force"));
+    }
+
+    /// [SAFETY] `DGN-a`: the no-sensor floor starts after the sweep moved the
+    /// header. That force reaches only the active profile's members (DEC-382),
+    /// so the skipped restore records the header as abandoned (`PTR-ae`): the
+    /// force's own give-back then releases a non-member with no mode switch to
+    /// the exit floor (`the_no_sensor_floor_releases_a_header_a_diagnostic_left`
+    /// in `profile_engine::backends`). Before, nothing was recorded and nothing
+    /// wrote the header again while the CPU could not be seen.
+    #[tokio::test(start_paused = true)]
+    async fn a_no_sensor_floor_after_a_write_leaves_the_header_for_the_engine_to_release() {
+        let cache = cache_at(45.0, Some("normal"));
+        let cancel = AtomicBool::new(false);
+        let report = RestoreReport::new();
+        let writes: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writes_w = writes.clone();
+        let blind: &StateCache = &cache;
+
+        let out = run_sweep_uni(
+            &cache,
+            "hwmon:test:pwm1",
+            &[30, 50],
+            0,
+            Duration::from_secs(6),
+            move |p: u8| {
+                writes_w.lock().unwrap().push(p);
+                blind.record_engine_tick(
+                    "no_sensor_fallback",
+                    constants::THERMAL_EMERGENCY_TRIGGER_C,
+                );
+                Ok(())
+            },
+            move || sample(Some(42), Some(1), Some(900)),
+            &cancel,
+            || false,
+            || true,
+            &report,
+            |_| {},
+        )
+        .await;
+
+        assert_eq!(out.state, STATE_ABORTED);
+        assert_eq!(
+            *writes.lock().unwrap(),
+            vec![30],
+            "precondition: moved once"
+        );
+        assert_eq!(rig_free_restore(&report), (true, "skipped_thermal_force"));
+        assert_eq!(
+            cache.abandoned_by_diagnostic(),
+            vec!["hwmon:test:pwm1".to_string()],
+            "the engine must be told the header was left behind"
+        );
     }
 
     /// The same for the shutdown skip, and distinct from the drop-the-future test
@@ -3963,6 +4036,12 @@ mod tests {
         .await;
         assert_eq!(out.state, STATE_COMPLETE);
         assert_eq!(rig.restore(), (true, "write_failed"));
+        // `DGN-a`: left to the engine, which releases it if nothing drives it
+        // (most often the force took the lease).
+        assert_eq!(
+            cache.abandoned_by_diagnostic(),
+            vec!["hwmon:test:pwm1".to_string()]
+        );
     }
 
     #[tokio::test(start_paused = true)]

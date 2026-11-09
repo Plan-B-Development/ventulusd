@@ -692,6 +692,11 @@ fn start_openfan_calibration(
             // lock, so this takes only `active_profile` and `header_roles`,
             // each briefly — nothing the walk holds.
             || pump_state.header_is_pump_protected(&fan_id),
+            // `DGN-a`: the engine's own member set, from the profile it runs.
+            {
+                let state = Arc::clone(&pump_state);
+                Arc::new(move || channel_in_active_profile(&state, channel))
+            },
             publish,
         )
         .await;
@@ -935,6 +940,18 @@ pub async fn openfan_rescan_handler(
         crate::serial::real_transport::RealSerialTransport::open,
     )
     .await
+}
+
+/// [SAFETY] `DGN-a`: whether the active profile names OpenFan `channel`, by
+/// the engine's own member set. Under the no-sensor floor the force reaches
+/// profile members only, so calibration reads this to know whether the force
+/// drives the channel it walked.
+pub(crate) fn channel_in_active_profile(state: &AppState, channel: u8) -> bool {
+    state.active_profile.lock().as_ref().is_some_and(|p| {
+        crate::profile_engine::ProfileMembers::of(p)
+            .openfan
+            .contains(&channel)
+    })
 }
 
 /// [`openfan_rescan_handler`] with its two hardware touchpoints injected
@@ -3066,6 +3083,47 @@ mod tests {
                 .await
         );
         let _ = stop.send(true);
+    }
+
+    /// `DGN-a`: calibration's membership answer is the profile's own member
+    /// set, read live: a channel the active profile names, and no other.
+    #[test]
+    fn a_channel_is_in_the_profile_only_when_a_control_names_it() {
+        let state = rescan_state();
+        assert!(!channel_in_active_profile(&state, 3), "no profile");
+        *state.active_profile.lock() = Some(crate::profile::DaemonProfile {
+            id: "p".into(),
+            name: "p".into(),
+            version: 7,
+            description: String::new(),
+            controls: vec![crate::profile::LogicalControl {
+                id: "front".into(),
+                name: "front".into(),
+                mode: "manual".into(),
+                curve_id: String::new(),
+                manual_output_pct: 50.0,
+                members: vec![crate::profile::ControlMember {
+                    source: "openfan".into(),
+                    member_id: "openfan:ch03".into(),
+                    member_label: "Front".into(),
+                    fan_zero_rpm: false,
+                }],
+                step_up_pct: 100.0,
+                step_down_pct: 100.0,
+                offset_pct: 0.0,
+                minimum_pct: 20.0,
+                start_pct: 0.0,
+                stop_pct: 0.0,
+            }],
+            curves: vec![],
+        });
+        assert!(channel_in_active_profile(&state, 3));
+        assert!(!channel_in_active_profile(&state, 4));
+        *state.active_profile.lock() = None;
+        assert!(
+            !channel_in_active_profile(&state, 3),
+            "read live, not captured"
+        );
     }
 
     fn rescan_state() -> Arc<AppState> {

@@ -297,6 +297,32 @@ mod tests {
         r
     }
 
+    /// [SAFETY] `DGN-a`: the diagnostics judge the force's reach from the
+    /// published state alone (`api::calibration::members_only_force_pct`). For
+    /// every forcing decision the ladder can make, that must agree with the reach
+    /// the engine gives its duty (`ForceReach::for_duty`): members-only at the
+    /// same duty, or every output.
+    #[test]
+    fn the_diagnostics_judge_the_force_reach_as_the_engine_does() {
+        use super::super::backends::{ForceReach, HeldMembers, ProfileMembers};
+        let (members, held) = (ProfileMembers::default(), HeldMembers::default());
+        for decision in [
+            SafetyDecision::emergency(&ThermalSafetyRule::new()),
+            SafetyDecision::emergency(&rule()),
+            SafetyDecision::NO_SENSOR_FALLBACK,
+        ] {
+            let pct = decision.forced_pct.expect("a forcing decision");
+            let engine = ForceReach::for_duty(pct, &members, &held, false).members_only();
+            let api = crate::api::calibration::members_only_force_pct(decision.thermal_state);
+            assert_eq!(
+                api,
+                engine.then_some(pct),
+                "{}: the diagnostics and the engine disagree on the reach of {pct}%",
+                decision.thermal_state
+            );
+        }
+    }
+
     /// [SAFETY] DEC-443: every CPU state crossed with both coolant states. The
     /// combined duty is never below either input's, the state is `emergency`
     /// exactly when one rule is, and a CPU fallback survives only while coolant

@@ -552,6 +552,7 @@ pub async fn hwmon_verify_handler(
         move || watch_state.header_is_pump_protected(&watch_id),
     );
     let bg_lease_id = verify_lease_id.clone();
+    let bg_cache = state.cache.clone();
     // Not capped (DEC-505): the verify (holds its lease and pause).
     let join = tokio::task::spawn_blocking(move || {
         // Moved, not borrowed: dropped only when this task finishes, so the
@@ -697,6 +698,11 @@ pub async fn hwmon_verify_handler(
             match ctrl.set_pwm(&bg_header_id, restore_pct, &bg_lease_id) {
                 Ok(_) => false,
                 Err(e) => {
+                    // [SAFETY] `DGN-a`: most often a thermal force took the
+                    // lease. Recorded so the engine releases a header with no
+                    // mode switch the profile does not name; its release only
+                    // raises, and the record is ignored for any other header.
+                    bg_cache.note_abandoned_by_diagnostic(&bg_header_id);
                     log::warn!(
                         "verify: restore PWM to {restore_pct}% on {bg_header_id} \
                          failed (header left at test value {test_pct}%): {e}"
@@ -2157,6 +2163,43 @@ pub(crate) mod tests {
             "a run that lost its header recorded a verdict"
         );
         assert!(published_verification(&state).await.is_null());
+    }
+
+    /// [SAFETY] `DGN-a`: the thermal force takes the hwmon lease mid-settle,
+    /// so the verify's restore fails. The header is recorded as abandoned, so
+    /// the engine releases it if nothing drives it; before, it stayed at the
+    /// test duty with no writer.
+    #[tokio::test]
+    async fn a_verify_whose_lease_the_force_took_leaves_the_header_to_the_engine() {
+        temp_state_dir();
+        let (state, _writes, _tx, _tmp) = build_verify_state_with(
+            Some(128),
+            crate::hwmon::roles::HeaderRole::ChassisFan,
+            Some(|raw| 300 + raw * 8),
+        );
+        state.cache.update_sensors(vec![fresh_cpu(40.0)]);
+        let task = tokio::spawn(hwmon_verify_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("hwmon:test:dev:pwm1".to_string()),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!task.is_finished(), "precondition: still settling");
+        assert!(state.cache.abandoned_by_diagnostic().is_empty());
+        state
+            .hwmon_controller
+            .as_ref()
+            .unwrap()
+            .controller()
+            .lock()
+            .lease_manager_mut()
+            .force_take_lease(HwmonWriter::ThermalSafety);
+        let (status, Json(body)) = task.await.expect("the verify task");
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["restore_failed"], true, "precondition: {body}");
+        assert_eq!(
+            state.cache.abandoned_by_diagnostic(),
+            vec!["hwmon:test:dev:pwm1".to_string()]
+        );
     }
 
     /// A completed sweep whose duty read back and whose fan followed is a

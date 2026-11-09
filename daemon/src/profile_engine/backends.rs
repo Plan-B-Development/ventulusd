@@ -2695,7 +2695,7 @@ impl HwmonBackend {
 
                 // Phase 2b (DEC-382): give back what nothing holds any more.
                 if let Some(members) = &give_back {
-                    give_back_unheld(&ctrl, &lease_id, members);
+                    give_back_unheld(&ctrl, &lease_id, members, 0);
                 }
 
                 // Phase 3: renew under a brief lock to keep it alive for next
@@ -2766,7 +2766,15 @@ fn has_unheld(ctrl: &HwmonPwmController, members: &HashSet<String>) -> bool {
 /// Called only from inside a write task that already holds a valid lease. A
 /// header whose lease is lost mid-scan (a verify force-took it) is skipped, not
 /// forced: the verify owns it now, and a later tick gives it back.
-fn give_back_unheld(ctrl: &Mutex<HwmonPwmController>, lease_id: &str, members: &HashSet<String>) {
+///
+/// `min_pct` is the forced duty when a members-only force gives back, else 0:
+/// a header with no mode switch is released no lower than it (`DGN-a`).
+fn give_back_unheld(
+    ctrl: &Mutex<HwmonPwmController>,
+    lease_id: &str,
+    members: &HashSet<String>,
+    min_pct: u8,
+) {
     let (unheld, unheld_no_mode): (Vec<String>, Vec<String>) = {
         let guard = ctrl.lock();
         let unnamed = |ids: Vec<String>| -> Vec<String> {
@@ -2779,10 +2787,11 @@ fn give_back_unheld(ctrl: &Mutex<HwmonPwmController>, lease_id: &str, members: &
     };
     for id in unheld_no_mode {
         let mut guard = ctrl.lock();
-        match guard.release_no_mode(&id, lease_id) {
+        match guard.release_no_mode(&id, lease_id, min_pct) {
             Ok(Some(NoModeRelease::Raised { was, to })) => log::info!(
                 "hwmon {id}: no profile control commands it any more, and it has no mode to \
-                 give back — raised from {} to {to} % (the exit floor)",
+                 give back — raised from {} to {to} % (the exit floor, or the thermal \
+                 floor while it forces)",
                 was.map_or("an unknown duty".to_string(), |p| format!("{p} %"))
             ),
             Ok(Some(NoModeRelease::Kept { at })) => log::info!(
@@ -2794,7 +2803,7 @@ fn give_back_unheld(ctrl: &Mutex<HwmonPwmController>, lease_id: &str, members: &
                 if guard.note_release_failed(&id) {
                     log::warn!(
                         "hwmon {id}: no profile control commands it any more, but raising it \
-                         to {to} % (the exit floor) failed ({error}); retrying every tick"
+                         to {to} % failed ({error}); retrying every tick"
                     );
                 }
             }
@@ -2989,7 +2998,9 @@ impl SafetyWriteBackend for HwmonBackend {
                 cache.note_fan_write_outcome(hdr_id, landed, std::time::Instant::now());
             }
             if let (Some(m), true) = (&members, give_back) {
-                give_back_unheld(&ctrl, &lease_id, m);
+                // `DGN-a`: a header released while the floor forces is
+                // released no lower than the floor's duty.
+                give_back_unheld(&ctrl, &lease_id, m, pct);
             }
             Vec::new()
         })
@@ -6000,6 +6011,64 @@ mod tests {
             vec![crate::pwm::percent_to_raw(50).to_string()]
         );
         assert!(cache.abandoned_by_diagnostic().is_empty());
+    }
+
+    /// [SAFETY] `DGN-a`, the engine's half: a diagnostic left a header with no
+    /// mode switch at a low duty when the no-sensor floor stopped it, and the
+    /// profile does not name the header. The floor reaches the profile's
+    /// members only and is not latched, so its own give-back releases the
+    /// header to the exit floor once the diagnostic's pause has ended. The
+    /// reach is the engine's own `for_duty`, so this is the reach the ladder
+    /// actually gives the floor.
+    #[tokio::test]
+    async fn the_no_sensor_floor_releases_a_header_a_diagnostic_left() {
+        // The exit floor above the floor's duty, then below it, then off: the
+        // release is never lower than the floor's duty while it forces.
+        for (exit_floor, expect) in [
+            (50u8, 50u8),
+            (20, constants::NO_SENSOR_SAFE_PCT),
+            (0, constants::NO_SENSOR_SAFE_PCT),
+        ] {
+            let (mut be, writes, cache) = release_rig();
+            cache.set_exit_floor_pct(exit_floor);
+            {
+                let mut ctrl = be.ctrl.lock();
+                let verify = ctrl
+                    .lease_manager_mut()
+                    .force_take_lease(HwmonWriter::Verify)
+                    .lease_id;
+                ctrl.set_pwm(NO_MODE_ID, 15, &verify).unwrap();
+                ctrl.lease_manager_mut().release_lease(&verify).unwrap();
+            }
+            cache.note_abandoned_by_diagnostic(NO_MODE_ID);
+            writes.lock().clear();
+            // The profile names the other header only.
+            let members = hwmon_members(&[&header_with_paths(2).id]);
+            let held = HeldMembers::default();
+            let pct = constants::NO_SENSOR_SAFE_PCT;
+            let reach = ForceReach::for_duty(pct, &members, &held, false);
+            assert!(
+                reach.members_only(),
+                "precondition: the floor is members-only"
+            );
+
+            // While a diagnostic's pause is held, nothing is released.
+            let epoch = cache
+                .try_begin_verify(std::time::Duration::from_secs(30))
+                .unwrap();
+            be.force_all_with_floor(pct, &[], reach).await;
+            assert!(no_mode_writes(&writes).is_empty(), "the pause holds it");
+            assert!(cache.end_verify(epoch));
+
+            be.force_all_with_floor(pct, &[], reach).await;
+
+            assert_eq!(
+                no_mode_writes(&writes),
+                vec![crate::pwm::percent_to_raw(expect).to_string()],
+                "exit floor {exit_floor}: the header the floor does not reach is raised"
+            );
+            assert!(cache.abandoned_by_diagnostic().is_empty());
+        }
     }
 
     /// The opposite branch: a header the new profile still names is its to
