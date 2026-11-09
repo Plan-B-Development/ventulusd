@@ -113,7 +113,7 @@ pub async fn gpu_reset_fan_handler(
             ),
             Err(e) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &ErrorEnvelope::internal(format!("GPU fan reset task failed: {e}")),
+                &ErrorEnvelope::internal(crate::api::blocking::join_failure("GPU fan reset", &e)),
             ),
         }
     } else if gpu.can_write_legacy_pwm() {
@@ -176,7 +176,7 @@ pub async fn gpu_reset_fan_handler(
             ),
             Err(e) => error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &ErrorEnvelope::internal(format!("GPU fan reset task failed: {e}")),
+                &ErrorEnvelope::internal(crate::api::blocking::join_failure("GPU fan reset", &e)),
             ),
         }
     } else {

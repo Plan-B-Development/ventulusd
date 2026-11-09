@@ -814,7 +814,7 @@ async fn write_off_runtime(write: &CalWriteFn, channel: u8, pct: u8) -> Result<(
     match tokio::task::spawn_blocking(move || w(channel, pct)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
-        Err(e) => Err(format!("the write task failed: {e}")),
+        Err(e) => Err(crate::api::blocking::join_failure("calibration write", &e)),
     }
 }
 

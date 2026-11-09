@@ -37,7 +37,7 @@ pub async fn hwmon_inventory_handler(
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(format!("hwmon inventory task failed: {e}")),
+            &ErrorEnvelope::internal(crate::api::blocking::join_failure("hwmon inventory", &e)),
         ),
     }
 }
@@ -533,7 +533,7 @@ pub async fn superio_probe_handler(
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(format!("superio probe task failed: {e}")),
+            &ErrorEnvelope::internal(crate::api::blocking::join_failure("superio probe", &e)),
         ),
     }
 }

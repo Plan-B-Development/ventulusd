@@ -46,6 +46,11 @@ rename. Version numbers carry on from Control-OFC.
   in effect. The check looked for the roles in the wrong place in `runtime.toml`, so the warning
   never appeared and a pump role (and its 30 % floor) could be lost without notice. It now finds
   them.
+- **Error responses no longer include internal details.** When a background task behind a request
+  failed, the error message quoted the task's internal failure text; it now says only which task
+  failed and whether it crashed or was cancelled, and the full text goes to the log. Refusing to
+  remove the profile store directory from the search path no longer quotes its path; `GET /config`
+  reports it.
 - **Dependency updates.** tokio 1.54.1 fixes RUSTSEC-2026-0386 (unsound `AsyncFd` constructors, a
   part of tokio the daemon and tray do not use), and hyper 1.12.0 drops the unmaintained
   `pin-utils` (RUSTSEC-2026-0441).

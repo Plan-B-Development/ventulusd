@@ -55,6 +55,20 @@ where
     spawn_with(&REQUEST_BLOCKING_SLOTS, f).await
 }
 
+/// A failed task in words fit for an error envelope: what failed, and whether
+/// it panicked or was cancelled — never the panic's message, which `JoinError`'s
+/// `Display` carries and which may hold paths or internal state (`CLAUDE.md
+/// § Boundaries`). The whole error, message included, goes to the log.
+pub(crate) fn join_failure(what: &str, e: &JoinError) -> String {
+    log::error!("{what} task failed: {e}");
+    let how = if e.is_panic() {
+        "panicked"
+    } else {
+        "was cancelled"
+    };
+    format!("{what} task failed ({how})")
+}
+
 /// Request-blocking permits free now. For tests that must show a flood
 /// reached the cap.
 #[doc(hidden)]
@@ -94,6 +108,29 @@ mod tests {
         TOKIO_MAX_BLOCKING_THREADS,
     };
     use std::time::{Duration, Instant};
+
+    /// A panicking task's message stays in the log: the envelope text names
+    /// the task and how it ended, and nothing of the payload.
+    #[tokio::test]
+    async fn join_failure_keeps_the_panic_message_out() {
+        const PAYLOAD: &str = "/var/lib/ventulus/secret-path";
+        let err = run(|| -> () { panic!("{PAYLOAD}") })
+            .await
+            .expect_err("the task panicked");
+        // Precondition: the raw error does carry the payload.
+        assert!(err.to_string().contains(PAYLOAD), "{err}");
+
+        let text = join_failure("hardware diagnostics", &err);
+        assert_eq!(text, "hardware diagnostics task failed (panicked)");
+
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let err = cancelled.await.expect_err("aborted");
+        assert_eq!(
+            join_failure("store", &err),
+            "store task failed (was cancelled)"
+        );
+    }
 
     /// The budget: request work, with the profile-read slots, can hold at most a
     /// quarter of the pool, so the control path's handful of tasks always finds

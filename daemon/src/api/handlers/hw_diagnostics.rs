@@ -99,7 +99,10 @@ pub async fn hardware_diagnostics_handler(
         Ok(resp) => resp,
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &ErrorEnvelope::internal(format!("hardware diagnostics task failed: {e}")),
+            &ErrorEnvelope::internal(crate::api::blocking::join_failure(
+                "hardware diagnostics",
+                &e,
+            )),
         ),
     }
 }

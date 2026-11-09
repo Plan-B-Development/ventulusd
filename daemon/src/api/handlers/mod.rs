@@ -1279,7 +1279,7 @@ where
         // The closure panicked or the runtime is shutting down. Report it as a
         // persistence failure rather than unwrapping — a panicking write must
         // not take an API worker down with it.
-        Err(e) => Err(format!("persistence task failed: {e}")),
+        Err(e) => Err(crate::api::blocking::join_failure("persistence", &e)),
     }
 }
 
@@ -1301,7 +1301,7 @@ where
         fut.await
     })
     .await
-    .map_err(|e| format!("store task failed: {e}"))
+    .map_err(|e| crate::api::blocking::join_failure("store", &e))
 }
 
 /// Why a [`bounded_profile_io`] call produced no answer.
@@ -2560,10 +2560,14 @@ mod persist_tests {
             result.is_err(),
             "a panic must surface as Err, not unwind the handler"
         );
+        let message = result.unwrap_err();
         assert!(
-            result.unwrap_err().contains("persistence task failed"),
+            message.contains("persistence task failed"),
             "and must be distinguishable from an ordinary IO failure"
         );
+        // The message can reach an error envelope (a validation session read),
+        // which never carries a panic's payload (`CLAUDE.md § Boundaries`).
+        assert!(!message.contains("simulated write panic"), "{message}");
     }
 
     #[tokio::test]

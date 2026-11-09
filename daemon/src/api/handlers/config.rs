@@ -207,12 +207,15 @@ pub(crate) fn merge_search_dirs(
                 .to_string(),
         );
     }
+    // The store's path is not in the message: an error envelope never carries an
+    // absolute path (`CLAUDE.md § Boundaries`); `GET /config` reports it.
     if let Some(store) = store_dir {
         if merged.first().map(String::as_str) != Some(store) {
-            return Err(format!(
+            return Err(
                 "the daemon's profile store directory must remain first in the \
-                 search path and cannot be removed or displaced: {store}"
-            ));
+                 search path and cannot be removed or displaced"
+                    .to_string(),
+            );
         }
     }
     Ok(merged)
@@ -2057,7 +2060,13 @@ mod tests {
 
         let msg = merge_search_dirs(&current, &[], &v(&[store]), Some(store))
             .expect_err("the store dir must be protected");
-        assert!(msg.contains(store), "the rejection must name it: {msg}");
+        assert!(
+            msg.contains("profile store directory"),
+            "the rejection must name it: {msg}"
+        );
+        // By role, not by path: an error envelope carries no absolute path
+        // (`CLAUDE.md § Boundaries`); `GET /config` reports where it is.
+        assert!(!msg.contains(store), "{msg}");
 
         // Removing something else is unaffected, and the store stays first.
         let out = merge_search_dirs(&current, &[], &v(&["/home/u/p"]), Some(store)).unwrap();
@@ -2072,7 +2081,10 @@ mod tests {
         // and no order at all, which is how the hole shipped.
         let msg = merge_search_dirs(&current, &v(&[store]), &v(&[store]), Some(store))
             .expect_err("displacing the store dir must be refused, not merely surviving it");
-        assert!(msg.contains(store), "the rejection must name it: {msg}");
+        assert!(
+            msg.contains("profile store directory") && !msg.contains(store),
+            "the rejection must name it by role: {msg}"
+        );
 
         // Position is the property, so assert it directly on every accepted
         // edit — membership alone is what let this through the first time.

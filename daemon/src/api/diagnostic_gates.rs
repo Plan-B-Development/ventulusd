@@ -380,8 +380,9 @@ pub(crate) async fn bounded_hwmon_write(
     });
     match tokio::time::timeout(crate::constants::DIAGNOSTIC_WRITE_BUDGET, join).await {
         Err(_elapsed) => Err(WriteFailure::Unresponsive),
-        Ok(Err(join_error)) => Err(WriteFailure::Error(format!(
-            "the write task did not finish: {join_error}"
+        Ok(Err(join_error)) => Err(WriteFailure::Error(crate::api::blocking::join_failure(
+            "diagnostic write",
+            &join_error,
         ))),
         Ok(Ok(result)) => result.map_err(WriteFailure::Error),
     }

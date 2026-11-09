@@ -476,7 +476,10 @@ async fn finalise_off_runtime(
         // A panicking finaliser must not take an API worker down. The session
         // stays installed and `recording`, which the next boot sweep represents
         // honestly as `interrupted` (§15) — never a fabricated "completed".
-        Err(e) => Err(format!("validation finalise task failed: {e}")),
+        Err(e) => Err(crate::api::blocking::join_failure(
+            "validation finalise",
+            &e,
+        )),
     }
 }
 
@@ -681,8 +684,9 @@ pub async fn start_session_handler(
             // The blocking task panicked or the runtime is shutting down.
             // Reported as a persistence failure rather than unwrapped: a
             // panicking start must not take an API worker down with it.
-            Err(e) => Err(StartError::Persistence(format!(
-                "validation start task failed: {e}"
+            Err(e) => Err(StartError::Persistence(crate::api::blocking::join_failure(
+                "validation start",
+                &e,
             ))),
         }
     };
