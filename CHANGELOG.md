@@ -40,6 +40,9 @@ rename. Version numbers carry on from Control-OFC.
   - `/diagnostics/hardware` no longer hangs while a motherboard fan write has not returned. It
     answers after 2 s without the BIOS reclaim counts, and says so with
     `enable_revert_counts_unavailable`.
+- **Dependency updates.** tokio 1.54.1 fixes RUSTSEC-2026-0386 (unsound `AsyncFd` constructors, a
+  part of tokio the daemon and tray do not use), and hyper 1.12.0 drops the unmaintained
+  `pin-utils` (RUSTSEC-2026-0441).
 
 ## [5.5.0] — 2026-11-03
 
