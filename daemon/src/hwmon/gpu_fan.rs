@@ -406,6 +406,52 @@ pub fn read_zero_rpm_enabled(zero_rpm_path: &Path) -> Option<bool> {
     parse_zero_rpm_enabled(&std::fs::read_to_string(zero_rpm_path).ok()?)
 }
 
+/// Parse a `fan_zero_rpm_stop_temperature` read (GPD-b): the integer line after
+/// the `FAN_ZERO_RPM_STOP_TEMPERATURE:` header, in °C. SMU 14.0.2 prints
+/// `FAN_ZERO_RPM_STOP_TEMPERATURE:\n<v>\nOD_RANGE:\nZERO_RPM_STOP_TEMPERATURE: <min> <max>`
+/// (torvalds master `smu_v14_0_2_ppt.c`). `None` on anything else.
+pub fn parse_zero_rpm_stop_temp(content: &str) -> Option<i32> {
+    let mut found_header = false;
+    for line in content.lines() {
+        if line.trim() == "FAN_ZERO_RPM_STOP_TEMPERATURE:" {
+            found_header = true;
+            continue;
+        }
+        if found_header {
+            return line.trim().parse::<i32>().ok();
+        }
+    }
+    None
+}
+
+/// Read the card's zero-RPM stop temperature (`gpu_od/fan_ctrl/
+/// fan_zero_rpm_stop_temperature`, a sibling of `fan_curve`). Diagnostics-only:
+/// the GPU fan verify uses it to judge whether a stopped RDNA4 fan is idle.
+/// `None` when the kernel has no such file (before it gained one) or it does not
+/// parse.
+pub fn read_zero_rpm_stop_temp(fan_curve_path: &Path) -> Option<i32> {
+    let path = fan_curve_path.with_file_name("fan_zero_rpm_stop_temperature");
+    parse_zero_rpm_stop_temp(&std::fs::read_to_string(path).ok()?)
+}
+
+/// The GPU's hotspot in °C: the `tempN_input` whose `tempN_label` is
+/// `junction` in the amdgpu hwmon directory (GPD-b). `None` when no channel is
+/// labelled `junction` or it does not read.
+pub fn read_junction_temp_c(hwmon_path: &Path) -> Option<f64> {
+    (1..=8).find_map(|n| {
+        let label = std::fs::read_to_string(hwmon_path.join(format!("temp{n}_label"))).ok()?;
+        if label.trim() != "junction" {
+            return None;
+        }
+        let milli = std::fs::read_to_string(hwmon_path.join(format!("temp{n}_input")))
+            .ok()?
+            .trim()
+            .parse::<i64>()
+            .ok()?;
+        Some(milli as f64 / 1000.0)
+    })
+}
+
 /// Re-enable fan zero-RPM mode (restore firmware idle fan-stop behaviour).
 pub fn enable_zero_rpm(zero_rpm_path: &Path) -> Result<(), HwmonError> {
     std::fs::write(zero_rpm_path, "1\n").map_err(|e| HwmonError::WriteError {
@@ -1022,6 +1068,50 @@ ZERO_RPM_ENABLE: 0 1
     fn parse_zero_rpm_enabled_reads_value_line() {
         assert_eq!(parse_zero_rpm_enabled(ZERO_RPM_ENABLED), Some(true));
         assert_eq!(parse_zero_rpm_enabled(ZERO_RPM_DISABLED), Some(false));
+    }
+
+    /// GPD-b: the SMU 14.0.2 print format, and the cases that must not parse.
+    #[test]
+    fn parse_zero_rpm_stop_temp_reads_the_value_line() {
+        let smu14 =
+            "FAN_ZERO_RPM_STOP_TEMPERATURE:\n55\nOD_RANGE:\nZERO_RPM_STOP_TEMPERATURE: 50 110\n";
+        assert_eq!(parse_zero_rpm_stop_temp(smu14), Some(55));
+        assert_eq!(
+            parse_zero_rpm_stop_temp("FAN_ZERO_RPM_STOP_TEMPERATURE:\nx\n"),
+            None
+        );
+        assert_eq!(
+            parse_zero_rpm_stop_temp("ZERO_RPM_STOP_TEMPERATURE: 50 110\n"),
+            None
+        );
+        assert_eq!(parse_zero_rpm_stop_temp(""), None);
+    }
+
+    #[test]
+    fn read_junction_temp_finds_the_junction_channel_by_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (n, label, milli) in [
+            (1, "edge", "38000"),
+            (2, "junction", "44500"),
+            (3, "mem", "50000"),
+        ] {
+            std::fs::write(
+                tmp.path().join(format!("temp{n}_label")),
+                format!("{label}\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                tmp.path().join(format!("temp{n}_input")),
+                format!("{milli}\n"),
+            )
+            .unwrap();
+        }
+        assert_eq!(read_junction_temp_c(tmp.path()), Some(44.5));
+
+        let none = tempfile::tempdir().unwrap();
+        std::fs::write(none.path().join("temp1_label"), "edge\n").unwrap();
+        std::fs::write(none.path().join("temp1_input"), "38000\n").unwrap();
+        assert_eq!(read_junction_temp_c(none.path()), None);
     }
 
     #[test]

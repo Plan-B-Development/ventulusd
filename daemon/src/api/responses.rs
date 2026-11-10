@@ -2587,7 +2587,14 @@ pub struct GpuVerifyResponse {
     pub gpu_id: String,
     /// One of: "effective", "curve_not_applied", "no_rpm_effect",
     /// "zero_rpm_suppressed", "rpm_unavailable", "write_failed",
-    /// "pwm_enable_reverted" (legacy pwm1 path only).
+    /// "pwm_enable_reverted" (legacy pwm1 path only), or — GPD-b, RDNA4 only,
+    /// both inconclusive rather than failures — "idle_fan_stop" (the fan read 0
+    /// RPM after the test, not seen spinning before it, with the hotspot below
+    /// the card's idle band or unreadable: the
+    /// firmware may hold it stopped whatever zero-RPM says) and
+    /// "rpm_reads_zero" (0 RPM before and after with the hotspot at or above the band:
+    /// the tach may read 0 while the fan spins). An older client renders an
+    /// unknown token rather than dropping it (273-i).
     pub result: String,
     pub initial_state: GpuVerifyState,
     pub final_state: GpuVerifyState,
@@ -2617,6 +2624,11 @@ pub struct GpuVerifyState {
     pub pwm_enable: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zero_rpm_enabled: Option<bool>,
+    /// GPU hotspot (the amdgpu `junction` channel) in °C, read with the state
+    /// on the PMFW path (GPD-b). Absent on the legacy path and when no
+    /// `junction` channel reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotspot_c: Option<f64>,
 }
 
 /// Body of `POST /control/{id}/override` (DEC-163). `ttl_secs` is an optional

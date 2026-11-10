@@ -259,6 +259,10 @@ enum GpuVerifySequence {
         final_state: GpuVerifyState,
         test_speed: u8,
         restore_failed: bool,
+        /// The card's `fan_zero_rpm_stop_temperature`, read on the PMFW path
+        /// when the kernel has the file (GPD-b); `None` otherwise and on the
+        /// legacy path.
+        zero_rpm_stop_c: Option<i32>,
     },
     /// DEC-502: the stop began first. Either no test write was made, or the
     /// settle was cut short and the card restored at once — to firmware auto on
@@ -514,8 +518,11 @@ pub async fn gpu_verify_handler(
             final_state,
             test_speed,
             restore_failed,
+            zero_rpm_stop_c,
         } => {
-            let (result, details) = classify_gpu_verify_result(&initial, &final_state, test_speed);
+            let ctx = GpuVerifyContext::for_card(gpu.pci_device_id, zero_rpm_stop_c);
+            let (result, details) =
+                classify_gpu_verify_result(&initial, &final_state, test_speed, &ctx);
             json_ok(
                 StatusCode::OK,
                 GpuVerifyResponse {
@@ -530,6 +537,50 @@ pub async fn gpu_verify_handler(
                     restore_failed,
                 },
             )
+        }
+    }
+}
+
+/// GPD-b: the RDNA4 arms of [`classify_gpu_verify_result`], reached once the
+/// curve applied, the fan did not demonstrably respond and zero-RPM was not
+/// reported on. `None` means "not one of these" — the caller's `no_rpm_effect`.
+fn rdna4_zero_rpm_verdict(
+    initial: &GpuVerifyState,
+    final_state: &GpuVerifyState,
+    final_rpm: u16,
+    ctx: &GpuVerifyContext,
+) -> Option<(String, String)> {
+    // A fan seen spinning before the test that read 0 after it was not held
+    // stopped by an idle firmware: that is a real no-effect, whatever the hotspot.
+    let not_seen_spinning = matches!(initial.rpm, Some(0) | None);
+    if !ctx.rdna4 || final_rpm != 0 || !not_seen_spinning {
+        return None;
+    }
+    let hotspot = final_state.hotspot_c.or(initial.hotspot_c);
+    match hotspot {
+        Some(h) if h >= ctx.idle_band_below_c => (initial.rpm == Some(0)).then(|| {
+            (
+                "rpm_reads_zero".into(),
+                format!(
+                    "The curve was applied but the fan read 0 RPM before and after the test, \
+                     with the GPU hotspot at {h:.0} \u{00b0}C. Some RDNA4 cards report 0 RPM \
+                     while the fan spins (drm/amd #5514): look at the fan, or re-test under load."
+                ),
+            )
+        }),
+        _ => {
+            let at = hotspot
+                .map(|h| format!("at {h:.0} \u{00b0}C"))
+                .unwrap_or_else(|| "unreadable".into());
+            Some((
+                "idle_fan_stop".into(),
+                format!(
+                    "The curve was applied but the fan read 0 RPM after the test with the GPU \
+                     hotspot {at}. RDNA4 firmware can keep the fan stopped at idle even with \
+                     zero-RPM off \
+                     (drm/amd #5905). Inconclusive: re-test with the GPU under load."
+                ),
+            ))
         }
     }
 }
@@ -622,6 +673,7 @@ fn pmfw_verify_sequence(
         rpm: read_rpm(hwmon_path),
         pwm_enable: None,
         zero_rpm_enabled: zero_rpm_path.and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
+        hotspot_c: crate::hwmon::gpu_fan::read_junction_temp_c(hwmon_path),
     };
 
     let test_speed = select_gpu_test_speed(
@@ -656,6 +708,7 @@ fn pmfw_verify_sequence(
                 rpm: read_rpm(hwmon_path),
                 pwm_enable: None,
                 zero_rpm_enabled: None,
+                hotspot_c: crate::hwmon::gpu_fan::read_junction_temp_c(hwmon_path),
             },
             test_speed,
             restore_failed,
@@ -694,7 +747,9 @@ fn pmfw_verify_sequence(
         rpm: read_rpm(hwmon_path),
         pwm_enable: None,
         zero_rpm_enabled: zero_rpm_path.and_then(crate::hwmon::gpu_fan::read_zero_rpm_enabled),
+        hotspot_c: crate::hwmon::gpu_fan::read_junction_temp_c(hwmon_path),
     };
+    let zero_rpm_stop_c = crate::hwmon::gpu_fan::read_zero_rpm_stop_temp(fan_curve_path);
 
     renew();
 
@@ -709,6 +764,7 @@ fn pmfw_verify_sequence(
         final_state,
         test_speed,
         restore_failed,
+        zero_rpm_stop_c,
     }
 }
 
@@ -763,6 +819,7 @@ fn legacy_verify_sequence(
         rpm: read_rpm(hwmon_path),
         pwm_enable: read_enable(hwmon_path),
         zero_rpm_enabled: None,
+        hotspot_c: None,
     };
 
     let test_speed = select_gpu_test_speed(initial_state.applied_speed_pct, 0, 100);
@@ -802,6 +859,7 @@ fn legacy_verify_sequence(
                 rpm: read_rpm(hwmon_path),
                 pwm_enable: read_enable(hwmon_path),
                 zero_rpm_enabled: None,
+                hotspot_c: None,
             },
             test_speed,
             restore_failed,
@@ -838,6 +896,7 @@ fn legacy_verify_sequence(
         rpm: read_rpm(hwmon_path),
         pwm_enable: read_enable(hwmon_path),
         zero_rpm_enabled: None,
+        hotspot_c: None,
     };
 
     renew();
@@ -856,6 +915,7 @@ fn legacy_verify_sequence(
         final_state,
         test_speed,
         restore_failed,
+        zero_rpm_stop_c: None,
     }
 }
 
@@ -906,15 +966,49 @@ fn note_legacy_restored(
     }
 }
 
+/// What the classifier knows about the card beyond its two states (GPD-b).
+///
+/// Built only by [`GpuVerifyContext::for_card`], from the card's PCI device id
+/// and the stop temperature the sequence read, so a caller cannot classify an
+/// RDNA4 card without the RDNA4 rules.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GpuVerifyContext {
+    /// RDNA4: in curve mode the firmware stops the fan below its zero-RPM stop
+    /// temperature whatever `fan_zero_rpm_enable` says (drm/amd #5905), and some
+    /// cards' `fan1_input` reads 0 while the fan spins (#5514).
+    rdna4: bool,
+    /// Hotspot (°C) below which a stopped RDNA4 fan may be the firmware's idle
+    /// stop: the card's stop temperature (or the default) plus the margin.
+    idle_band_below_c: f64,
+}
+
+impl GpuVerifyContext {
+    fn for_card(pci_device_id: u16, zero_rpm_stop_c: Option<i32>) -> Self {
+        let stop = zero_rpm_stop_c.unwrap_or(constants::GPU_RDNA4_DEFAULT_ZERO_RPM_STOP_C);
+        Self {
+            rdna4: crate::hwmon::gpu_detect::is_rdna4(pci_device_id),
+            idle_band_below_c: f64::from(stop + constants::GPU_RDNA4_IDLE_BAND_MARGIN_C),
+        }
+    }
+}
+
 /// Classify the GPU fan verify outcome from the before/after state and the
 /// (OD_RANGE-clamped) requested test speed. Avoids the documented false-failure
 /// traps: OD_RANGE clamping is absorbed by the caller, zero-RPM idle is reported
 /// as normal (not a fault), and a silent-ignore is distinguished from a real
 /// no-effect by the read-back speed match.
+///
+/// GPD-b: on RDNA4 with zero-RPM not reported on, a fan still at 0 RPM is
+/// `idle_fan_stop` when it was not seen spinning before (0 or no reading) and
+/// the hotspot is below the idle band (or unreadable), and `rpm_reads_zero` when
+/// it read 0 before and after with the hotspot at or above the band. Both are
+/// inconclusive, never a pass. A fan that read non-zero after the test, or was
+/// seen spinning before it, stays `no_rpm_effect`.
 fn classify_gpu_verify_result(
     initial: &GpuVerifyState,
     final_state: &GpuVerifyState,
     test_speed: u8,
+    ctx: &GpuVerifyContext,
 ) -> (String, String) {
     // Legacy path: pwm1_enable left manual (1) during the test. `BRD-o`: what
     // reads back here is the card's own driver/SMU state, never motherboard
@@ -995,6 +1089,10 @@ fn classify_gpu_verify_result(
                      behaviour — the fan will spin up under load."
                         .into(),
                 )
+            } else if let Some(verdict) =
+                rdna4_zero_rpm_verdict(initial, final_state, final_rpm, ctx)
+            {
+                verdict
             } else {
                 (
                     "no_rpm_effect".into(),
@@ -1886,6 +1984,7 @@ mod tests {
             rpm,
             pwm_enable,
             zero_rpm_enabled: zero_rpm,
+            hotspot_c: None,
         }
     }
 
@@ -1913,7 +2012,7 @@ mod tests {
     fn classify_effective_via_rpm_rise_from_idle() {
         let init = st(None, Some(0), None, Some(false));
         let fin = st(Some(75), Some(1600), None, Some(false));
-        let (r, _) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, _) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "effective");
     }
 
@@ -1923,7 +2022,7 @@ mod tests {
         // the fan is demonstrably spinning and the curve applied.
         let init = st(Some(80), Some(1500), None, Some(false));
         let fin = st(Some(100), Some(1550), None, Some(false));
-        let (r, _) = classify_gpu_verify_result(&init, &fin, 100);
+        let (r, _) = classify_gpu_verify_result(&init, &fin, 100, &NOT_RDNA4);
         assert_eq!(r, "effective");
     }
 
@@ -1932,7 +2031,7 @@ mod tests {
         // Write silently ignored — old curve persists.
         let init = st(None, Some(0), None, Some(true));
         let fin = st(Some(30), Some(0), None, Some(true));
-        let (r, d) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, d) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "curve_not_applied");
         assert!(d.contains("ppfeaturemask"));
     }
@@ -1941,7 +2040,7 @@ mod tests {
     fn classify_curve_not_applied_when_unreadable() {
         let init = st(None, Some(0), None, Some(false));
         let fin = st(None, Some(0), None, Some(false));
-        let (r, _) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, _) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "curve_not_applied");
     }
 
@@ -1950,7 +2049,7 @@ mod tests {
         // Curve applied, zero-RPM disabled, fan still stopped → genuine no-effect.
         let init = st(None, Some(0), None, Some(false));
         let fin = st(Some(75), Some(0), None, Some(false));
-        let (r, d) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, d) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "no_rpm_effect");
         assert!(d.contains("no hardware effect"));
     }
@@ -1960,7 +2059,7 @@ mod tests {
         // Curve applied but zero-RPM still on (idle) → normal, not a fault.
         let init = st(None, Some(0), None, Some(true));
         let fin = st(Some(75), Some(0), None, Some(true));
-        let (r, _) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, _) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "zero_rpm_suppressed");
     }
 
@@ -1968,7 +2067,7 @@ mod tests {
     fn classify_rpm_unavailable_when_no_tach() {
         let init = st(None, None, None, Some(false));
         let fin = st(Some(75), None, None, Some(false));
-        let (r, _) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, _) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "rpm_unavailable");
     }
 
@@ -1978,7 +2077,7 @@ mod tests {
         // text names the value read and blames no motherboard firmware.
         let init = st(Some(30), Some(800), Some(1), None);
         let fin = st(Some(75), Some(820), Some(2), None);
-        let (r, d) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, d) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "pwm_enable_reverted");
         assert!(d.contains("to 2 (automatic)"), "{d}");
         assert!(d.contains("another GPU fan tool"), "{d}");
@@ -1986,10 +2085,198 @@ mod tests {
 
         // Opposite arm: 0 is full speed, and must not be called automatic.
         let fin = st(Some(75), Some(820), Some(0), None);
-        let (r, d) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, d) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "pwm_enable_reverted");
         assert!(d.contains("to 0 (no fan control: full speed)"), "{d}");
         assert!(!d.contains("automatic) during"), "{d}");
+    }
+
+    /// A card that is not RDNA4: the GPD-b arms never apply.
+    const NOT_RDNA4: GpuVerifyContext = GpuVerifyContext {
+        rdna4: false,
+        idle_band_below_c: 60.0,
+    };
+
+    fn hot(mut state: GpuVerifyState, hotspot: Option<f64>) -> GpuVerifyState {
+        state.hotspot_c = hotspot;
+        state
+    }
+
+    /// GPD-b, one fixture per verdict on an RX 9070 XT (0x7550) with no stop
+    /// temperature file (default band): an idle stopped fan is `idle_fan_stop`,
+    /// unreadable hotspot too; a fan at 0 before and after above the band is
+    /// `rpm_reads_zero`; a fan that read non-zero and did not rise stays
+    /// `no_rpm_effect`.
+    #[test]
+    fn classify_rdna4_zero_rpm_verdicts() {
+        let ctx = GpuVerifyContext::for_card(0x7550, None);
+        let band = ctx.idle_band_below_c;
+        assert!(ctx.rdna4);
+        let below = band - 15.0;
+        let above = band + 5.0;
+        let init = |h| hot(st(None, Some(0), None, Some(false)), h);
+        let fin = |h| hot(st(Some(75), Some(0), None, Some(false)), h);
+
+        let (r, d) = classify_gpu_verify_result(&init(Some(below)), &fin(Some(below)), 75, &ctx);
+        assert_eq!(r, "idle_fan_stop", "{d}");
+        assert!(
+            d.contains(&format!("{below:.0}")),
+            "names the measured hotspot: {d}"
+        );
+
+        let (r, _) = classify_gpu_verify_result(&init(None), &fin(None), 75, &ctx);
+        assert_eq!(r, "idle_fan_stop", "unreadable hotspot counts as idle");
+
+        let (r, d) = classify_gpu_verify_result(&init(Some(above)), &fin(Some(above)), 75, &ctx);
+        assert_eq!(r, "rpm_reads_zero", "{d}");
+
+        // Exactly at the band is not below it.
+        let (r, _) = classify_gpu_verify_result(&init(Some(band)), &fin(Some(band)), 75, &ctx);
+        assert_eq!(r, "rpm_reads_zero");
+
+        // Non-zero and not rising: a real no-effect, at any hotspot.
+        let spun = hot(st(None, Some(900), None, Some(false)), Some(below));
+        let still = hot(st(Some(75), Some(910), None, Some(false)), Some(below));
+        let (r, _) = classify_gpu_verify_result(&spun, &still, 75, &ctx);
+        assert_eq!(r, "no_rpm_effect");
+
+        // Spinning before, 0 after: not an idle stop and not the stuck-tach
+        // shape, below the band, above it or with no hotspot.
+        for h in [Some(below), Some(above), None] {
+            let spun = hot(st(None, Some(900), None, Some(false)), h);
+            let (r, _) = classify_gpu_verify_result(&spun, &fin(h), 75, &ctx);
+            assert_eq!(r, "no_rpm_effect", "hotspot {h:?}");
+        }
+
+        // No RPM reading before the test, 0 after, cool: idle stop.
+        let unread = hot(st(None, None, None, Some(false)), Some(below));
+        let (r, _) = classify_gpu_verify_result(&unread, &fin(Some(below)), 75, &ctx);
+        assert_eq!(r, "idle_fan_stop");
+    }
+
+    /// GPD-b: `hotspot_c` is omitted from the wire when unread and written as a
+    /// number when read, so an older GUI sees no new key from a legacy card.
+    #[test]
+    fn hotspot_c_is_omitted_when_unread_and_a_number_when_read() {
+        let unread = serde_json::to_value(st(Some(75), Some(0), None, Some(false))).unwrap();
+        assert!(unread.get("hotspot_c").is_none(), "{unread}");
+        let read = serde_json::to_value(hot(st(Some(75), Some(0), None, Some(false)), Some(44.5)))
+            .unwrap();
+        assert_eq!(read["hotspot_c"], serde_json::json!(44.5));
+    }
+
+    /// GPD-b opposite branches: the same idle stop on a non-RDNA4 card (RDNA3
+    /// RX 7900 XTX) stays `no_rpm_effect`, and an RDNA4 card reporting zero-RPM
+    /// on stays `zero_rpm_suppressed` — the new arms sit after that one.
+    #[test]
+    fn classify_rdna4_arms_need_rdna4_and_zero_rpm_not_on() {
+        let init = hot(st(None, Some(0), None, Some(false)), Some(35.0));
+        let fin = hot(st(Some(75), Some(0), None, Some(false)), Some(35.0));
+        let rdna3 = GpuVerifyContext::for_card(0x744C, None);
+        assert!(!rdna3.rdna4);
+        let (r, _) = classify_gpu_verify_result(&init, &fin, 75, &rdna3);
+        assert_eq!(r, "no_rpm_effect");
+
+        let rdna4 = GpuVerifyContext::for_card(0x7590, None);
+        let init_on = hot(st(None, Some(0), None, Some(true)), Some(35.0));
+        let fin_on = hot(st(Some(75), Some(0), None, Some(true)), Some(35.0));
+        let (r, _) = classify_gpu_verify_result(&init_on, &fin_on, 75, &rdna4);
+        assert_eq!(r, "zero_rpm_suppressed");
+    }
+
+    /// GPD-b: the card's own stop temperature moves the band; without one the
+    /// default applies.
+    #[test]
+    fn rdna4_idle_band_follows_the_cards_stop_temperature() {
+        let default = GpuVerifyContext::for_card(0x7551, None);
+        assert_eq!(
+            default.idle_band_below_c,
+            f64::from(
+                constants::GPU_RDNA4_DEFAULT_ZERO_RPM_STOP_C
+                    + constants::GPU_RDNA4_IDLE_BAND_MARGIN_C
+            )
+        );
+        let card = GpuVerifyContext::for_card(0x7551, Some(70));
+        assert_eq!(
+            card.idle_band_below_c,
+            f64::from(70 + constants::GPU_RDNA4_IDLE_BAND_MARGIN_C)
+        );
+    }
+
+    /// GPD-b wiring: the PMFW sequence reads the hotspot (`junction`) into both
+    /// states and the card's stop temperature from the `fan_curve` sibling, and
+    /// what it returns, classified as the handler does, gives the verdict. The
+    /// stop-temperature file is what moves the same 44 °C reading from "idle"
+    /// to "reads zero".
+    #[test]
+    fn pmfw_sequence_feeds_hotspot_and_stop_temperature_to_the_classifier() {
+        fn flat(speed: u8) -> String {
+            let mut c = String::from("OD_FAN_CURVE:\n");
+            for i in 0..5 {
+                c.push_str(&format!("{i}: {}C {speed}%\n", 40 + 10 * i));
+            }
+            c.push_str(
+                "OD_RANGE:\nFAN_CURVE(hotspot temp): 25C 100C\nFAN_CURVE(fan speed): 15% 100%\n",
+            );
+            c
+        }
+        let run = |stop_file: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            let fan_ctrl = dir.path().join("gpu_od/fan_ctrl");
+            std::fs::create_dir_all(&fan_ctrl).unwrap();
+            let curve = fan_ctrl.join("fan_curve");
+            std::fs::write(&curve, flat(30)).unwrap();
+            if let Some(stop) = stop_file {
+                std::fs::write(fan_ctrl.join("fan_zero_rpm_stop_temperature"), stop).unwrap();
+            }
+            let hwmon = dir.path().join("hwmon3");
+            std::fs::create_dir_all(&hwmon).unwrap();
+            std::fs::write(hwmon.join("fan1_input"), "0\n").unwrap();
+            std::fs::write(hwmon.join("temp2_label"), "junction\n").unwrap();
+            std::fs::write(hwmon.join("temp2_input"), "44000\n").unwrap();
+            let cache = crate::health::cache::StateCache::new();
+            let seq = pmfw_verify_sequence(
+                &curve,
+                None,
+                &hwmon,
+                None,
+                &cache,
+                "amd_gpu:0000:03:00.0",
+                |speed| {
+                    std::fs::write(&curve, flat(speed)).unwrap();
+                    Ok(())
+                },
+                || {},
+                || {},
+            );
+            let GpuVerifySequence::Completed {
+                initial,
+                final_state,
+                test_speed,
+                zero_rpm_stop_c,
+                ..
+            } = seq
+            else {
+                panic!("the sequence must complete");
+            };
+            assert_eq!(initial.hotspot_c, Some(44.0));
+            assert_eq!(final_state.hotspot_c, Some(44.0));
+            let ctx = GpuVerifyContext::for_card(0x7550, zero_rpm_stop_c);
+            classify_gpu_verify_result(&initial, &final_state, test_speed, &ctx).0
+        };
+
+        assert_eq!(
+            run(None),
+            "idle_fan_stop",
+            "44 °C is below the default band"
+        );
+        let low_stop =
+            "FAN_ZERO_RPM_STOP_TEMPERATURE:\n30\nOD_RANGE:\nZERO_RPM_STOP_TEMPERATURE: 30 110\n";
+        assert_eq!(
+            run(Some(low_stop)),
+            "rpm_reads_zero",
+            "a 30 °C stop puts 44 °C above the band"
+        );
     }
 
     #[test]
@@ -1997,7 +2284,7 @@ mod tests {
         // raw↔percent rounding within tolerance still counts as applied.
         let init = st(None, Some(0), None, Some(false));
         let fin = st(Some(73), Some(1400), None, Some(false));
-        let (r, _) = classify_gpu_verify_result(&init, &fin, 75);
+        let (r, _) = classify_gpu_verify_result(&init, &fin, 75, &NOT_RDNA4);
         assert_eq!(r, "effective");
     }
 }

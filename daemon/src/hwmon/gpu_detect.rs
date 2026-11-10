@@ -172,6 +172,17 @@ impl AmdGpuInfo {
     }
 }
 
+/// RDNA4 (GC 12.0.x) by PCI device ID: RX 9070 XT / 9070 / 9070 GRE (0x7550);
+/// Radeon AI PRO R9700 / R9700S / R9600D (0x7551); RX 9060 XT / 9060 XT LP /
+/// 9060 (0x7590). The one RDNA4 list: [`is_rdna3_or_rdna4`] is built on it.
+/// Used by the GPU fan verify (GPD-b): RDNA4 firmware stops the fan below its
+/// zero-RPM stop temperature in curve mode whatever `fan_zero_rpm_enable` says
+/// (drm/amd #5905), and some cards' `fan1_input` reads 0 while the fan spins
+/// (#5514).
+pub fn is_rdna4(device_id: u16) -> bool {
+    matches!(device_id, 0x7550 | 0x7551 | 0x7590)
+}
+
 /// Whether a PCI device ID is an RDNA3 or RDNA4 GPU (for kernel-regression warnings).
 ///
 /// Used by `kernel_warnings::detect_kernel_warnings`, whose drm/amd #4765 rule
@@ -197,20 +208,18 @@ impl AmdGpuInfo {
 /// Product names only, from the table: it does not name dies, so neither does
 /// this.
 pub fn is_rdna3_or_rdna4(device_id: u16) -> bool {
-    matches!(
-        device_id,
-        // RDNA4 (GC 12.0.x): RX 9070 XT / 9070 / 9070 GRE (0x7550); Radeon AI PRO
-        // R9700 / R9600D (0x7551); RX 9060 XT / 9060 XT LP / 9060 (0x7590)
-        0x7550 | 0x7551 | 0x7590
-        // RDNA3 discrete (GC 11.0.x): Pro W7900 (0x7448); Pro W7800 48GB (0x7449);
-        // Pro W7900 Dual Slot (0x744A); Pro W7900D (0x744B); RX 7900 XTX / XT /
-        // GRE / 7900M (0x744C); Pro W7800 (0x745E); Pro V710 (0x7460, 0x7461
-        // MxGPU); Pro W7700 (0x7470); RX 7800 XT / 7700 XT / 7700 / 7800M
-        // (0x747E); RX 7600 XT / 7600 / 7650 GRE / 7700S / 7600S / 7600M XT,
-        // Pro W7600 (0x7480); Steam Machine (0x7481, Valve's semi-custom RDNA3);
-        // RX 7600M (0x7483); Pro W7500 (0x7489); RX 7400 / 7300, Pro W7400
-        // (0x7499)
-        | 0x7448 | 0x7449 | 0x744A | 0x744B | 0x744C | 0x745E | 0x7460 | 0x7461
+    is_rdna4(device_id)
+        || matches!(
+            device_id,
+            // RDNA3 discrete (GC 11.0.x): Pro W7900 (0x7448); Pro W7800 48GB (0x7449);
+            // Pro W7900 Dual Slot (0x744A); Pro W7900D (0x744B); RX 7900 XTX / XT /
+            // GRE / 7900M (0x744C); Pro W7800 (0x745E); Pro V710 (0x7460, 0x7461
+            // MxGPU); Pro W7700 (0x7470); RX 7800 XT / 7700 XT / 7700 / 7800M
+            // (0x747E); RX 7600 XT / 7600 / 7650 GRE / 7700S / 7600S / 7600M XT,
+            // Pro W7600 (0x7480); Steam Machine (0x7481, Valve's semi-custom RDNA3);
+            // RX 7600M (0x7483); Pro W7500 (0x7489); RX 7400 / 7300, Pro W7400
+            // (0x7499)
+            0x7448 | 0x7449 | 0x744A | 0x744B | 0x744C | 0x745E | 0x7460 | 0x7461
         | 0x7470 | 0x747E | 0x7480 | 0x7481 | 0x7483 | 0x7489 | 0x7499
         // RDNA3 iGPUs (GC 11.0.x): Radeon 780M / 760M / 740M (0x15BF, 0x1900),
         // 740M (0x15C8, 0x1901)
@@ -218,7 +227,7 @@ pub fn is_rdna3_or_rdna4(device_id: u16) -> bool {
         // RDNA3.5 iGPUs (GC 11.5.x): Radeon 890M / 880M (0x150E), 860M / 840M
         // (0x1114), 8060S / 8050S / 8040S (0x1586), 840M / 820M (0x1902)
         | 0x150E | 0x1114 | 0x1586 | 0x1902
-    )
+        )
 }
 
 /// Discover all AMD GPUs by scanning hwmon devices.
@@ -914,6 +923,18 @@ mod tests {
         // iGPUs Radeon 610M (0x164E) and 680M / 660M (0x1681).
         for id in [0x73BF_u16, 0x73DF, 0x73FF, 0x164E, 0x1681] {
             assert!(!is_rdna3_or_rdna4(id), "{id:#06x} is not RDNA3/4");
+        }
+    }
+
+    /// GPD-b: RDNA4 alone, and every RDNA4 id still counts as RDNA3/4.
+    #[test]
+    fn is_rdna4_names_the_rdna4_cards_only() {
+        for id in [0x7550_u16, 0x7551, 0x7590] {
+            assert!(is_rdna4(id), "{id:#06x} is RDNA4");
+            assert!(is_rdna3_or_rdna4(id), "{id:#06x} is RDNA3/4");
+        }
+        for id in [0x744C_u16, 0x747E, 0x15BF, 0x73BF] {
+            assert!(!is_rdna4(id), "{id:#06x} is not RDNA4");
         }
     }
 

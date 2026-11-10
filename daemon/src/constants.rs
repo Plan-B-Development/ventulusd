@@ -149,6 +149,17 @@ pub const GPU_PMFW_NUM_CURVE_POINTS: u8 = 5;
 /// the same fan at the same speed.
 pub const GPU_FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// GPU fan verify (GPD-b): the zero-RPM stop temperature (°C) assumed for an
+/// RDNA4 card whose kernel has no `fan_zero_rpm_stop_temperature` file. The
+/// value drm/amd #5905 measured the firmware stopping the fan below.
+pub const GPU_RDNA4_DEFAULT_ZERO_RPM_STOP_C: i32 = 50;
+
+/// GPU fan verify (GPD-b): how far above the zero-RPM stop temperature an RDNA4
+/// fan can still be held stopped by the firmware. #5905 saw it spin up at about
+/// 54–58 °C over a 50 °C stop, so a 10 °C margin covers that with room to spare.
+/// Below `stop + margin` hotspot, a stopped fan is reported as idle, not broken.
+pub const GPU_RDNA4_IDLE_BAND_MARGIN_C: i32 = 10;
+
 /// Settle window (seconds) shared by **both** verify endpoints —
 /// `POST /hwmon/{header_id}/verify` and `POST /gpu/{gpu_id}/fan/verify` —
 /// between driving a test value and reading the hardware back. This is the

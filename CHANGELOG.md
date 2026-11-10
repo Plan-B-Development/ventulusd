@@ -7,6 +7,16 @@ rename. Version numbers carry on from Control-OFC.
 
 ### Fixed
 
+- **The GPU fan test no longer calls an idle RX 9000 fan broken.** On RDNA4 cards the firmware
+  can keep the fan stopped while the GPU is cool, even with zero-RPM idle off, and some cards
+  report 0 RPM while the fan spins. The test reported both as "the fan did not respond". It now
+  reads the GPU hotspot during the test, and the card's zero-RPM stop temperature where the kernel
+  exposes it, and on an RDNA4 card with zero-RPM not reported on it answers `idle_fan_stop` (the fan
+  read 0 RPM after the test, was not seen spinning before it, and the GPU was cool or its hotspot
+  could not be read) or `rpm_reads_zero` (0 RPM before and after with the GPU warm). Both are
+  inconclusive, not failures. On the PMFW path each test state carries the new `hotspot_c` field
+  when the hotspot reads. Other cards, a fan that read above 0 RPM after the test, and one that was
+  spinning before it are unchanged.
 - **A GPU's own fan control is never treated as a motherboard fan header.** The daemon kept AMD
   (`amdgpu`) and open NVIDIA (`nouveau`) GPU fans out of its motherboard header list, but not the
   legacy AMD `radeon` driver, which gives older cards (Radeon HD 7000 to R9 300 series running
