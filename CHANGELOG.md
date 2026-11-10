@@ -5,6 +5,11 @@ rename. Version numbers carry on from Control-OFC.
 
 ## [Unreleased]
 
+## [5.6.0] — 2026-11-10
+
+Pairs with `ventulus` >= v2.23.0; ventulus 6.1.0 is the matching GUI release, and shows this
+release's RX 9000 idle fan-test verdicts as warnings with the GPU hotspot.
+
 ### Fixed
 
 - **The GPU fan test no longer calls an idle RX 9000 fan broken.** On RDNA4 cards the firmware
