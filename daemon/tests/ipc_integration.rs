@@ -10408,6 +10408,17 @@ async fn the_firmware_upload_has_its_own_slot() {
 /// included, takes the same path) waited 876 ms and then did not run within
 /// five minutes. Now request work holds at most
 /// `REQUEST_BLOCKING_MAX_OUTSTANDING` threads.
+///
+/// A hwmon write that has not returned holds the controller's lock, so each
+/// request's scan waits up to `HWMON_CONTROLLER_WAIT` on it while holding its
+/// permit. That fills the cap on any host. Left to the scan's own speed it did
+/// not: in the Arch clean-room build the scan finished fast enough that at most
+/// 20 permits were ever held at once, and the "filled the cap" precondition
+/// failed although the probe never waited. The lock is let go as soon as a
+/// probe has run beside the full cap: the permits are process-wide, and other
+/// tests in this binary run at the same time on routes that take them. With
+/// the cap gone the permits never run out, the lock is held for the whole
+/// window, and the uncapped scans block the pool under the probe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_flood_cannot_delay_the_engines_blocking_work() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -10415,15 +10426,50 @@ async fn a_request_flood_cannot_delay_the_engines_blocking_work() {
 
     /// The engine joins each write for at most this long (`WRITE_JOIN_BUDGET`).
     const ENGINE_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+    /// The flood stops here. Each request's work waits on the held lock, so this
+    /// many fill the cap many times over, and without the cap they still
+    /// outnumber the test runtime's 512 blocking threads, so the probe queues.
+    /// Unbounded, a failing run left about 250 000 abandoned scans for the
+    /// runtime to drain after the assertion, and hung for over an hour.
+    const FLOOD_REQUESTS: usize = 32 * ventulusd::constants::REQUEST_BLOCKING_MAX_OUTSTANDING;
+    /// tokio's default `max_blocking_threads`, which `#[tokio::test]` keeps.
+    /// Without the cap the flood must outnumber these, or the probe finds a
+    /// free thread and the test cannot show the defect.
+    const TEST_RUNTIME_BLOCKING_THREADS: usize = 512;
+    /// Each scan waits this long on the held lock. Without the cap, a probe
+    /// queued behind such scans must wait past the engine's budget.
+    const SCAN_WAIT: std::time::Duration = ventulusd::constants::HWMON_CONTROLLER_WAIT;
+    assert!(
+        SCAN_WAIT > ENGINE_WRITE_BUDGET,
+        "a scan waits {SCAN_WAIT:?} on the lock, not past the {ENGINE_WRITE_BUDGET:?} budget"
+    );
 
-    let (sock, _tx, _d) = start_test_server(test_app_state()).await;
+    let state = test_app_state_with_hwmon();
+    let controller = state
+        .hwmon_controller
+        .as_ref()
+        .unwrap()
+        .controller()
+        .clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    // Self-releasing: a failed assertion below skips the release.
+    let holder = std::thread::spawn(move || {
+        let _guard = controller.lock();
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(30));
+    });
+    locked_rx.recv().unwrap();
+
+    let (sock, _tx, _d) = start_test_server(state).await;
     let stop = Arc::new(AtomicBool::new(false));
     let sent = Arc::new(AtomicUsize::new(0));
     let floods: Vec<_> = (0..16)
         .map(|_| {
             let (sock, stop, sent) = (sock.clone(), stop.clone(), sent.clone());
             tokio::spawn(async move {
-                while !stop.load(Ordering::Relaxed) {
+                while !stop.load(Ordering::Relaxed) && sent.load(Ordering::Relaxed) < FLOOD_REQUESTS
+                {
                     match UnixStream::connect(&sock).await {
                         Ok(mut s) => {
                             let _ = s
@@ -10445,9 +10491,14 @@ async fn a_request_flood_cannot_delay_the_engines_blocking_work() {
 
     let mut worst = std::time::Duration::ZERO;
     let mut fewest_free = usize::MAX;
-    let until = Instant::now() + std::time::Duration::from_secs(2);
+    let mut probed_beside_a_full_cap = false;
+    // The permits holders took stay held until their scan's wait ends, at least
+    // this long after the flood began, so a probe started in it after the cap
+    // is seen full runs beside the full cap.
+    let until = Instant::now() + SCAN_WAIT;
     while Instant::now() < until {
-        fewest_free = fewest_free.min(ventulusd::api::blocking::request_permits_available());
+        let free = ventulusd::api::blocking::request_permits_available();
+        fewest_free = fewest_free.min(free);
         let started = Instant::now();
         let ran =
             tokio::time::timeout(2 * ENGINE_WRITE_BUDGET, tokio::task::spawn_blocking(|| ())).await;
@@ -10455,7 +10506,19 @@ async fn a_request_flood_cannot_delay_the_engines_blocking_work() {
         if ran.is_err() {
             break;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        if free == 0 {
+            probed_beside_a_full_cap = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Let go first: the rest of the flood then runs fast scans, holding each
+    // permit only briefly, and ends at `FLOOD_REQUESTS`.
+    let _ = release_tx.send(());
+    holder.join().unwrap();
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    while sent.load(Ordering::Relaxed) < FLOOD_REQUESTS && Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     stop.store(true, Ordering::Relaxed);
     for flood in floods {
@@ -10463,20 +10526,26 @@ async fn a_request_flood_cannot_delay_the_engines_blocking_work() {
     }
 
     let sent = sent.load(Ordering::Relaxed);
-    eprintln!("request flood: {sent} abandoned requests, worst wait outside the API {worst:?}");
+    eprintln!(
+        "request flood: {sent} abandoned requests, fewest permits free {fewest_free}, \
+         worst wait outside the API {worst:?}"
+    );
+    // Checked before the safety assertion, and satisfiable with or without the
+    // cap: a flood too small to block the uncapped pool could not show the defect.
     assert!(
-        sent > 4 * ventulusd::constants::REQUEST_BLOCKING_MAX_OUTSTANDING,
-        "precondition: the flood outran the cap ({sent} requests)"
+        sent > TEST_RUNTIME_BLOCKING_THREADS,
+        "precondition: the flood outnumbered the test runtime's blocking threads \
+         ({sent} requests)"
     );
     assert!(
         worst < ENGINE_WRITE_BUDGET,
         "blocking work outside the API waited {worst:?} behind {sent} abandoned requests"
     );
-    // The flood really reached the pool: request work held every permit at
-    // some point, so the probe ran beside a full cap, not an idle one.
-    assert_eq!(
-        fewest_free, 0,
-        "precondition: the flood never filled the request cap"
+    // The flood really reached the pool: request work held every permit when
+    // the last probe ran, so it ran beside a full cap, not an idle one.
+    assert!(
+        probed_beside_a_full_cap,
+        "precondition: the flood never filled the request cap (fewest free {fewest_free})"
     );
 }
 
