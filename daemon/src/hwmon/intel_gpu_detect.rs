@@ -25,11 +25,16 @@
 //! ## Read-only by design
 //!
 //! Intel discrete GPU fan control is handled autonomously by on-card firmware
-//! (the `fan_control_*.bin` blob in linux-firmware). The kernel exposes
-//! `fanN_input` (RPM) as read-only — there is **no `pwm` attribute and no fan
-//! write callback** anywhere in either driver. This detector therefore models
-//! only what can be read; there is no `fan_curve_path`, `pwm`, `pwm_enable`,
-//! overdrive, or shutdown-reset machinery (contrast `gpu_detect.rs` for AMD).
+//! (the `fan_control_*.bin` blob in linux-firmware). On a stock kernel the
+//! hwmon node exposes `fanN_input` (RPM) read-only, with **no `pwm` attribute
+//! and no fan write callback** in either driver. Intel's fan-control series
+//! (patchwork 168027, unmerged as of 2026-11) adds writable `pwm1..3` on `xe`;
+//! the daemon still does not drive them. Those chips are GPU-owned
+//! (`hwmon::is_gpu_owned_hwmon`, DEC-508), so PWM discovery never binds them,
+//! and this detector records only whether the interface exists
+//! (`pwm_exposed`) so the diagnostics note can say it is unused. There is no
+//! `fan_curve_path`, `pwm`, `pwm_enable`, overdrive, or shutdown-reset
+//! machinery (contrast `gpu_detect.rs` for AMD).
 
 use std::path::{Path, PathBuf};
 
@@ -65,6 +70,10 @@ pub struct IntelGpuInfo {
     pub is_discrete: bool,
     /// Whether fan RPM reading is available (`fan1_input` exists).
     pub has_fan_rpm: bool,
+    /// Whether the kernel exposes a fan-control interface (`pwm1` exists, as
+    /// on a kernel carrying Intel's fan-control series). The daemon never
+    /// drives it (DEC-508); this only changes the diagnostics wording.
+    pub pwm_exposed: bool,
 }
 
 impl IntelGpuInfo {
@@ -165,6 +174,15 @@ fn detect_single_gpu(hwmon_dir: &Path) -> Option<IntelGpuInfo> {
     // GPU" (DEC-044) and the read-only contract.
     let has_fan_rpm = hwmon_dir.join("fan1_input").exists();
 
+    let pwm_exposed = hwmon_dir.join("pwm1").exists();
+    if pwm_exposed {
+        // Once per detection, which runs at startup.
+        log::info!(
+            "Intel GPU {pci_bdf} ({driver}) exposes a fan-control interface; Ventulus does not \
+             use it and never drives a GPU fan through hwmon (DEC-508)"
+        );
+    }
+
     Some(IntelGpuInfo {
         pci_bdf,
         pci_device_id,
@@ -175,6 +193,7 @@ fn detect_single_gpu(hwmon_dir: &Path) -> Option<IntelGpuInfo> {
         hwmon_path: hwmon_dir.to_path_buf(),
         is_discrete,
         has_fan_rpm,
+        pwm_exposed,
     })
 }
 
@@ -400,6 +419,32 @@ mod tests {
         assert!(gpu.has_fan_rpm);
         assert_eq!(gpu.fan_control_method(), "read_only");
         assert_eq!(gpu.pci_bdf, "0000:03:00.0");
+        assert!(!gpu.pwm_exposed, "a stock-kernel xe node has no pwm1");
+    }
+
+    /// DEC-508: a kernel carrying Intel's fan-control series adds a writable
+    /// `pwm1`. Detection records that it exists; the method stays read-only,
+    /// because the daemon never drives it.
+    #[test]
+    fn detect_patched_xe_with_pwm_records_it_but_stays_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hwmon = create_fake_intel_gpu(
+            tmp.path(),
+            "hwmon3",
+            "xe",
+            "0000:03:00.0",
+            "0xe20b",
+            "0x00",
+            "0x030000",
+            true,
+        );
+        fs::write(hwmon.join("pwm1"), "128\n").unwrap();
+        fs::write(hwmon.join("pwm1_enable"), "2\n").unwrap();
+
+        let gpus = detect_intel_gpus(tmp.path());
+        assert_eq!(gpus.len(), 1);
+        assert!(gpus[0].pwm_exposed);
+        assert_eq!(gpus[0].fan_control_method(), "read_only");
     }
 
     #[test]

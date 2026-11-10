@@ -43,6 +43,8 @@ pub mod types;
 pub mod util;
 pub mod voltages;
 
+use std::path::Path;
+
 use types::{SensorDescriptor, SensorReading};
 
 /// Default sysfs hwmon root.
@@ -116,22 +118,67 @@ pub fn is_wireless_phy_chip(chip_name: &str) -> bool {
         || chip_name.starts_with("iwlmvm")
 }
 
-/// True when an hwmon chip's fans/PWMs are owned by a GPU subsystem rather than
-/// by hwmon, so they must be excluded from hwmon PWM-header discovery
-/// ([`pwm_discovery`]) and monitor-only-fan discovery ([`inventory`]).
+/// True when an hwmon device's fans/PWMs are owned by a GPU subsystem rather
+/// than by hwmon, so they must be excluded from hwmon PWM-header discovery
+/// ([`pwm_discovery`]), monitor-only-fan discovery ([`inventory`]) and the
+/// board-rail voltage table ([`voltages`]) (DEC-508).
+///
+/// `[SAFETY]` A header this lets through is reachable by the profile engine
+/// and by the thermal emergency's 100 % force (`force_all_with_floor` reaches
+/// every discovered writable header, DEC-382). GPU fans are outside the ladder
+/// (DEC-130), so a GPU fan bound here breaks that invariant.
+///
+/// Two add-only legs; either one excludes the device:
+/// - the chip name, see [`is_gpu_owned_chip_name`];
+/// - the parent device's PCI class: a display controller (base class `0x03`,
+///   read from `<hwmon>/device/class`) is GPU-owned whatever its driver is
+///   called, so a GPU driver that registers hwmon on its PCI function but is
+///   missing from the name list is still excluded. Only the immediate parent
+///   is read: a separate hwmon chip on a GPU's I²C bus (its parent an I²C
+///   client) is not caught. An absent or unreadable class (a Super I/O
+///   platform device, a USB AIO, a test fixture) contributes nothing and the
+///   name leg still applies.
+///
+/// The only public form takes the hwmon directory, so a new discovery site
+/// cannot check the name alone and miss the class leg.
+pub fn is_gpu_owned_hwmon(hwmon_dir: &Path, chip_name: &str) -> bool {
+    is_gpu_owned_chip_name(chip_name) || parent_is_pci_display_controller(hwmon_dir)
+}
+
+/// The chip-name leg of [`is_gpu_owned_hwmon`].
 ///
 /// - `amdgpu` — DEC-102: RDNA4 exposes `pwm1` read-only (no `pwm1_enable`), so
 ///   binding it as an hwmon header produces a 1 Hz EACCES storm; RDNA3 exposes
 ///   both at 0644 but a write can silently no-op (DEC-430).
 /// - `nouveau` — DEC-204: the open NVIDIA driver exposes a **writable**
-///   `pwm1`/`pwm1_enable`; leaking it as an hwmon header would let the profile
-///   engine drive a GPU fan, violating the read-only-telemetry contract.
+///   `pwm1`/`pwm1_enable`.
+/// - `radeon` — DEC-508: the legacy AMD driver (SI/CI cards on DPM) registers
+///   a **writable** `pwm1`/`pwm1_enable` on mainline today.
+/// - `xe` — DEC-508: Intel's fan-control series (patchwork 168027, not merged
+///   as of 2026-11) adds writable `pwm1..3`/`pwm1..3_enable`, so a patched
+///   kernel — or mainline once it merges — would otherwise expose an Arc fan
+///   as a motherboard header.
+/// - `i915` — DEC-508: pre-emptive; no write path on mainline. Its fans are
+///   still surfaced as `intel_gpu:` (`intel_gpu_detect` scans by name, not
+///   through this predicate).
 ///
-/// GPU fan RPM is surfaced exclusively via the `amd_gpu:` / `nvidia_gpu:` id
-/// prefixes and the GPU endpoints — never as an hwmon header. Single source of
-/// truth for the exclusion list so the two discovery sites cannot drift.
-pub fn is_gpu_owned_hwmon_chip(chip_name: &str) -> bool {
-    chip_name == "amdgpu" || chip_name == "nouveau"
+/// GPU fan RPM is surfaced via the `amd_gpu:` / `nvidia_gpu:` / `intel_gpu:`
+/// id prefixes and the GPU endpoints — never as an hwmon header.
+fn is_gpu_owned_chip_name(chip_name: &str) -> bool {
+    matches!(chip_name, "amdgpu" | "nouveau" | "radeon" | "xe" | "i915")
+}
+
+/// PCI base class 0x03 = display controller (VGA, XGA, 3D, other).
+const PCI_BASE_CLASS_DISPLAY: u32 = 0x03;
+
+/// True when `<hwmon_dir>/device/class` reads as a PCI display controller.
+fn parent_is_pci_display_controller(hwmon_dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(hwmon_dir.join("device").join("class")) else {
+        return false;
+    };
+    let trimmed = raw.trim();
+    let hex = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+    u32::from_str_radix(hex, 16).is_ok_and(|class| class >> 16 == PCI_BASE_CLASS_DISPLAY)
 }
 
 #[cfg(test)]
@@ -478,19 +525,63 @@ mod tests {
         assert!(!is_wireless_phy_chip("z53")); // NZXT Kraken coolant
     }
 
+    /// [SAFETY] DEC-508: the name leg. Every GPU driver known to register an
+    /// hwmon `pwm` (or due to) is GPU-owned; board and CPU chips are not.
     #[test]
-    fn is_gpu_owned_hwmon_chip_recognises_gpu_chips() {
-        // Single source of truth for the PWM-header + monitor-only-fan exclusion.
-        assert!(is_gpu_owned_hwmon_chip("amdgpu")); // DEC-102 (read-only pwm1, EACCES storm)
-        assert!(is_gpu_owned_hwmon_chip("nouveau")); // DEC-204 (writable pwm1 — must not be driven)
-                                                     // Motherboard / CPU chips are hwmon-owned. Intel Arc (`xe`/`i915`) exposes
-                                                     // NO pwm attribute at all, so it needs no exclusion here — its temps flow
-                                                     // through the sensor pipeline and it has no fan header to leak.
-        assert!(!is_gpu_owned_hwmon_chip("k10temp"));
-        assert!(!is_gpu_owned_hwmon_chip("nct6798"));
-        assert!(!is_gpu_owned_hwmon_chip("it8696"));
-        assert!(!is_gpu_owned_hwmon_chip("xe"));
-        assert!(!is_gpu_owned_hwmon_chip("i915"));
+    fn gpu_owned_chip_names_cover_every_gpu_driver_and_no_board_chip() {
+        for gpu in ["amdgpu", "nouveau", "radeon", "xe", "i915"] {
+            assert!(is_gpu_owned_chip_name(gpu), "{gpu} must be GPU-owned");
+        }
+        for board in [
+            "k10temp", "nct6798", "it8696", "nct6687", "kraken3", "coretemp",
+        ] {
+            assert!(
+                !is_gpu_owned_chip_name(board),
+                "{board} must stay hwmon-owned"
+            );
+        }
+    }
+
+    /// [SAFETY] DEC-508: the PCI-class leg. A chip whose name is on no list is
+    /// still GPU-owned when its parent is a PCI display controller; a non-display
+    /// PCI parent, a garbled class or no class at all leaves it hwmon-owned.
+    #[test]
+    fn a_pci_display_parent_makes_any_chip_gpu_owned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let with_class = |dir: &str, class: Option<&str>| {
+            let hwmon = tmp.path().join(dir);
+            fs::create_dir_all(hwmon.join("device")).unwrap();
+            if let Some(class) = class {
+                fs::write(hwmon.join("device/class"), class).unwrap();
+            }
+            hwmon
+        };
+
+        for (dir, class) in [
+            ("hwmon0", "0x030000\n"), // VGA
+            ("hwmon1", "0x030200\n"), // 3D controller
+            ("hwmon2", "0x038000\n"), // other display controller
+        ] {
+            let hwmon = with_class(dir, Some(class));
+            assert!(
+                is_gpu_owned_hwmon(&hwmon, "futuregpu"),
+                "class {class:?} must make the device GPU-owned"
+            );
+        }
+        for (dir, class) in [
+            ("hwmon3", Some("0x060000\n")), // host bridge (k10temp's parent)
+            ("hwmon4", Some("0x010802\n")), // NVMe
+            ("hwmon5", Some("not-hex\n")),
+            ("hwmon6", None), // platform device: no class file
+        ] {
+            let hwmon = with_class(dir, class);
+            assert!(
+                !is_gpu_owned_hwmon(&hwmon, "nct6798"),
+                "class {class:?} must leave a board chip hwmon-owned"
+            );
+        }
+        // The name leg holds with no class to read.
+        assert!(is_gpu_owned_hwmon(&tmp.path().join("hwmon6"), "xe"));
     }
 
     /// [SAFETY] `DC-f` (end-to-end, sysfs bytes -> the ladder's CPU reading).

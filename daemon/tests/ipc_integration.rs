@@ -1246,6 +1246,53 @@ async fn capabilities_includes_nvidia_gpu_absent_by_default() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// DEC-508: the Intel `fan_control_note` follows whether the kernel exposes a
+/// fan-control interface. A stock node gets the "no PWM interface" wording; a
+/// node with `pwm1` (Intel's fan-control series) gets the "exposed but not
+/// used" wording, and the method stays `read_only` either way. Runs through
+/// the real handler, so the note's input is the field production reads.
+#[tokio::test]
+async fn diagnostics_intel_note_follows_whether_pwm_is_exposed() {
+    use ventulusd::hwmon::intel_gpu_detect::IntelGpuInfo;
+    for pwm_exposed in [false, true] {
+        let mut state = Arc::try_unwrap(test_app_state())
+            .ok()
+            .expect("fresh test state has one owner");
+        state.intel_gpus = vec![IntelGpuInfo {
+            pci_bdf: "0000:03:00.0".into(),
+            pci_device_id: 0xE20B,
+            pci_revision: 0,
+            pci_class: 0x030000,
+            marketing_name: Some("Arc B580".into()),
+            driver: "xe".into(),
+            hwmon_path: std::path::PathBuf::from("/nonexistent/hwmon3"),
+            is_discrete: true,
+            has_fan_rpm: true,
+            pwm_exposed,
+        }];
+        let (path, shutdown, _dir) = start_test_server(Arc::new(state)).await;
+
+        let (status, json) = uds_get(&path, "/diagnostics/hardware").await;
+        assert_eq!(status, 200);
+        let diag = &json["intel_gpu"];
+        assert_eq!(diag["fan_control_method"], "read_only");
+        let note = diag["fan_control_note"].as_str().unwrap();
+        assert_eq!(
+            note.contains("register no PWM interface"),
+            !pwm_exposed,
+            "pwm_exposed={pwm_exposed}: {note}"
+        );
+        assert_eq!(
+            note.contains("Ventulus does not use it"),
+            pwm_exposed,
+            "pwm_exposed={pwm_exposed}: {note}"
+        );
+
+        let _ = shutdown.send(());
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 #[tokio::test]
 async fn capabilities_and_diagnostics_report_nvidia_gpu_when_present() {
     // The handlers must read `state.nvidia_gpus` into both the capability and

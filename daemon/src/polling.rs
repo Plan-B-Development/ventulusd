@@ -3336,6 +3336,7 @@ mod tests {
             hwmon_path,
             is_discrete: true,
             has_fan_rpm,
+            pwm_exposed: false,
         }
     }
 

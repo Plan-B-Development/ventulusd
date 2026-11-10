@@ -218,11 +218,7 @@ fn build_hardware_diagnostics(state: &AppState) -> (StatusCode, Json<serde_json:
                 driver: gpu.driver.clone(),
                 fan_control_method: gpu.fan_control_method().to_string(),
                 fan_rpm_available: gpu.has_fan_rpm,
-                fan_control_note:
-                    "Intel GPU fan control is managed autonomously by on-card firmware: the \
-                     mainline xe/i915 drivers register no PWM interface, so nothing can set \
-                     the fan on a stock kernel. Temperature and fan RPM are read-only."
-                        .to_string(),
+                fan_control_note: intel_fan_control_note(gpu.pwm_exposed).to_string(),
             }
         });
 
@@ -575,6 +571,22 @@ fn voltage_entries(
     });
     crate::hwmon::voltages::apply_board_catalogue(&mut rails, cpu_vendor, siv_word);
     rails.into_iter().map(VoltageEntry::from).collect()
+}
+
+/// The Intel GPU `fan_control_note` (DEC-121, DEC-508). A kernel carrying
+/// Intel's fan-control series exposes `pwm1`; the daemon still does not use
+/// it (the chip is GPU-owned, so PWM discovery never binds it), and the note
+/// says so rather than claiming no interface exists.
+fn intel_fan_control_note(pwm_exposed: bool) -> &'static str {
+    if pwm_exposed {
+        "This kernel exposes a fan-control interface for the Intel GPU. Ventulus does not \
+         use it: it never drives a GPU fan through hwmon. Temperature and fan RPM are \
+         read-only."
+    } else {
+        "Intel GPU fan control is managed autonomously by on-card firmware: the \
+         mainline xe/i915 drivers register no PWM interface, so nothing can set \
+         the fan on a stock kernel. Temperature and fan RPM are read-only."
+    }
 }
 
 #[cfg(test)]

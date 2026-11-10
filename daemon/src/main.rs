@@ -2879,7 +2879,7 @@ async fn async_main(cli: CliOptions) {
 
     // Detect nouveau-backed NVIDIA discrete GPUs (DEC-204). Read-only telemetry —
     // temps flow through the sensor pipeline; fan RPM is polled here. The writable
-    // nouveau `pwm1` is excluded from hwmon discovery (`is_gpu_owned_hwmon_chip`)
+    // nouveau `pwm1` is excluded from hwmon discovery (`is_gpu_owned_hwmon`)
     // so the engine never drives it. Passed straight to the poll loop (no AppState
     // store yet — the `/capabilities` + `/diagnostics` surfaces land in a later phase).
     let nouveau_gpus_for_poll = ventulusd::hwmon::nouveau_detect::detect_nouveau_gpus(

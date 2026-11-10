@@ -42,7 +42,7 @@ so can your scripts be (§ Scripting the daemon). No client writes a fan.
 | Motherboard fan headers (hwmon) | Yes | Yes |
 | AMD GPU fans, RX 7000 / RX 9000 | Yes | Yes, through the firmware (PMFW) fan curve |
 | AMD GPU fans, RX 6000 and older | Yes | Fan test and reset only. No profile drives them, so the card's own curve stays in charge |
-| Intel Arc GPU fans | RPM | No: the firmware manages them and no mainline kernel exposes PWM control |
+| Intel Arc GPU fans | RPM | No: the firmware manages them. No mainline kernel exposes PWM control, and where a patched kernel does, the daemon leaves it unused |
 | NVIDIA GPU fans | RPM, plus the driver's duty through NVML (NVIDIA's *intended* speed, not a measurement) | No: there is no kernel write path, and the daemon does not use NVML's privileged one |
 | ARCTIC Fan Controller (`arctic_fan`, Linux 7.2 and later) | Yes | Yes. Every write carries all ten channels, so the daemon first sets each channel reading 0 that it did not choose to 100 %. A channel your profile does not control therefore runs at full speed; control all ten to keep them quiet |
 | Liquid coolers with an hwmon driver | Coolant temperature and pump RPM | Pump speed, fixed or on a curve, never below 30 %; the GUI's **Configure AIO** sets it up. A pump on a motherboard header is set up the same way once the header has the `pump` role (§ Identifying a fan) |
@@ -87,7 +87,10 @@ The daemon publishes a **read-only** view of your cooling hardware for the GUI
 - **Reboot may be required:** loading a missing Super-I/O or DKMS driver usually
   needs a reboot or a module reload, and the readiness item says so.
 - **GPUs are handled separately:** GPU fan discovery and control are not part of
-  this hwmon path (§ GPU fan control).
+  this hwmon path (§ GPU fan control). A GPU's own hwmon PWM channels, such as a
+  writable `pwm1` from the `nouveau`, `radeon` or a patched `xe` driver, or from any
+  device whose PCI parent is a display controller, are never listed as headers, so no
+  profile and no thermal emergency can drive them.
 
 ### Board names for unlabelled headers (Gigabyte)
 

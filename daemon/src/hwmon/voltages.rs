@@ -48,7 +48,8 @@
 //!   hwmon nodes publish `in0_input` (package voltage, per the kernel ABI doc
 //!   `sysfs-driver-intel-i915-hwmon`). Those are GPU core voltages, not board
 //!   rails, and reporting one as an unnamed board rail is exactly the confusion
-//!   this module exists to avoid. See [`is_gpu_voltage_chip`].
+//!   this module exists to avoid. They are dropped by the shared
+//!   [`crate::hwmon::is_gpu_owned_hwmon`] predicate.
 
 use std::path::{Path, PathBuf};
 
@@ -158,25 +159,6 @@ pub fn discover_voltages(hwmon_root: &Path) -> Result<Vec<VoltageDescriptor>, Hw
     Ok(descriptors)
 }
 
-/// True for an hwmon chip whose voltage channels are GPU core rails rather than
-/// board rails.
-///
-/// Deliberately **not** `hwmon::is_gpu_owned_hwmon_chip`, and this is the whole
-/// point of the function. That predicate is the single source of truth for the
-/// PWM-header and monitor-only-fan exclusions, and its own test records that it
-/// omits `xe`/`i915` *because those drivers register no `pwm` attribute*. That
-/// reasoning does not carry over to voltages: `i915` and `xe` both register
-/// `in0_input` (package voltage — kernel ABI
-/// `Documentation/ABI/testing/sysfs-driver-intel-i915-hwmon`), so an Arc or
-/// Battlemage card would otherwise appear in a board-rail table as an unnamed
-/// channel on chip `xe`.
-///
-/// Widening the shared predicate instead would change what PWM discovery
-/// excludes, which is a fan-control behaviour change for a display feature.
-fn is_gpu_voltage_chip(chip_name: &str) -> bool {
-    crate::hwmon::is_gpu_owned_hwmon_chip(chip_name) || matches!(chip_name, "i915" | "xe")
-}
-
 /// Discover voltage rails for a single hwmon device directory.
 fn discover_device_voltages(hwmon_dir: &Path) -> Result<Vec<VoltageDescriptor>, HwmonError> {
     // Canonical: the it87 v2.0 board suffix is stripped here, so the ids
@@ -184,7 +166,7 @@ fn discover_device_voltages(hwmon_dir: &Path) -> Result<Vec<VoltageDescriptor>, 
     let chip_name = crate::hwmon::chip_name::read_chip_name(hwmon_dir)?.canonical;
 
     // GPU core voltages are not board rails — see the module docs.
-    if is_gpu_voltage_chip(&chip_name) {
+    if crate::hwmon::is_gpu_owned_hwmon(hwmon_dir, &chip_name) {
         return Ok(Vec::new());
     }
 
@@ -365,13 +347,12 @@ mod tests {
         assert_eq!(rails[0].label, "in0");
     }
 
-    /// `WIRE-ag` review: `i915`/`xe` publish `in0_input` (package voltage) and
-    /// are NOT covered by `is_gpu_owned_hwmon_chip`, whose omission of them is
-    /// justified by their lack of a `pwm` attribute. A board-rail table must not
-    /// show a GPU core voltage as an unnamed channel.
+    /// `WIRE-ag`: `i915`/`xe` publish `in0_input` (package voltage). A
+    /// board-rail table must not show a GPU core voltage as an unnamed channel;
+    /// the shared GPU-owned predicate covers them since DEC-508.
     #[test]
     fn gpu_chips_are_excluded_including_the_intel_ones() {
-        for gpu_chip in ["amdgpu", "nouveau", "i915", "xe"] {
+        for gpu_chip in ["amdgpu", "nouveau", "radeon", "i915", "xe"] {
             let root = tempdir().unwrap();
             write_chip(
                 root.path(),

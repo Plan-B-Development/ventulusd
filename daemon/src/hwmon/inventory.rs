@@ -95,11 +95,10 @@ fn discover_device_monitor_only_fans(
     // built below match the ones saved before that driver's rename (DEC-442).
     let chip_name = crate::hwmon::chip_name::read_chip_name(hwmon_dir)?.canonical;
 
-    // GPU-owned fans are never surfaced in the hwmon inventory — consistent
-    // with `pwm_discovery`. amdgpu (DEC-102) and nouveau (DEC-204) fan RPM is
-    // surfaced via the `amd_gpu:` / `nvidia_gpu:` prefixes + the GPU endpoints,
-    // not the hwmon monitor-only-fan inventory.
-    if crate::hwmon::is_gpu_owned_hwmon_chip(&chip_name) {
+    // GPU-owned fans are never surfaced in the hwmon inventory, consistent
+    // with `pwm_discovery`: GPU fan RPM is surfaced via the GPU id prefixes
+    // and endpoints (DEC-102/204/508).
+    if crate::hwmon::is_gpu_owned_hwmon(hwmon_dir, &chip_name) {
         return Ok(Vec::new());
     }
 
@@ -321,6 +320,42 @@ mod tests {
 
         let fans = discover_monitor_only_fans(tmp.path()).unwrap();
         assert!(fans.is_empty(), "nouveau fans must be excluded: {fans:#?}");
+    }
+
+    /// DEC-508: Intel (`xe`, `i915`), legacy AMD (`radeon`) and an unnamed PCI
+    /// display controller are GPU-owned. Their tachometers are not listed as
+    /// monitor-only hwmon fans; the board chip beside them still is. The Intel
+    /// fan stays visible as `intel_gpu:`, which scans by name independently.
+    #[test]
+    fn intel_radeon_and_pci_display_fans_excluded() {
+        for gpu_chip in ["xe", "i915", "radeon", "futuregpu"] {
+            let tmp = tempfile::tempdir().unwrap();
+            create_fan_fixture(
+                tmp.path(),
+                "hwmon0",
+                "nct6798",
+                &[(2, Some("AUX_FAN"), false)],
+            );
+            let gpu = create_fan_fixture(
+                tmp.path(),
+                "hwmon1",
+                gpu_chip,
+                &[(1, None, false), (2, None, false), (3, None, false)],
+            );
+            if gpu_chip == "futuregpu" {
+                fs::create_dir_all(gpu.join("device")).unwrap();
+                fs::write(gpu.join("device/class"), "0x030000\n").unwrap();
+            }
+
+            let fans = discover_monitor_only_fans(tmp.path()).unwrap();
+            assert_eq!(
+                fans.iter()
+                    .map(|f| f.chip_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["nct6798"],
+                "{gpu_chip} fans must not be listed as hwmon fans"
+            );
+        }
     }
 
     #[test]

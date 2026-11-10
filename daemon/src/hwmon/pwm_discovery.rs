@@ -159,17 +159,16 @@ fn discover_device_pwm(
     let chip_name = names.canonical;
     let sysfs_chip_name = (names.sysfs != chip_name).then_some(names.sysfs);
 
-    // GPU-owned hwmon `pwm1` is never surfaced as an hwmon header.
-    // - amdgpu (DEC-102): RDNA4 exposes `pwm1` read-only with no `pwm1_enable`,
-    //   so binding it produces a 1 Hz 503/EACCES storm; RDNA3 exposes both, but
-    //   a write can silently no-op (DEC-430).
-    // - nouveau (DEC-204): exposes a *writable* `pwm1`; leaking it here would let
-    //   the profile engine drive a GPU fan, breaking the read-only contract.
-    // GPU fans are addressed exclusively via the `amd_gpu:` / `nvidia_gpu:`
-    // prefixes and the GPU endpoints. Single source of truth: `is_gpu_owned_hwmon_chip`.
-    if crate::hwmon::is_gpu_owned_hwmon_chip(&chip_name) {
+    // [SAFETY] A GPU-owned hwmon device's `pwm*` is never surfaced as an hwmon
+    // header: everything returned here is reachable by the profile engine and
+    // the thermal emergency's force (DEC-382), and GPU fans are outside the
+    // ladder (DEC-130). amdgpu (DEC-102/430), nouveau (DEC-204), radeon / xe /
+    // i915 and any PCI display controller (DEC-508). GPU fans are addressed
+    // via the GPU id prefixes and endpoints. Single source of truth:
+    // `is_gpu_owned_hwmon`.
+    if crate::hwmon::is_gpu_owned_hwmon(hwmon_dir, &chip_name) {
         log::debug!(
-            "Skipping GPU-owned hwmon chip '{chip_name}' at {} — GPU fans are owned by the GPU subsystem (DEC-102/DEC-204)",
+            "Skipping GPU-owned hwmon chip '{chip_name}' at {}: GPU fans are owned by the GPU subsystem (DEC-508)",
             hwmon_dir.display()
         );
         return Ok(Vec::new());
@@ -541,6 +540,90 @@ mod tests {
         let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
         assert_eq!(headers.len(), 1, "headers: {headers:#?}");
         assert_eq!(headers[0].chip_name, "it8696");
+    }
+
+    /// The writable three-fan shape Intel's xe fan-control series registers
+    /// (`pwm1..3` + `pwm1..3_enable` + `fan1..3_input`), reused for every
+    /// GPU-owned chip in the DEC-508 tests.
+    const WRITABLE_GPU_FANS: &[(u8, Option<&str>, bool, bool)] = &[
+        (1, None, true, true),
+        (2, None, true, true),
+        (3, None, true, true),
+    ];
+
+    /// [SAFETY] DEC-508: a writable GPU fan on chip `xe`, `i915` or `radeon`
+    /// is never a header, so neither the profile engine nor the thermal
+    /// emergency's force can reach it (GPU fans are outside the ladder,
+    /// DEC-130). The same shape on a board chip IS discovered: proof the
+    /// fixture would bind if the chip were not excluded.
+    #[test]
+    fn discover_writable_intel_and_radeon_gpu_fans_excluded() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_pwm_fixture(tmp.path(), "hwmon0", "nct6798", WRITABLE_GPU_FANS);
+        let control = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
+        assert_eq!(
+            control.len(),
+            3,
+            "the fixture shape must bind on a board chip"
+        );
+
+        for gpu_chip in ["xe", "i915", "radeon"] {
+            let tmp = tempfile::tempdir().unwrap();
+            create_pwm_fixture(tmp.path(), "hwmon0", gpu_chip, WRITABLE_GPU_FANS);
+
+            let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
+            assert!(
+                headers.is_empty(),
+                "{gpu_chip} writable pwm must not be advertised as a header: {headers:#?}"
+            );
+        }
+    }
+
+    /// [SAFETY] DEC-508: beside a motherboard chip, only the motherboard's
+    /// headers are discovered — the GPU exclusion drops nothing else.
+    #[test]
+    fn discover_xe_excluded_alongside_motherboard_chip() {
+        for gpu_chip in ["xe", "i915", "radeon"] {
+            let tmp = tempfile::tempdir().unwrap();
+            create_pwm_fixture(
+                tmp.path(),
+                "hwmon0",
+                "it8696",
+                &[(1, Some("CPU_FAN"), true, true)],
+            );
+            create_pwm_fixture(tmp.path(), "hwmon1", gpu_chip, WRITABLE_GPU_FANS);
+
+            let headers = discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap();
+            assert_eq!(
+                headers
+                    .iter()
+                    .map(|h| h.chip_name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["it8696"],
+                "beside {gpu_chip}"
+            );
+        }
+    }
+
+    /// [SAFETY] DEC-508, the PCI-class leg through real discovery: a GPU
+    /// driver with a name on no list, whose parent is a PCI display
+    /// controller, is excluded; the same chip with a non-display parent binds.
+    #[test]
+    fn discover_unknown_driver_on_a_pci_display_parent_excluded() {
+        let headers_for_class = |class: &str| {
+            let tmp = tempfile::tempdir().unwrap();
+            let gpu = create_pwm_fixture(tmp.path(), "hwmon0", "futuregpu", WRITABLE_GPU_FANS);
+            fs::create_dir_all(gpu.join("device")).unwrap();
+            fs::write(gpu.join("device/class"), class).unwrap();
+            discover_pwm_headers(tmp.path(), &BoardContext::default()).unwrap()
+        };
+
+        assert_eq!(headers_for_class("0x0c0330\n").len(), 3); // USB controller: binds
+        let headers = headers_for_class("0x030000\n");
+        assert!(
+            headers.is_empty(),
+            "a PCI display controller's pwm must not be a header: {headers:#?}"
+        );
     }
 
     #[test]

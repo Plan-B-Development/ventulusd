@@ -569,7 +569,7 @@ fn discover_device_sensors(
             "xe" | "i915" => SensorSource::IntelGpu,
             // NVIDIA discrete GPU via the open `nouveau` driver. Read-only
             // telemetry; the writable `pwm1` is excluded from PWM discovery
-            // (`is_gpu_owned_hwmon_chip`) so the engine never drives it (DEC-204).
+            // (`is_gpu_owned_hwmon`) so the engine never drives it (DEC-204).
             "nouveau" => SensorSource::NvidiaGpu,
             _ => SensorSource::Hwmon,
         };
@@ -705,7 +705,7 @@ mod tests {
     fn discover_nvidia_gpu_nouveau_source_and_kind() {
         // NVIDIA via the open nouveau driver: temp1 classified as GpuTemp with
         // source NvidiaGpu (DEC-204). Temps flow through the normal pipeline;
-        // the writable pwm1 is excluded elsewhere (`is_gpu_owned_hwmon_chip`).
+        // the writable pwm1 is excluded elsewhere (`is_gpu_owned_hwmon`).
         let tmp = tempfile::tempdir().unwrap();
         create_fixture_with_chip_name(tmp.path(), "hwmon0", "nouveau", &[("1", None)]);
 

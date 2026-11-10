@@ -7,6 +7,22 @@ rename. Version numbers carry on from Control-OFC.
 
 ### Fixed
 
+- **A GPU's own fan control is never treated as a motherboard fan header.** The daemon kept AMD
+  (`amdgpu`) and open NVIDIA (`nouveau`) GPU fans out of its motherboard header list, but not the
+  legacy AMD `radeon` driver, which gives older cards (Radeon HD 7000 to R9 300 series running
+  DPM) a writable fan control on current kernels. Nor did it exclude Intel Arc (`xe`, `i915`),
+  where Intel's pending fan-control patches add writable controls, and some users already run
+  kernels with them. On such a machine the GPU fan was listed as a motherboard header, a profile
+  could drive it, and the thermal emergency would force it to 100 %, though GPU fans are meant to
+  stay outside it. Those drivers are now excluded too, and so is any device whose PCI parent is a
+  display controller, so a GPU driver the daemon has never heard of is excluded as well. Their
+  fan readings also leave the monitor-only fan list. An Intel fan stays visible as the GPU's fan,
+  as AMD and NVIDIA ones already were; a `radeon` card's fan duty, the only fan reading that
+  driver gives, is no longer shown, and its temperature still is. The Intel GPU's
+  hardware-diagnostics note says when the kernel exposes a fan control the daemon does not use. **If a profile drove such a header**, that member
+  is no longer written. A control left with no member the daemon can write is reported as not
+  controlled (`skipped_controls`, reason `backend_unavailable`); remove the member in the GUI. The
+  older daemon handed the header back to what it had been doing when it exited.
 - **Installing the daemon no longer leaves most systems "degraded".** On most boards other than
   Gigabyte's, `nct6775` or `w83627ehf` finds no chip at boot, and some kernels do not include
   `nct6775` at all (Fedora 45's `kernel-modules-core`). The package's Super-I/O guard, which loads

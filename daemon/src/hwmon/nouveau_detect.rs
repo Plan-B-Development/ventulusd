@@ -12,7 +12,7 @@
 //! than Turing, but Phase-1 NVIDIA support is telemetry-only: this
 //! detector models only the readable `fan1_input` (RPM). The `nouveau` chip is
 //! excluded from hwmon PWM-header and monitor-only-fan discovery via
-//! [`crate::hwmon::is_gpu_owned_hwmon_chip`] (mirroring the `amdgpu` DEC-102
+//! [`crate::hwmon::is_gpu_owned_hwmon`] (mirroring the `amdgpu` DEC-102
 //! exclusion), so the profile engine can never drive that `pwm1`. GPU
 //! temperatures flow through the normal sensor pipeline tagged
 //! `SensorSource::NvidiaGpu` (see `discovery.rs`).
